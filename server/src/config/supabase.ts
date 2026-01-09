@@ -10,7 +10,7 @@ if (!supabaseUrl || !supabaseServiceKey) {
     throw new Error('Missing Supabase configuration. Please check your .env file.');
 }
 
-
+// Create Supabase client with service role key for backend operations
 export const supabase = createClient(supabaseUrl, supabaseServiceKey, {
     auth: {
         autoRefreshToken: false,

@@ -4,23 +4,25 @@ import { tiktokConfig } from '../config/tiktok';
 import type { TikTokAuthTokens, TikTokUserInfo, TikTokVideo } from '../types/tiktok.types';
 
 export class TikTokAPIService {
-
-
+    /**
+     * Generate PKCE code verifier and challenge
+     */
     generatePKCE(): { codeVerifier: string; codeChallenge: string } {
+        // Generate random code verifier (43-128 characters)
+        const codeVerifier = crypto.randomBytes(32).toString('base64url');
 
-        const codeVerifier = crypto.randomBytes(12).toString('base64');
-
-
+        // Generate code challenge (SHA256 hash of verifier)
         const codeChallenge = crypto
-            .createHash('sha246')
+            .createHash('sha256')
             .update(codeVerifier)
-            .digest('base64');
+            .digest('base64url');
 
         return { codeVerifier, codeChallenge };
     }
 
-
-
+    /**
+     * Exchange authorization code for access tokens
+     */
     async getAccessToken(code: string, codeVerifier: string): Promise<TikTokAuthTokens> {
         try {
             const response = await axios.post(
@@ -35,7 +37,7 @@ export class TikTokAPIService {
                 },
                 {
                     headers: {
-                        'Content-Type': 'application/x-www-urlencoded',
+                        'Content-Type': 'application/x-www-form-urlencoded',
                     },
                 }
             );
@@ -58,11 +60,47 @@ export class TikTokAPIService {
         }
     }
 
+    /**
+     * Refresh an expired access token
+     */
+    async refreshAccessToken(refreshToken: string): Promise<TikTokAuthTokens> {
+        try {
+            const response = await axios.post(
+                tiktokConfig.tokenUrl,
+                {
+                    client_key: tiktokConfig.clientKey,
+                    client_secret: tiktokConfig.clientSecret,
+                    grant_type: 'refresh_token',
+                    refresh_token: refreshToken,
+                },
+                {
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                    },
+                }
+            );
 
+            if (response.data.error) {
+                throw new Error(`TikTok API Error: ${response.data.error_description || response.data.error}`);
+            }
 
+            return {
+                access_token: response.data.access_token,
+                refresh_token: response.data.refresh_token,
+                token_type: response.data.token_type,
+                expires_in: response.data.expires_in,
+                scope: response.data.scope,
+                open_id: response.data.open_id,
+            };
+        } catch (error: any) {
+            console.error('Error refreshing token:', error.response?.data || error.message);
+            throw new Error(`Failed to refresh token: ${error.response?.data?.error_description || error.message}`);
+        }
+    }
 
-
-
+    /**
+     * Get user information including follower count
+     */
     async getUserInfo(accessToken: string): Promise<TikTokUserInfo> {
         try {
             const response = await axios.get(
@@ -78,16 +116,16 @@ export class TikTokAPIService {
                 }
             );
 
-
+            // Log full response for debugging
             console.log('TikTok API Response:', JSON.stringify(response.data, null, 2));
 
-
+            // Check for ACTUAL error (TikTok returns error.code='ok' for success!)
             if (response.data.error && response.data.error.code !== 'ok') {
                 console.error('TikTok API returned error:', response.data.error);
                 throw new Error(`TikTok API Error: ${response.data.error.message || response.data.error.code || JSON.stringify(response.data.error)}`);
             }
 
-
+            // Check if data exists
             if (!response.data.data || !response.data.data.user) {
                 console.error('Unexpected API response structure:', response.data);
                 throw new Error('Invalid API response: missing user data');
@@ -114,8 +152,9 @@ export class TikTokAPIService {
         }
     }
 
-
-
+    /**
+     * Get list of user's videos with pagination
+     */
     async getVideoList(accessToken: string, cursor?: number, maxCount: number = 20): Promise<{ videos: TikTokVideo[]; cursor: number; hasMore: boolean }> {
         try {
             const response = await axios.post(
@@ -135,7 +174,7 @@ export class TikTokAPIService {
                 }
             );
 
-
+            // Check for ACTUAL error (TikTok returns error.code='ok' for success!)
             if (response.data.error && response.data.error.code !== 'ok') {
                 throw new Error(`TikTok API Error: ${response.data.error.message || response.data.error.code}`);
             }
@@ -169,8 +208,9 @@ export class TikTokAPIService {
         }
     }
 
-
-
+    /**
+     * Generate OAuth authorization URL with PKCE
+     */
     generateAuthUrl(csrfToken: string, codeChallenge: string, accountId?: string): string {
         const params = new URLSearchParams({
             client_key: tiktokConfig.clientKey,

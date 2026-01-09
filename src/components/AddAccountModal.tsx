@@ -20,7 +20,7 @@ export function AddAccountModal({ onAccountAdded }: AddAccountModalProps) {
         try {
             setLoading(true);
 
-
+            // Create the account
             const { data: account, error: accountError } = await supabase
                 .from('accounts')
                 .insert({
@@ -33,7 +33,7 @@ export function AddAccountModal({ onAccountAdded }: AddAccountModalProps) {
 
             if (accountError) throw accountError;
 
-
+            // Link account to user
             const { error: linkError } = await supabase
                 .from('user_accounts')
                 .insert({
@@ -43,12 +43,12 @@ export function AddAccountModal({ onAccountAdded }: AddAccountModalProps) {
 
             if (linkError) throw linkError;
 
-
+            // Reset form and close modal
             setAccountName('');
             setTiktokHandle('');
             setIsOpen(false);
 
-
+            // Notify parent to refresh accounts
             onAccountAdded();
         } catch (error: any) {
             console.error('Error creating account:', error);
@@ -70,10 +70,10 @@ export function AddAccountModal({ onAccountAdded }: AddAccountModalProps) {
 
             {isOpen && (
                 <>
-                    {}
+                    {/* Backdrop */}
                     <div className="fixed inset-0 bg-black/50 z-40" onClick={() => setIsOpen(false)} />
 
-                    {}
+                    {/* Modal */}
                     <div className="fixed inset-0 flex items-center justify-center z-50 p-4">
                         <div className="bg-gray-800 rounded-xl border border-gray-700 p-6 max-w-md w-full shadow-2xl">
                             <div className="flex items-center justify-between mb-4">

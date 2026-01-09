@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useAuth } from '../contexts/AuthContext';
-import { Video } from 'lucide-react';
+import { Video, Eye, EyeOff } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 
 export function Login() {
@@ -11,7 +11,10 @@ export function Login() {
   const [success, setSuccess] = useState('');
   const [loading, setLoading] = useState(false);
   const [isSignUp, setIsSignUp] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
   const { signIn } = useAuth();
+
+  const [isForgotPassword, setIsForgotPassword] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -19,7 +22,17 @@ export function Login() {
     setSuccess('');
     setLoading(true);
 
-    if (isSignUp) {
+    if (isForgotPassword) {
+      const { error: resetError } = await supabase.auth.resetPasswordForEmail(email, {
+        redirectTo: `${window.location.origin}/reset-password`,
+      });
+
+      if (resetError) {
+        setError(resetError.message);
+      } else {
+        setSuccess('Password reset link sent to your email!');
+      }
+    } else if (isSignUp) {
       const { error: signUpError } = await supabase.auth.signUp({
         email,
         password,
@@ -60,11 +73,13 @@ export function Login() {
             Mamba TikTok Reporting App
           </h1>
           <p className="text-gray-400 text-center mb-8">
-            {isSignUp ? 'Create your account' : 'Sign in to view your analytics'}
+            {isForgotPassword
+              ? 'Enter your email to reset your password'
+              : isSignUp ? 'Create your account' : 'Sign in to view your analytics'}
           </p>
 
           <form onSubmit={handleSubmit} className="space-y-6">
-            {isSignUp && (
+            {isSignUp && !isForgotPassword && (
               <div>
                 <label htmlFor="fullName" className="block text-sm font-medium text-gray-300 mb-2">
                   Full Name
@@ -96,20 +111,49 @@ export function Login() {
               />
             </div>
 
-            <div>
-              <label htmlFor="password" className="block text-sm font-medium text-gray-300 mb-2">
-                Password
-              </label>
-              <input
-                id="password"
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                required
-                className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-pink-500 focus:border-transparent transition-all"
-                placeholder="••••••••"
-              />
-            </div>
+            {!isForgotPassword && (
+              <div>
+                <div className="flex justify-between items-center mb-2">
+                  <label htmlFor="password" className="block text-sm font-medium text-gray-300">
+                    Password
+                  </label>
+
+                </div>
+                <div className="relative">
+                  <input
+                    id="password"
+                    type={showPassword ? 'text' : 'password'}
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    required
+                    className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-pink-500 focus:border-transparent transition-all pr-12"
+                    placeholder="••••••••"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword(!showPassword)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 p-1.5 text-gray-400 hover:text-white transition-colors"
+                  >
+                    {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+                  </button>
+                </div>
+                <div className="flex justify-end mt-2">
+                  {!isSignUp && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsForgotPassword(true);
+                        setError('');
+                        setSuccess('');
+                      }}
+                      className="text-xs text-pink-400 hover:text-pink-300 transition-colors"
+                    >
+                      Forgot password?
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
 
             {error && (
               <div className="bg-red-900/30 border border-red-500 text-red-300 px-4 py-3 rounded-lg text-sm">
@@ -128,20 +172,28 @@ export function Login() {
               disabled={loading}
               className="w-full bg-gradient-to-r from-pink-500 to-red-500 text-white py-3 rounded-lg font-semibold hover:from-pink-600 hover:to-red-600 focus:outline-none focus:ring-2 focus:ring-pink-500 focus:ring-offset-2 focus:ring-offset-gray-800 disabled:opacity-50 disabled:cursor-not-allowed transition-all transform hover:scale-[1.02]"
             >
-              {loading ? (isSignUp ? 'Creating account...' : 'Signing in...') : (isSignUp ? 'Create Account' : 'Sign In')}
+              {loading
+                ? (isForgotPassword ? 'Sending...' : isSignUp ? 'Creating account...' : 'Signing in...')
+                : (isForgotPassword ? 'Send Reset Link' : isSignUp ? 'Create Account' : 'Sign In')}
             </button>
           </form>
 
-          <div className="mt-6 text-center">
+          <div className="mt-6 text-center space-y-2">
             <button
               onClick={() => {
-                setIsSignUp(!isSignUp);
+                if (isForgotPassword) {
+                  setIsForgotPassword(false);
+                } else {
+                  setIsSignUp(!isSignUp);
+                }
                 setError('');
                 setSuccess('');
               }}
-              className="text-sm text-pink-400 hover:text-pink-300 transition-colors"
+              className="text-sm text-pink-400 hover:text-pink-300 transition-colors block w-full"
             >
-              {isSignUp ? 'Already have an account? Sign in' : "Don't have an account? Sign up"}
+              {isForgotPassword
+                ? 'Back to Sign In'
+                : isSignUp ? 'Already have an account? Sign in' : "Don't have an account? Sign up"}
             </button>
           </div>
         </div>

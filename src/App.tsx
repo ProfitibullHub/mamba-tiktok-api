@@ -7,7 +7,7 @@ function AppContent() {
   const { user, loading } = useAuth();
 
   useEffect(() => {
-
+    // Auth check logic or other app-level effects can go here
   }, [user]);
 
   if (loading) {

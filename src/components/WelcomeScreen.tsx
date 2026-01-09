@@ -5,10 +5,11 @@ import { Store, LogOut } from 'lucide-react';
 interface WelcomeScreenProps {
     onConnect?: () => void;
     onConnectAgency?: () => void;
+    onSkip?: () => void;
     isConnecting?: boolean;
 }
 
-export default function WelcomeScreen({ onConnect, onConnectAgency, isConnecting = false }: WelcomeScreenProps) {
+export default function WelcomeScreen({ onConnect, onConnectAgency, onSkip, isConnecting = false }: WelcomeScreenProps) {
     const { profile, signOut } = useAuth();
     const [localConnecting, setLocalConnecting] = useState(false);
     const [localAgencyConnecting, setLocalAgencyConnecting] = useState(false);
@@ -39,7 +40,15 @@ export default function WelcomeScreen({ onConnect, onConnectAgency, isConnecting
 
     return (
         <div className="fixed inset-0 z-50 bg-gradient-to-br from-gray-900 via-purple-900 to-pink-900 flex items-center justify-center p-6 overflow-hidden">
-            <div className="absolute top-6 right-6 z-10">
+            <div className="absolute top-6 right-6 z-10 flex gap-3">
+                {profile?.role === 'admin' && onSkip && (
+                    <button
+                        onClick={onSkip}
+                        className="px-4 py-2 bg-white/10 hover:bg-white/20 text-white rounded-lg transition-all border border-white/20 backdrop-blur-sm text-sm font-medium"
+                    >
+                        Skip to Dashboard
+                    </button>
+                )}
                 <button
                     onClick={() => signOut()}
                     className="flex items-center gap-2 px-4 py-2 bg-gray-800/50 hover:bg-gray-800 text-gray-300 hover:text-white rounded-lg transition-all border border-gray-700 hover:border-gray-600 backdrop-blur-sm"
@@ -50,7 +59,7 @@ export default function WelcomeScreen({ onConnect, onConnectAgency, isConnecting
             </div>
 
             <div className="max-w-4xl w-full max-h-full overflow-y-auto custom-scrollbar">
-                { }
+                {/* Welcome Header */}
                 <div className="text-center mb-8">
                     <div className="inline-flex items-center justify-center w-20 h-20 bg-gradient-to-r from-pink-500 to-red-500 rounded-2xl mb-4 shadow-lg shadow-pink-500/20">
                         <Store className="w-10 h-10 text-white" />
@@ -63,9 +72,9 @@ export default function WelcomeScreen({ onConnect, onConnectAgency, isConnecting
                     </p>
                 </div>
 
-                { }
+                {/* Main Card */}
                 <div className="bg-gray-800/50 backdrop-blur-lg rounded-2xl border border-gray-700 p-8 shadow-2xl">
-                    { }
+                    {/* Instructions */}
                     <div className="mb-8">
                         <h2 className="text-2xl font-bold text-white mb-6">Quick Setup</h2>
                         <div className="space-y-6">
@@ -101,17 +110,17 @@ export default function WelcomeScreen({ onConnect, onConnectAgency, isConnecting
                         </div>
                     </div>
 
-                    { }
+                    {/* Connection Component */}
                     <div className="bg-gray-900/50 rounded-xl p-6 border border-gray-700">
                         <button
                             onClick={handleConnect}
                             disabled={isLoading}
                             className="w-full bg-gradient-to-r from-pink-500 to-red-500 text-white px-6 py-4 rounded-xl font-semibold text-lg hover:from-pink-600 hover:to-red-600 transition-all shadow-lg hover:shadow-xl transform hover:scale-[1.02] disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none active:scale-[0.98]"
                         >
-                            {localConnecting ? (
+                            {isLoading ? (
                                 <span className="flex items-center justify-center gap-2">
                                     <div className="animate-spin rounded-full h-5 w-5 border-2 border-white border-t-transparent"></div>
-                                    Connecting to TikTok Shop...
+                                    Connecting...
                                 </span>
                             ) : (
                                 'Connect TikTok Shop'
@@ -138,7 +147,7 @@ export default function WelcomeScreen({ onConnect, onConnectAgency, isConnecting
                         </button>
                     </div>
 
-                    { }
+                    {/* Info Box */}
                     <div className="mt-6 bg-blue-500/10 border border-blue-500/30 rounded-lg p-4">
                         <p className="text-blue-300 text-sm flex gap-2">
                             <span className="text-lg">💡</span>

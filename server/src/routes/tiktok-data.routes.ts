@@ -4,8 +4,10 @@ import { supabase } from '../config/supabase';
 
 const router = Router();
 
-
-
+/**
+ * GET /api/tiktok/user/:accountId
+ * Get TikTok user info and follower count
+ */
 router.get('/user/:accountId', async (req: Request, res: Response) => {
     try {
         const { accountId } = req.params;
@@ -36,8 +38,10 @@ router.get('/user/:accountId', async (req: Request, res: Response) => {
     }
 });
 
-
-
+/**
+ * GET /api/tiktok/videos/:accountId
+ * Get list of videos with analytics
+ */
 router.get('/videos/:accountId', async (req: Request, res: Response) => {
     try {
         const { accountId } = req.params;
@@ -74,20 +78,22 @@ router.get('/videos/:accountId', async (req: Request, res: Response) => {
     }
 });
 
-
-
+/**
+ * GET /api/tiktok/analytics/:accountId
+ * Get aggregated analytics for an account
+ */
 router.get('/analytics/:accountId', async (req: Request, res: Response) => {
     try {
         const { accountId } = req.params;
 
-
+        // Get user info
         const { data: userInfo } = await supabase
             .from('tiktok_user_info')
             .select('*')
             .eq('account_id', accountId)
             .single();
 
-
+        // Get video count and total analytics
         const { data: videos } = await supabase
             .from('tiktok_videos')
             .select(`
@@ -102,7 +108,7 @@ router.get('/analytics/:accountId', async (req: Request, res: Response) => {
       `)
             .eq('account_id', accountId);
 
-
+        // Calculate aggregated metrics
         let totalLikes = 0;
         let totalComments = 0;
         let totalShares = 0;
@@ -149,12 +155,14 @@ router.get('/analytics/:accountId', async (req: Request, res: Response) => {
     }
 });
 
-
-
+/**
+ * POST /api/tiktok/sync/:accountId
+ * Manually trigger data sync for an account
+ */
 router.post('/sync/:accountId', async (req: Request, res: Response) => {
     try {
         const { accountId } = req.params;
-        const { syncType = 'all' } = req.body;
+        const { syncType = 'all' } = req.body; // 'all', 'user', or 'videos'
 
         let result;
 
@@ -185,8 +193,10 @@ router.post('/sync/:accountId', async (req: Request, res: Response) => {
     }
 });
 
-
-
+/**
+ * GET /api/tiktok/sync/status/:accountId
+ * Get sync status for an account
+ */
 router.get('/sync/status/:accountId', async (req: Request, res: Response) => {
     try {
         const { accountId } = req.params;

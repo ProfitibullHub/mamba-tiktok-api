@@ -5,10 +5,10 @@ import { supabase } from '../config/supabase';
 
 const router = Router();
 
-
+// Store CSRF tokens and code verifiers temporarily (in production, use Redis or similar)
 const csrfTokens = new Map<string, { accountId?: string; codeVerifier: string; timestamp: number }>();
 
-
+// Clean up old CSRF tokens every 10 minutes
 setInterval(() => {
     const now = Date.now();
     for (const [token, data] of csrfTokens.entries()) {
@@ -18,22 +18,24 @@ setInterval(() => {
     }
 }, 10 * 60 * 1000);
 
-
-
+/**
+ * POST /api/tiktok/auth/start
+ * Generate OAuth URL to start authentication flow
+ */
 router.post('/start', async (req: Request, res: Response) => {
     try {
         const { accountId } = req.body;
 
-
+        // Generate CSRF token
         const csrfToken = crypto.randomBytes(32).toString('hex');
 
-
+        // Generate PKCE code verifier and challenge
         const { codeVerifier, codeChallenge } = tiktokAPI.generatePKCE();
 
-
+        // Store both CSRF token and code verifier
         csrfTokens.set(csrfToken, { accountId, codeVerifier, timestamp: Date.now() });
 
-
+        // Generate OAuth URL with code challenge
         const authUrl = tiktokAPI.generateAuthUrl(csrfToken, codeChallenge, accountId);
 
         res.json({
@@ -50,13 +52,15 @@ router.post('/start', async (req: Request, res: Response) => {
     }
 });
 
-
-
+/**
+ * GET /api/tiktok/auth/callback
+ * Handle OAuth callback from TikTok
+ */
 router.get('/callback', async (req: Request, res: Response) => {
     try {
         const { code, state, error, error_description } = req.query;
 
-
+        // Check for OAuth errors
         if (error) {
             const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
             return res.redirect(`${frontendUrl}?tiktok_error=${encodeURIComponent(error_description as string || error as string)}`);
@@ -66,11 +70,11 @@ router.get('/callback', async (req: Request, res: Response) => {
             throw new Error('Missing code or state parameter');
         }
 
-
+        // Parse and validate state
         const stateData = JSON.parse(state as string);
         const { csrf, accountId } = stateData;
 
-
+        // Validate CSRF token and get code verifier
         const storedData = csrfTokens.get(csrf);
         if (!storedData) {
             throw new Error('Invalid or expired CSRF token');
@@ -79,13 +83,13 @@ router.get('/callback', async (req: Request, res: Response) => {
         const { codeVerifier } = storedData;
         csrfTokens.delete(csrf);
 
-
+        // Exchange code for tokens using code verifier
         const tokens = await tiktokAPI.getAccessToken(code as string, codeVerifier);
 
-
+        // Calculate token expiry
         const expiresAt = new Date(Date.now() + tokens.expires_in * 1000);
 
-
+        // Save tokens to database
         const { error: dbError } = await supabase
             .from('tiktok_auth_tokens')
             .upsert({
@@ -106,24 +110,24 @@ router.get('/callback', async (req: Request, res: Response) => {
             throw new Error('Failed to save authentication tokens');
         }
 
-
+        // AUTO-SYNC: Fetch user data immediately after authentication
         try {
             console.log(`Auto-syncing TikTok data for account ${accountId}...`);
 
-
+            // Import sync service dynamically to avoid circular dependencies
             const { tiktokSyncService } = await import('../services/tiktok-sync.service');
 
-
+            // Sync user data and videos
             await tiktokSyncService.syncUserData(accountId);
             await tiktokSyncService.syncVideos(accountId);
 
             console.log(`Auto-sync completed for account ${accountId}`);
         } catch (syncError: any) {
             console.error('Error during auto-sync:', syncError);
-
+            // Don't fail the OAuth flow if sync fails - user can manually sync later
         }
 
-
+        // Redirect back to frontend with success
         const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
         res.redirect(`${frontendUrl}?tiktok_connected=true&account_id=${accountId}`);
     } catch (error: any) {
@@ -133,13 +137,15 @@ router.get('/callback', async (req: Request, res: Response) => {
     }
 });
 
-
-
+/**
+ * POST /api/tiktok/auth/refresh
+ * Manually refresh access token
+ */
 router.post('/refresh/:accountId', async (req: Request, res: Response) => {
     try {
         const { accountId } = req.params;
 
-
+        // Get current tokens
         const { data: tokenData, error: fetchError } = await supabase
             .from('tiktok_auth_tokens')
             .select('refresh_token')
@@ -153,11 +159,11 @@ router.post('/refresh/:accountId', async (req: Request, res: Response) => {
             });
         }
 
-
+        // Refresh token
         const newTokens = await tiktokAPI.refreshAccessToken(tokenData.refresh_token);
         const expiresAt = new Date(Date.now() + newTokens.expires_in * 1000);
 
-
+        // Update database
         const { error: updateError } = await supabase
             .from('tiktok_auth_tokens')
             .update({
@@ -186,13 +192,15 @@ router.post('/refresh/:accountId', async (req: Request, res: Response) => {
     }
 });
 
-
-
+/**
+ * DELETE /api/tiktok/auth/disconnect/:accountId
+ * Disconnect TikTok account
+ */
 router.delete('/disconnect/:accountId', async (req: Request, res: Response) => {
     try {
         const { accountId } = req.params;
 
-
+        // Delete auth tokens
         const { error } = await supabase
             .from('tiktok_auth_tokens')
             .delete()
@@ -215,8 +223,10 @@ router.delete('/disconnect/:accountId', async (req: Request, res: Response) => {
     }
 });
 
-
-
+/**
+ * GET /api/tiktok/auth/status/:accountId
+ * Check if account is connected to TikTok
+ */
 router.get('/status/:accountId', async (req: Request, res: Response) => {
     try {
         const { accountId } = req.params;

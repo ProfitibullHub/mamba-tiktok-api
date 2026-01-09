@@ -3,15 +3,21 @@ import { useState, useEffect } from 'react';
 import { StatCard } from '../StatCard';
 import { useShopStore } from '../../store/useShopStore';
 import { DateRangePicker, DateRange } from '../DateRangePicker';
+import { RefreshCw } from 'lucide-react';
+import { Account } from '../../lib/supabase';
 
 interface ProfitLossViewProps {
+  account: Account;
   shopId?: string;
 }
 
 interface ProfitLossMetrics {
   total_revenue: number;
+  deductions: number;
+  net_sales: number;
+  unsettled_revenue: number;
   ad_revenue: number;
-  sales_revenue: number;
+  sales_revenue: number; // Keeping for backward compatibility or specific breakdown if needed
   affiliate_revenue: number;
   total_costs: number;
   ad_spend: number;
@@ -33,14 +39,21 @@ const getDefaultDateRange = (): DateRange => {
   };
 };
 
-export function ProfitLossView({ shopId: _shopId }: ProfitLossViewProps) {
+export function ProfitLossView({ account, shopId }: ProfitLossViewProps) {
   const [dateRange, setDateRange] = useState<DateRange>(getDefaultDateRange());
   const orders = useShopStore(state => state.orders);
   const finance = useShopStore(state => state.finance);
   const isLoading = useShopStore(state => state.isLoading);
+  const syncData = useShopStore(state => state.syncData);
+  const cacheMetadata = useShopStore(state => state.cacheMetadata);
 
   const [plMetrics, setPlMetrics] = useState<ProfitLossMetrics | null>(null);
   const [calculating, setCalculating] = useState(false);
+
+  const handleSync = async () => {
+    if (!shopId) return;
+    await syncData(account.id, shopId, 'finance');
+  };
 
   useEffect(() => {
     if (!isLoading) {
@@ -52,33 +65,45 @@ export function ProfitLossView({ shopId: _shopId }: ProfitLossViewProps) {
     try {
       setCalculating(true);
 
-
+      // Filter orders by date range (UTC midnight)
       const start = new Date(dateRange.startDate).getTime() / 1000;
-      const end = new Date(dateRange.endDate).getTime() / 1000 + 86400;
+      const end = new Date(dateRange.endDate).getTime() / 1000 + 86400; // End of day
 
-      const filteredOrders = orders.filter(o => o.created_time >= start && o.created_time <= end);
       const filteredStatements = finance.statements.filter(s => s.statement_time >= start && s.statement_time <= end);
 
+      // Calculate Metrics using Statements (User Request)
+      // 1. Revenue Amount (Top Line)
+      const totalRevenue = filteredStatements.reduce((sum, s) => sum + parseFloat(s.revenue_amount || '0'), 0);
 
-      const totalRevenue = filteredOrders.reduce((sum, o) => sum + o.order_amount, 0);
-      const netPayout = filteredStatements.reduce((sum, s) => sum + parseFloat(s.settlement_amount), 0);
+      // 2. Net Sales Amount (Sales Value)
+      const netSales = filteredStatements.reduce((sum, s) => sum + parseFloat(s.net_sales_amount || '0'), 0);
 
+      // 3. Settlement Amount (Take-Home Pay / Net Profit)
+      const netProfit = filteredStatements.reduce((sum, s) => sum + parseFloat(s.settlement_amount || '0'), 0);
 
-      const adSpend = 0;
-      const productCosts = totalRevenue * 0.3;
-      const operationalCosts = totalRevenue * 0.1;
+      // Deductions (Difference between Revenue and Net Sales, usually 0 if they match)
+      const totalDeductions = totalRevenue - netSales;
 
-      const totalCosts = (totalRevenue - netPayout) + productCosts + operationalCosts;
+      const unsettledRevenue = 0; // Not calculating this from statements only
+
+      // Estimates (since we don't have this data from API yet)
+      const adSpend = 0; // Would need Ads API
+      const productCosts = totalRevenue * 0.3; // Estimated 30% COGS
+      const operationalCosts = totalRevenue * 0.1; // Estimated 10% Ops
+
+      const totalCosts = (totalRevenue - netProfit) + productCosts + operationalCosts; // Fees + COGS + Ops (Approximation)
       const grossProfit = totalRevenue - productCosts;
-      const netProfit = netPayout - productCosts - operationalCosts;
 
       const profitMargin = totalRevenue > 0 ? (netProfit / totalRevenue) * 100 : 0;
       const roi = totalCosts > 0 ? ((netProfit / totalCosts) * 100) : 0;
 
       setPlMetrics({
         total_revenue: totalRevenue,
+        deductions: totalDeductions,
+        net_sales: netSales,
+        unsettled_revenue: unsettledRevenue,
         ad_revenue: 0,
-        sales_revenue: totalRevenue,
+        sales_revenue: netSales, // Using Net Sales as the main sales figure
         affiliate_revenue: 0,
         total_costs: totalCosts,
         ad_spend: adSpend,
@@ -105,9 +130,7 @@ export function ProfitLossView({ shopId: _shopId }: ProfitLossViewProps) {
   }
 
   const formatCurrency = (num: number): string => {
-    if (num >= 1000000) return `$${(num / 1000000).toFixed(2)}M`;
-    if (num >= 1000) return `$${(num / 1000).toFixed(2)}K`;
-    return `$${num.toFixed(2)}`;
+    return `$${num.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
   };
 
   const formatPercent = (num: number): string => {
@@ -121,7 +144,17 @@ export function ProfitLossView({ shopId: _shopId }: ProfitLossViewProps) {
           <h2 className="text-2xl font-bold text-white mb-2">Profit & Loss Statement</h2>
           <p className="text-gray-400">Financial performance and profitability analysis</p>
         </div>
-        <DateRangePicker value={dateRange} onChange={setDateRange} />
+        <div className="flex gap-3">
+          <button
+            onClick={handleSync}
+            disabled={cacheMetadata.isSyncing || isLoading}
+            className="flex items-center space-x-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg transition-colors disabled:opacity-50"
+          >
+            <RefreshCw size={20} className={cacheMetadata.isSyncing ? "animate-spin" : ""} />
+            <span>{cacheMetadata.isSyncing ? 'Syncing...' : 'Sync Finance'}</span>
+          </button>
+          <DateRangePicker value={dateRange} onChange={setDateRange} />
+        </div>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -168,15 +201,41 @@ export function ProfitLossView({ shopId: _shopId }: ProfitLossViewProps) {
 
           <div className="flex items-center justify-between py-3 border-b border-gray-700">
             <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-lg bg-gradient-to-r from-red-500 to-pink-500 flex items-center justify-center">
+                <DollarSign className="w-5 h-5 text-white" />
+              </div>
+              <div>
+                <p className="text-white font-medium">Deductions</p>
+                <p className="text-sm text-gray-400">Discounts & Refunds</p>
+              </div>
+            </div>
+            <p className="text-xl font-bold text-red-400">-{formatCurrency(plMetrics?.deductions || 0)}</p>
+          </div>
+
+          <div className="flex items-center justify-between py-3 border-b border-gray-700">
+            <div className="flex items-center gap-3">
               <div className="w-10 h-10 rounded-lg bg-gradient-to-r from-blue-500 to-cyan-500 flex items-center justify-center">
                 <DollarSign className="w-5 h-5 text-white" />
               </div>
               <div>
-                <p className="text-white font-medium">Sales Revenue</p>
-                <p className="text-sm text-gray-400">From TikTok Shop</p>
+                <p className="text-white font-medium">Net Sales</p>
+                <p className="text-sm text-gray-400">Revenue after deductions</p>
               </div>
             </div>
-            <p className="text-xl font-bold text-blue-400">{formatCurrency(plMetrics?.sales_revenue || 0)}</p>
+            <p className="text-xl font-bold text-blue-400">{formatCurrency(plMetrics?.net_sales || 0)}</p>
+          </div>
+
+          <div className="flex items-center justify-between py-3 border-b border-gray-700">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-lg bg-gradient-to-r from-cyan-500 to-teal-500 flex items-center justify-center">
+                <DollarSign className="w-5 h-5 text-white" />
+              </div>
+              <div>
+                <p className="text-white font-medium">Unsettled Revenue</p>
+                <p className="text-sm text-gray-400">Estimated (not yet paid)</p>
+              </div>
+            </div>
+            <p className="text-xl font-bold text-cyan-400">{formatCurrency(plMetrics?.unsettled_revenue || 0)}</p>
           </div>
 
           <div className="flex items-center justify-between py-3 border-b border-gray-700">
@@ -277,13 +336,13 @@ export function ProfitLossView({ shopId: _shopId }: ProfitLossViewProps) {
               ) : (
                 <TrendingDown className="w-6 h-6 text-red-400" />
               )}
-              <p className="text-gray-400 font-medium">Net Profit</p>
+              <p className="text-gray-400 font-medium">Settlement Amount (Net Profit)</p>
             </div>
             <p className={`text-3xl font-bold mb-1 ${plMetrics && plMetrics.net_profit > 0 ? 'text-green-400' : 'text-red-400'
               }`}>
               {formatCurrency(plMetrics?.net_profit || 0)}
             </p>
-            <p className="text-sm text-gray-400">Revenue minus all costs</p>
+            <p className="text-sm text-gray-400">Actual payout to bank</p>
           </div>
         </div>
       </div>

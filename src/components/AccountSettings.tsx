@@ -26,7 +26,7 @@ export default function AccountSettings() {
         try {
             setLoading(true);
 
-
+            // Get user's profile to check role
             const { data: profile } = await supabase
                 .from('profiles')
                 .select('role')
@@ -35,7 +35,7 @@ export default function AccountSettings() {
 
             let query = supabase.from('accounts').select('*');
 
-
+            // If not admin, filter by user's assigned accounts
             if (profile?.role !== 'admin') {
                 const { data: userAccounts } = await supabase
                     .from('user_accounts')
@@ -76,7 +76,7 @@ export default function AccountSettings() {
                 <p className="text-gray-500 mt-2">Manage your TikTok account connections and view analytics</p>
             </div>
 
-            {}
+            {/* Account Selector */}
             {accounts.length > 1 && (
                 <div className="bg-white rounded-lg border border-gray-200 p-4">
                     <label className="block text-sm font-medium text-gray-700 mb-2">
@@ -98,13 +98,13 @@ export default function AccountSettings() {
 
             {selectedAccount && (
                 <>
-                    {}
+                    {/* TikTok Connection */}
                     <div className="bg-white rounded-lg border border-gray-200 p-6">
                         <h2 className="text-xl font-semibold text-gray-900 mb-4">TikTok Connection</h2>
                         <TikTokConnect accountId={selectedAccount} />
                     </div>
 
-                    {}
+                    {/* TikTok Analytics */}
                     <div className="bg-white rounded-lg border border-gray-200 p-6">
                         <h2 className="text-xl font-semibold text-gray-900 mb-4">TikTok Analytics</h2>
                         <TikTokAnalytics accountId={selectedAccount} />

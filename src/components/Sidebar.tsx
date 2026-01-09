@@ -1,4 +1,4 @@
-import { BarChart3, ShoppingBag, Package, Calculator, Store, LogOut } from 'lucide-react';
+import { BarChart3, ShoppingBag, Package, Calculator, Store, LogOut, Users, Database } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 
 interface SidebarProps {
@@ -14,6 +14,14 @@ export function Sidebar({ activeTab, onTabChange }: SidebarProps) {
     { id: 'orders', label: 'Orders', icon: ShoppingBag },
     { id: 'products', label: 'Products', icon: Package },
     { id: 'profit-loss', label: 'P&L Statement', icon: Calculator },
+    { id: 'finance-debug', label: 'Finance Debug', icon: Database },
+    { id: 'profile', label: 'Profile', icon: Users },
+  ];
+
+  const adminMenuItems = [
+    { id: 'admin-dashboard', label: 'Admin Dashboard', icon: BarChart3 },
+    { id: 'admin-users', label: 'User Management', icon: Users },
+    { id: 'admin-stores', label: 'Store Management', icon: Store },
   ];
 
   return (
@@ -51,6 +59,34 @@ export function Sidebar({ activeTab, onTabChange }: SidebarProps) {
             );
           })}
         </div>
+
+        {profile?.role === 'admin' && (
+          <div className="mt-8">
+            <p className="px-4 text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">
+              Admin Panel
+            </p>
+            <div className="space-y-1">
+              {adminMenuItems.map((item) => {
+                const Icon = item.icon;
+                const isActive = activeTab === item.id;
+
+                return (
+                  <button
+                    key={item.id}
+                    onClick={() => onTabChange(item.id)}
+                    className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg font-medium transition-all ${isActive
+                      ? 'bg-gradient-to-r from-pink-500/20 to-red-500/20 text-pink-400 border border-pink-500/30'
+                      : 'text-gray-400 hover:text-white hover:bg-gray-800'
+                      }`}
+                  >
+                    <Icon className="w-5 h-5" />
+                    <span>{item.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
       </nav>
 
       <div className="p-4 border-t border-gray-800">

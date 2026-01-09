@@ -35,7 +35,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       });
 
       if (newUser) {
-
+        // Only fetch profile if user changed or we don't have it
+        // We can rely on the user ID check above, but we need to trigger profile fetch
+        // Let's keep it simple: if we have a user, ensure we have a profile.
+        // But to avoid "reload on refocus", we should check if we already have the profile for this user.
+        // However, profile might have changed on server.
+        // Ideally we use React Query for profile.
         fetchProfile(newUser.id);
       } else {
         setProfile(null);
@@ -47,8 +52,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const fetchProfile = async (userId: string) => {
-
-
+    // If we already have the profile for this user, don't set loading to true (or maybe don't even fetch if we want to be strict, but syncing is good)
+    // To avoid flickering, we can just fetch and update.
     try {
       const { data, error } = await supabase
         .from('profiles')
@@ -59,7 +64,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (error) throw error;
 
       setProfile(prev => {
-
+        // Simple equality check to avoid re-renders
         if (JSON.stringify(prev) === JSON.stringify(data)) return prev;
         return data;
       });
@@ -84,7 +89,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   const signOut = async () => {
-    await supabase.auth.signOut();
+    try {
+      // Attempt to sign out from Supabase
+      const { error } = await supabase.auth.signOut();
+      if (error) {
+        console.error('Error signing out from Supabase:', error);
+      }
+    } catch (error) {
+      console.error('Unexpected error during sign out:', error);
+    } finally {
+      // Always clear local state, even if server request fails
+      setUser(null);
+      setProfile(null);
+      setLoading(false);
+      // Optional: Clear any other local storage items if needed
+      localStorage.removeItem('supabase.auth.token'); // Just in case, though client handles this
+    }
   };
 
   return (
