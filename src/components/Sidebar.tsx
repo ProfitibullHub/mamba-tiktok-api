@@ -1,4 +1,4 @@
-import { BarChart3, ShoppingBag, Package, Calculator, Store, LogOut, Users, Database } from 'lucide-react';
+import { BarChart3, ShoppingBag, Package, Calculator, Store, LogOut, Users, TrendingUp } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 
 interface SidebarProps {
@@ -14,7 +14,7 @@ export function Sidebar({ activeTab, onTabChange }: SidebarProps) {
     { id: 'orders', label: 'Orders', icon: ShoppingBag },
     { id: 'products', label: 'Products', icon: Package },
     { id: 'profit-loss', label: 'P&L Statement', icon: Calculator },
-    { id: 'finance-debug', label: 'Finance Debug', icon: Database },
+    { id: 'marketing', label: 'Marketing', icon: TrendingUp },
     { id: 'profile', label: 'Profile', icon: Users },
   ];
 

@@ -1,10 +1,14 @@
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { Login } from './components/Login';
 import { Dashboard } from './components/Dashboard';
+import { TikTokAdsCallback } from './components/TikTokAdsCallback';
 import { useEffect } from 'react';
 
 function AppContent() {
   const { user, loading } = useAuth();
+
+  // Check if this is the TikTok Ads OAuth callback
+  const isTikTokAdsCallback = window.location.pathname === '/auth/tiktok-ads/callback';
 
   useEffect(() => {
     // Auth check logic or other app-level effects can go here
@@ -16,6 +20,11 @@ function AppContent() {
         <div className="animate-spin rounded-full h-16 w-16 border-4 border-pink-500 border-t-transparent"></div>
       </div>
     );
+  }
+
+  // Handle TikTok Ads OAuth callback (allow even when not authenticated)
+  if (isTikTokAdsCallback) {
+    return <TikTokAdsCallback />;
   }
 
   if (!user) {

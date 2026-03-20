@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { tiktokShopApi } from '../services/tiktok-shop-api.service.js';
 import { supabase } from '../config/supabase.js';
+import { getTimezoneForRegion } from '../utils/timezoneMapping.js';
 import crypto from 'crypto';
 
 const router = Router();
@@ -111,6 +112,10 @@ async function processAuthCode(code: string, accountId: string) {
 
     // Store shop data in database
     for (const shop of shops) {
+        // Map region to IANA timezone
+        const timezone = getTimezoneForRegion(shop.region);
+        console.log(`[Shop Auth] Mapping region "${shop.region}" to timezone "${timezone}"`);
+
         const { error } = await supabase
             .from('tiktok_shops')
             .upsert({
@@ -119,6 +124,7 @@ async function processAuthCode(code: string, accountId: string) {
                 shop_cipher: shop.cipher,
                 shop_name: shop.name,
                 region: shop.region,
+                timezone: timezone,  // Store IANA timezone
                 seller_type: shop.seller_type,
                 access_token: tokenData.access_token,
                 refresh_token: tokenData.refresh_token,
@@ -246,9 +252,50 @@ router.get('/status/:accountId', async (req: Request, res: Response) => {
         }
 
         const connected = shops && shops.length > 0;
-        const isExpired = connected && shops[0].token_expires_at
-            ? new Date(shops[0].token_expires_at) < new Date()
-            : false;
+        const now = Date.now();
+
+        // Calculate token health for the first shop (they share tokens)
+        let tokenHealth: {
+            accessTokenExpiresIn: number | null;
+            refreshTokenExpiresIn: number | null;
+            status: 'healthy' | 'warning' | 'critical' | 'expired';
+            message: string | null;
+        } = {
+            accessTokenExpiresIn: null,
+            refreshTokenExpiresIn: null,
+            status: 'healthy',
+            message: null
+        };
+
+        if (connected && shops[0]) {
+            const shop = shops[0];
+
+            // Calculate expiration times in seconds
+            const accessExpiry = shop.token_expires_at ? new Date(shop.token_expires_at).getTime() : null;
+            const refreshExpiry = shop.refresh_token_expires_at ? new Date(shop.refresh_token_expires_at).getTime() : null;
+
+            tokenHealth.accessTokenExpiresIn = accessExpiry ? Math.max(0, Math.floor((accessExpiry - now) / 1000)) : null;
+            tokenHealth.refreshTokenExpiresIn = refreshExpiry ? Math.max(0, Math.floor((refreshExpiry - now) / 1000)) : null;
+
+            // Determine health status based on refresh token (the critical one)
+            if (refreshExpiry) {
+                const daysUntilRefreshExpires = (refreshExpiry - now) / (1000 * 60 * 60 * 24);
+
+                if (refreshExpiry < now) {
+                    tokenHealth.status = 'expired';
+                    tokenHealth.message = 'Authorization has expired. Please reconnect your TikTok Shop to continue.';
+                } else if (daysUntilRefreshExpires <= 1) {
+                    tokenHealth.status = 'critical';
+                    tokenHealth.message = 'Authorization expires within 24 hours! Click to refresh your connection.';
+                } else if (daysUntilRefreshExpires <= 7) {
+                    tokenHealth.status = 'warning';
+                    tokenHealth.message = `Authorization expires in ${Math.floor(daysUntilRefreshExpires)} days. Sync data to extend.`;
+                }
+                // else: healthy, no message needed
+            }
+        }
+
+        const isExpired = tokenHealth.status === 'expired';
 
         res.json({
             success: true,
@@ -260,6 +307,7 @@ router.get('/status/:accountId', async (req: Request, res: Response) => {
                 name: shop.shop_name,
                 region: shop.region,
             })) || [],
+            tokenHealth
         });
     } catch (error: any) {
         console.error('Error checking TikTok Shop status:', error);
@@ -269,6 +317,7 @@ router.get('/status/:accountId', async (req: Request, res: Response) => {
         });
     }
 });
+
 
 /**
  * DELETE /api/tiktok-shop/auth/disconnect/:accountId
@@ -302,25 +351,56 @@ router.delete('/disconnect/:accountId', async (req: Request, res: Response) => {
 
 /**
  * DELETE /api/tiktok-shop/auth/disconnect/:accountId/:shopId
- * Disconnect specific TikTok Shop
+ * Remove a shop and all associated customer data from Supabase.
+ * Deletes: shop_orders, shop_products, shop_settlements, then tiktok_shops.
  */
 router.delete('/disconnect/:accountId/:shopId', async (req: Request, res: Response) => {
     try {
         const { accountId, shopId } = req.params;
 
-        const { error } = await supabase
+        // Fetch internal shop ID (UUID) and name — needed to clean data tables
+        const { data: shop, error: fetchError } = await supabase
+            .from('tiktok_shops')
+            .select('id, shop_name')
+            .eq('account_id', accountId)
+            .eq('shop_id', shopId)
+            .maybeSingle();
+
+        if (fetchError) throw fetchError;
+
+        if (!shop) {
+            return res.status(404).json({ success: false, error: 'Shop not found' });
+        }
+
+        const { id: internalId, shop_name: shopName } = shop;
+        console.log(`[Disconnect] Removing shop "${shopName}" (${shopId}) — wiping all associated data...`);
+
+        // Delete all customer data in parallel, then remove the shop record
+        const [ordersResult, productsResult, settlementsResult] = await Promise.all([
+            supabase.from('shop_orders').delete().eq('shop_id', internalId),
+            supabase.from('shop_products').delete().eq('shop_id', internalId),
+            supabase.from('shop_settlements').delete().eq('shop_id', internalId),
+        ]);
+
+        if (ordersResult.error) console.error(`[Disconnect] Orders deletion error:`, ordersResult.error);
+        if (productsResult.error) console.error(`[Disconnect] Products deletion error:`, productsResult.error);
+        if (settlementsResult.error) console.error(`[Disconnect] Settlements deletion error:`, settlementsResult.error);
+
+        console.log(`[Disconnect] Customer data wiped — removing shop record...`);
+
+        // Remove the shop record itself (tokens, cipher, etc.)
+        const { error: shopDeleteError } = await supabase
             .from('tiktok_shops')
             .delete()
-            .eq('account_id', accountId)
-            .eq('shop_id', shopId);
+            .eq('id', internalId);
 
-        if (error) {
-            throw error;
-        }
+        if (shopDeleteError) throw shopDeleteError;
+
+        console.log(`[Disconnect] ✅ Shop "${shopName}" and all associated data successfully removed`);
 
         res.json({
             success: true,
-            message: 'TikTok Shop disconnected successfully',
+            message: 'TikTok Shop and all associated data removed successfully',
         });
     } catch (error: any) {
         console.error('Error disconnecting TikTok Shop:', error);

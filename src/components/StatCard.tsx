@@ -1,5 +1,5 @@
 import { LucideIcon, RefreshCw } from 'lucide-react';
-import { useState } from 'react';
+import { useState, memo, useCallback } from 'react';
 
 interface StatCardProps {
   title: string;
@@ -12,17 +12,18 @@ interface StatCardProps {
   onClick?: () => void;
   onSync?: () => void;
   isSyncing?: boolean;
+  tooltip?: React.ReactNode;
 }
 
-export function StatCard({ title, value, subValue, change, icon: Icon, iconColor, subtitle, onClick, onSync, isSyncing }: StatCardProps) {
+export function StatCard({ title, value, subValue, change, icon: Icon, iconColor, subtitle, onClick, onSync, isSyncing, tooltip }: StatCardProps) {
   const isPositive = change !== undefined && change >= 0;
   const showChange = change !== undefined && change !== 0;
   const [isHovered, setIsHovered] = useState(false);
 
-  const handleSyncClick = (e: React.MouseEvent) => {
+  const handleSyncClick = useCallback((e: React.MouseEvent) => {
     e.stopPropagation(); // Prevent triggering onClick
     onSync?.();
-  };
+  }, [onSync]);
 
   return (
     <div
@@ -56,7 +57,10 @@ export function StatCard({ title, value, subValue, change, icon: Icon, iconColor
       </div>
 
       <div>
-        <p className="text-gray-400 text-sm font-medium mb-1">{title}</p>
+        <div className="flex items-center gap-2 mb-1">
+          <p className="text-gray-400 text-sm font-medium">{title}</p>
+          {tooltip}
+        </div>
         <p className="text-3xl font-bold text-white mb-1">{value}</p>
         {subValue && (
           <p className="text-sm font-medium text-gray-300 mb-1">{subValue}</p>

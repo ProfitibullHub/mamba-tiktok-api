@@ -4,6 +4,7 @@ import { StatCard } from '../StatCard';
 import { useKPIData } from '../../hooks/useKPIData';
 import { Account } from '../../lib/supabase';
 import { DateRangePicker, DateRange } from '../DateRangePicker';
+import { toLocalDateString } from '../../utils/dateUtils';
 
 interface EngagementViewProps {
   account: Account;
@@ -14,8 +15,8 @@ const getDefaultDateRange = (): DateRange => {
   const start = new Date();
   start.setDate(start.getDate() - 30);
   return {
-    startDate: start.toISOString().split('T')[0],
-    endDate: end.toISOString().split('T')[0]
+    startDate: toLocalDateString(start),
+    endDate: toLocalDateString(end)
   };
 };
 

@@ -52,8 +52,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const fetchProfile = async (userId: string) => {
-    // If we already have the profile for this user, don't set loading to true (or maybe don't even fetch if we want to be strict, but syncing is good)
-    // To avoid flickering, we can just fetch and update.
     try {
       const { data, error } = await supabase
         .from('profiles')
@@ -63,11 +61,37 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
       if (error) throw error;
 
-      setProfile(prev => {
-        // Simple equality check to avoid re-renders
-        if (JSON.stringify(prev) === JSON.stringify(data)) return prev;
-        return data;
-      });
+      if (data) {
+        setProfile(prev => {
+          if (JSON.stringify(prev) === JSON.stringify(data)) return prev;
+          return data;
+        });
+      } else {
+        // Profile doesn't exist — auto-create it
+        console.log('[Auth] Profile missing for user, creating automatically:', userId);
+        const { data: { user: authUser } } = await supabase.auth.getUser();
+        if (authUser) {
+          const newProfile = {
+            id: authUser.id,
+            email: authUser.email,
+            full_name: authUser.user_metadata?.full_name || authUser.email?.split('@')[0] || 'User',
+            role: 'client',
+            updated_at: new Date().toISOString(),
+          };
+          const { data: created, error: insertError } = await supabase
+            .from('profiles')
+            .upsert(newProfile, { onConflict: 'id' })
+            .select()
+            .single();
+
+          if (insertError) {
+            console.error('[Auth] Failed to auto-create profile:', insertError);
+          } else {
+            console.log('[Auth] Profile auto-created successfully');
+            setProfile(created);
+          }
+        }
+      }
     } catch (error) {
       console.error('Error fetching profile:', error);
     } finally {

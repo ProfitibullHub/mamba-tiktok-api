@@ -1,0 +1,224 @@
+diff --git a/server/src/routes/admin.routes.ts b/server/src/routes/admin.routes.ts
+index df1f07d..0d6c7c4 100644
+--- a/server/src/routes/admin.routes.ts
++++ b/server/src/routes/admin.routes.ts
+@@ -131,11 +131,15 @@ router.get('/stores', async (req, res) => {
+                     shop_id,
+                     shop_name,
+                     region,
+-                    shop_orders (count),
++                    shop_orders (
++                        order_amount
++                    ),
+                     shop_products (count),
+                     shop_settlements (
+-                        total_amount,
+-                        net_amount
++                        revenue_amount,
++                        fee_amount,
++                        settlement_amount,
++                        status
+                     )
+                 )
+             `);
+@@ -156,11 +160,15 @@ router.get('/stores', async (req, res) => {
+                         shop_id,
+                         shop_name,
+                         region,
+-                        shop_orders (count),
++                        shop_orders (
++                            order_amount
++                        ),
+                         shop_products (count),
+                         shop_settlements (
+-                            total_amount,
+-                            net_amount
++                            revenue_amount,
++                            fee_amount,
++                            settlement_amount,
++                            status
+                         )
+                     )
+                 `);
+@@ -173,18 +181,39 @@ router.get('/stores', async (req, res) => {
+                 let totalOrders = 0;
+                 let totalProducts = 0;
+                 let totalRevenue = 0;
+-                let totalNet = 0;
++                let totalNetAccount = 0;
++                let totalNetProfitAccount = 0;
+ 
+                 const processedShops = shops.map((shop: any) => {
+-                    const ordersCount = shop.shop_orders?.[0]?.count || 0;
++                    const ordersCount = shop.shop_orders?.length || 0;
+                     const productsCount = shop.shop_products?.[0]?.count || 0;
+-                    const revenue = shop.shop_settlements?.reduce((sum: number, s: any) => sum + (Number(s.total_amount) || 0), 0) || 0;
+-                    const net = shop.shop_settlements?.reduce((sum: number, s: any) => sum + (Number(s.net_amount) || 0), 0) || 0;
++
++                    const allSettlements = shop.shop_settlements || [];
++
++                    // Calculate Settled metrics (PAID)
++                    const paidSettlements = allSettlements.filter((s: any) => s.status === 'PAID');
++                    const settledRevenue = paidSettlements.reduce((sum: number, s: any) => sum + (Number(s.revenue_amount) || 0), 0);
++                    const settledNet = paidSettlements.reduce((sum: number, s: any) => sum + (Number(s.settlement_amount) || 0), 0);
++
++                    // Calculate Unsettled metrics (UNSETTLED)
++                    const unsettledSettlements = allSettlements.filter((s: any) => s.status === 'UNSETTLED');
++                    const unsettledRevenue = unsettledSettlements.reduce((sum: number, s: any) => sum + (Number(s.revenue_amount) || 0), 0);
++                    const unsettledNet = unsettledSettlements.reduce((sum: number, s: any) => sum + (Number(s.settlement_amount) || 0), 0);
++
++                    // Total Revenue is Settled + Unsettled Revenue
++                    const revenue = settledRevenue + unsettledRevenue;
++
++                    // Total Net is Settled + Unsettled Net
++                    const totalNet = settledNet + unsettledNet;
++
++                    // Apply same estimates as P&L view (30% COGS, 10% Ops)
++                    const net = totalNet - (revenue * 0.4);
+ 
+                     totalOrders += ordersCount;
+                     totalProducts += productsCount;
+                     totalRevenue += revenue;
+-                    totalNet += net;
++                    totalNetAccount += totalNet;
++                    totalNetProfitAccount += net;
+ 
+                     return {
+                         id: shop.id,
+@@ -210,7 +239,7 @@ router.get('/stores', async (req, res) => {
+                     totalOrders,
+                     totalProducts,
+                     totalRevenue,
+-                    totalNet,
++                    totalNet: totalNetProfitAccount,
+                     stores: processedShops
+                 };
+             });
+@@ -230,18 +259,39 @@ router.get('/stores', async (req, res) => {
+             let totalOrders = 0;
+             let totalProducts = 0;
+             let totalRevenue = 0;
+-            let totalNet = 0;
++            let totalNetAccount = 0;
++            let totalNetProfitAccount = 0;
+ 
+             const processedShops = shops.map((shop: any) => {
+-                const ordersCount = shop.shop_orders?.[0]?.count || 0;
++                const ordersCount = shop.shop_orders?.length || 0;
+                 const productsCount = shop.shop_products?.[0]?.count || 0;
+-                const revenue = shop.shop_settlements?.reduce((sum: number, s: any) => sum + (Number(s.total_amount) || 0), 0) || 0;
+-                const net = shop.shop_settlements?.reduce((sum: number, s: any) => sum + (Number(s.net_amount) || 0), 0) || 0;
++
++                const allSettlements = shop.shop_settlements || [];
++
++                // Calculate Settled metrics (PAID)
++                const paidSettlements = allSettlements.filter((s: any) => s.status === 'PAID');
++                const settledRevenue = paidSettlements.reduce((sum: number, s: any) => sum + (Number(s.revenue_amount) || 0), 0);
++                const settledNet = paidSettlements.reduce((sum: number, s: any) => sum + (Number(s.settlement_amount) || 0), 0);
++
++                // Calculate Unsettled metrics (UNSETTLED)
++                const unsettledSettlements = allSettlements.filter((s: any) => s.status === 'UNSETTLED');
++                const unsettledRevenue = unsettledSettlements.reduce((sum: number, s: any) => sum + (Number(s.revenue_amount) || 0), 0);
++                const unsettledNet = unsettledSettlements.reduce((sum: number, s: any) => sum + (Number(s.settlement_amount) || 0), 0);
++
++                // Total Revenue is Settled + Unsettled Revenue
++                const revenue = settledRevenue + unsettledRevenue;
++
++                // Total Net is Settled + Unsettled Net
++                const totalNet = settledNet + unsettledNet;
++
++                // Apply same estimates as P&L view (30% COGS, 10% Ops)
++                const net = totalNet - (revenue * 0.4);
+ 
+                 totalOrders += ordersCount;
+                 totalProducts += productsCount;
+                 totalRevenue += revenue;
+-                totalNet += net;
++                totalNetAccount += totalNet; // Renamed to avoid conflict
++                totalNetProfitAccount += net;
+ 
+                 return {
+                     id: shop.id,
+@@ -267,7 +317,7 @@ router.get('/stores', async (req, res) => {
+                 totalOrders,
+                 totalProducts,
+                 totalRevenue,
+-                totalNet,
++                totalNet: totalNetProfitAccount,
+                 stores: processedShops
+             };
+         });
+@@ -290,41 +340,55 @@ router.get('/stores/:shopId/pl', async (req, res) => {
+ 
+         console.log(`[Admin API] Fetching P&L for shop ${shopId}...`);
+ 
+-        let query = supabase
++        // Fetch all settlements (Settled + Unsettled)
++        let settlementsQuery = supabase
+             .from('shop_settlements')
+-            .select('*')
++            .select('revenue_amount, fee_amount, settlement_amount, adjustment_amount, status')
+             .eq('shop_id', shopId);
+ 
+         if (startDate && endDate) {
+-            query = query
++            settlementsQuery = settlementsQuery
+                 .gte('settlement_time', startDate)
+                 .lte('settlement_time', endDate);
+         }
+ 
+-        const { data: settlements, error: settlementError } = await query;
+-
++        const { data: settlements, error: settlementError } = await settlementsQuery;
+         if (settlementError) throw settlementError;
+ 
+-        // Calculate P&L metrics
+-        const totalRevenue = settlements.reduce((sum, s) => sum + (Number(s.total_amount) || 0), 0);
+-        const platformFees = settlements.reduce((sum, s) => sum + (Number(s.platform_fee) || 0), 0);
+-        const shippingFees = settlements.reduce((sum, s) => sum + (Number(s.shipping_fee) || 0), 0);
+-        const affiliateCommissions = settlements.reduce((sum, s) => sum + (Number(s.affiliate_commission) || 0), 0);
+-        const refunds = settlements.reduce((sum, s) => sum + (Number(s.refund_amount) || 0), 0);
+-        const adjustments = settlements.reduce((sum, s) => sum + (Number(s.adjustment_amount) || 0), 0);
+-        const netProfit = settlements.reduce((sum, s) => sum + (Number(s.net_amount) || 0), 0);
++        const allSettlements = settlements || [];
++
++        // Calculate Settled metrics (PAID)
++        const paidSettlements = allSettlements.filter((s: any) => s.status === 'PAID');
++        const settledRevenue = paidSettlements.reduce((sum, s) => sum + (Number(s.revenue_amount) || 0), 0);
++        const settledFees = Math.abs(paidSettlements.reduce((sum, s) => sum + (Number(s.fee_amount) || 0), 0));
++        const settledNet = paidSettlements.reduce((sum, s) => sum + (Number(s.settlement_amount) || 0), 0);
++        const adjustments = paidSettlements.reduce((sum, s) => sum + (Number(s.adjustment_amount) || 0), 0);
++
++        // Calculate Unsettled metrics (UNSETTLED)
++        const unsettledSettlements = allSettlements.filter((s: any) => s.status === 'UNSETTLED');
++        const unsettledRevenue = unsettledSettlements.reduce((sum, s) => sum + (Number(s.revenue_amount) || 0), 0);
++        const unsettledFees = Math.abs(unsettledSettlements.reduce((sum, s) => sum + (Number(s.fee_amount) || 0), 0));
++        const unsettledNet = unsettledSettlements.reduce((sum, s) => sum + (Number(s.settlement_amount) || 0), 0);
++
++        // Totals
++        const totalRevenue = settledRevenue + unsettledRevenue;
++        const totalFees = settledFees + unsettledFees;
++        const totalNet = settledNet + unsettledNet;
++
++        // Apply same estimates as P&L view (30% COGS, 10% Ops)
++        const netProfit = totalNet - (totalRevenue * 0.4);
+ 
+         res.json({
+             success: true,
+             data: {
+                 totalRevenue,
+-                platformFees,
+-                shippingFees,
+-                affiliateCommissions,
+-                refunds,
++                platformFees: totalFees,
++                shippingFees: 0,
++                affiliateCommissions: 0,
++                refunds: 0,
+                 adjustments,
+                 netProfit,
+-                settlementCount: settlements.length
++                settlementCount: allSettlements.length
+             }
+         });
+     } catch (error: any) {

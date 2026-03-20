@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1200" y2="630" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0F172A"/>
+      <stop offset="50%" stop-color="#1E1B4B"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="300" y1="200" x2="900" y2="500" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#EC4899"/>
+      <stop offset="100%" stop-color="#A855F7"/>
+    </linearGradient>
+    <linearGradient id="line" x1="0" y1="0" x2="1200" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#EC4899" stop-opacity="0"/>
+      <stop offset="20%" stop-color="#EC4899"/>
+      <stop offset="80%" stop-color="#A855F7"/>
+      <stop offset="100%" stop-color="#A855F7" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <!-- Background -->
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <!-- Decorative grid lines -->
+  <line x1="0" y1="420" x2="1200" y2="420" stroke="#1E293B" stroke-width="1"/>
+  <line x1="0" y1="210" x2="1200" y2="210" stroke="#1E293B" stroke-width="1"/>
+  <!-- Accent line -->
+  <rect x="0" y="610" width="1200" height="4" fill="url(#line)"/>
+  <!-- Logo Mark -->
+  <rect x="100" y="180" width="90" height="90" rx="20" fill="#1E293B" stroke="url(#accent)" stroke-width="2"/>
+  <text x="145" y="244" font-family="Arial, Helvetica, sans-serif" font-size="52" font-weight="800" fill="url(#accent)" text-anchor="middle">M</text>
+  <!-- Title -->
+  <text x="210" y="238" font-family="Arial, Helvetica, sans-serif" font-size="56" font-weight="800" fill="white">Mamba</text>
+  <!-- Tagline -->
+  <text x="105" y="330" font-family="Arial, Helvetica, sans-serif" font-size="28" fill="#94A3B8">TikTok Shop Analytics &amp; Management Platform</text>
+  <!-- Feature pills -->
+  <rect x="105" y="380" width="160" height="40" rx="20" fill="#EC489920" stroke="#EC489950" stroke-width="1"/>
+  <text x="185" y="406" font-family="Arial, Helvetica, sans-serif" font-size="16" fill="#EC4899" text-anchor="middle">P&amp;L Analytics</text>
+  <rect x="285" y="380" width="200" height="40" rx="20" fill="#A855F720" stroke="#A855F750" stroke-width="1"/>
+  <text x="385" y="406" font-family="Arial, Helvetica, sans-serif" font-size="16" fill="#A855F7" text-anchor="middle">Product Management</text>
+  <rect x="505" y="380" width="180" height="40" rx="20" fill="#06B6D420" stroke="#06B6D450" stroke-width="1"/>
+  <text x="595" y="406" font-family="Arial, Helvetica, sans-serif" font-size="16" fill="#06B6D4" text-anchor="middle">Order Tracking</text>
+  <rect x="705" y="380" width="180" height="40" rx="20" fill="#22C55E20" stroke="#22C55E50" stroke-width="1"/>
+  <text x="795" y="406" font-family="Arial, Helvetica, sans-serif" font-size="16" fill="#22C55E" text-anchor="middle">Real-Time Sync</text>
+  <!-- Decorative chart visualization -->
+  <polyline points="100,540 200,510 300,520 400,490 500,500 600,460 700,470 800,430 900,440 1000,400 1100,410" stroke="url(#accent)" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  <polyline points="100,540 200,510 300,520 400,490 500,500 600,460 700,470 800,430 900,440 1000,400 1100,410 1100,580 100,580" fill="url(#accent)" fill-opacity="0.05"/>
+</svg>

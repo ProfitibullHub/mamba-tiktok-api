@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Account } from '../../lib/supabase';
 import { Search, FileText, CreditCard, ArrowDownCircle, AlertCircle, Database, RefreshCw } from 'lucide-react';
 import { DateRangePicker, DateRange } from '../DateRangePicker';
+import { parseUTCDate, toLocalDateString } from '../../utils/dateUtils';
 
 interface FinanceDebugViewProps {
     account: Account;
@@ -21,8 +22,8 @@ export function FinanceDebugView({ account, shopId }: FinanceDebugViewProps) {
 
     // Configuration State
     const [dateRange, setDateRange] = useState<DateRange>({
-        startDate: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
-        endDate: new Date().toISOString().split('T')[0]
+        startDate: toLocalDateString(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)),
+        endDate: toLocalDateString(new Date())
     });
     const [pageSize, setPageSize] = useState(20);
     const [targetId, setTargetId] = useState(''); // For Order ID or Statement ID
@@ -74,16 +75,16 @@ export function FinanceDebugView({ account, shopId }: FinanceDebugViewProps) {
                     // Based on tiktok-shop-finance.routes.ts, it passes query params through.
                     // TikTok API usually expects unix timestamp in seconds or milliseconds.
                     // Let's try passing standard start_time/end_time in seconds.
-                    const start = Math.floor(new Date(dateRange.startDate).getTime() / 1000);
-                    const end = Math.floor(new Date(dateRange.endDate).getTime() / 1000) + 86400;
+                    const start = Math.floor(parseUTCDate(dateRange.startDate).getTime() / 1000);
+                    const end = Math.floor(parseUTCDate(dateRange.endDate).getTime() / 1000) + 86400;
                     params.append('start_time', start.toString());
                     params.append('end_time', end.toString());
                     break;
 
                 case 'payments':
                     url = `${API_BASE_URL}/api/tiktok-shop/finance/payments/${account.id}`;
-                    const pStart = Math.floor(new Date(dateRange.startDate).getTime() / 1000);
-                    const pEnd = Math.floor(new Date(dateRange.endDate).getTime() / 1000) + 86400;
+                    const pStart = Math.floor(parseUTCDate(dateRange.startDate).getTime() / 1000);
+                    const pEnd = Math.floor(parseUTCDate(dateRange.endDate).getTime() / 1000) + 86400;
                     params.append('create_time_ge', pStart.toString());
                     params.append('create_time_le', pEnd.toString());
                     break;

@@ -9,6 +9,9 @@ import tiktokShopAuthRoutes from './routes/tiktok-shop-auth.routes.js';
 import tiktokShopDataRoutes from './routes/tiktok-shop-data.routes.js';
 import tiktokShopFinanceRoutes from './routes/tiktok-shop-finance.routes.js';
 import adminRoutes from './routes/admin.routes.js';
+import tiktokAdsRoutes from './routes/tiktok-ads.routes.js';
+import tiktokDebugRoutes from './routes/tiktok-debug.routes.js';
+import tiktokWebhookRoutes from './routes/tiktok-webhook.routes.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -18,11 +21,12 @@ const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
 const allowedOrigins = [
     'http://localhost:5173',
     'https://tiktok-dashboard-frontend-eight.vercel.app',
-    'https://mamba-frontend.vercel.app',
-    'https://mamba-red.vercel.app',
+    'https://mamba-phase1.vercel.app/',
+    'https://mamba-phase1-back-end.vercel.app',
     FRONTEND_URL
 ];
 
+// Enhanced CORS configuration for Vercel serverless functions
 app.use(cors({
     origin: (origin, callback) => {
         // Allow requests with no origin (like mobile apps or curl requests)
@@ -31,11 +35,36 @@ app.use(cors({
         if (allowedOrigins.indexOf(origin) !== -1) {
             callback(null, true);
         } else {
+            console.log('CORS blocked origin:', origin);
             callback(new Error('Not allowed by CORS'));
         }
     },
     credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+    exposedHeaders: ['Content-Range', 'X-Content-Range'],
+    maxAge: 600 // Cache preflight for 10 minutes
 }));
+
+// Additional CORS headers middleware for Vercel (belt and suspenders approach)
+app.use((req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin && allowedOrigins.includes(origin)) {
+        res.header('Access-Control-Allow-Origin', origin);
+        res.header('Access-Control-Allow-Credentials', 'true');
+        res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+        res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+        res.header('Access-Control-Expose-Headers', 'Content-Range, X-Content-Range');
+    }
+
+    // Handle preflight OPTIONS requests
+    if (req.method === 'OPTIONS') {
+        return res.status(200).end();
+    }
+
+    next();
+});
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -56,9 +85,16 @@ app.get('/health', (req, res) => {
 
 // Mount TikTok Shop routes
 app.use('/api/tiktok-shop/auth', tiktokShopAuthRoutes);
+app.use('/api/tiktok-shop/webhook', tiktokWebhookRoutes);
 app.use('/api/tiktok-shop', tiktokShopDataRoutes);
 app.use('/api/tiktok-shop/finance', tiktokShopFinanceRoutes);
 app.use('/api/admin', adminRoutes);
+
+// Mount TikTok Ads routes
+app.use('/api/tiktok-ads', tiktokAdsRoutes);
+
+// Mount TikTok Debug/Audit routes (raw API data for data authenticity verification)
+app.use('/api/tiktok-shop/debug', tiktokDebugRoutes);
 
 // 404 handler
 app.use((req, res) => {

@@ -16,6 +16,10 @@
         {
             "path": "/api/tiktok-shop/sync/cron",
             "schedule": "0 0 * * *"
+        },
+        {
+            "path": "/api/tiktok-shop/sync/refresh-tokens",
+            "schedule": "0 12 * * *"
         }
     ]
 }

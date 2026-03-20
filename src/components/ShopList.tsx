@@ -1,4 +1,14 @@
-import { Plus, ShoppingBag, MapPin, ExternalLink, RefreshCw, Trash2, User } from 'lucide-react';
+import { Plus, ShoppingBag, MapPin, ExternalLink, RefreshCw, Trash2, User, AlertTriangle, Clock } from 'lucide-react';
+import { useState } from 'react';
+
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001';
+
+interface TokenHealth {
+    status: 'healthy' | 'warning' | 'critical' | 'expired';
+    message: string | null;
+    expiresAt: string | null;
+    refreshTokenExpiresIn: number | null;
+}
 
 interface Shop {
     shop_id: string;
@@ -6,6 +16,8 @@ interface Shop {
     region: string;
     seller_type: string;
     created_at: string;
+    account_id?: string;
+    tokenHealth?: TokenHealth;
 }
 
 interface AdminAccount {
@@ -22,6 +34,8 @@ interface ShopListProps {
     adminAccounts?: AdminAccount[];
     currentUserId?: string;
     deletingShopId?: string | null;
+    disconnectPrompt?: { shopName: string } | null;
+    onDismissDisconnect?: () => void;
     onSelectShop: (shop: Shop, account?: AdminAccount) => void;
     onAddShop: () => void;
     onAddAgency?: () => void;
@@ -31,58 +45,288 @@ interface ShopListProps {
     isSyncing?: boolean;
 }
 
-function ShopCard({ shop, onSelect, onDelete, isDeleting }: { shop: Shop, onSelect: () => void, onDelete?: (e: React.MouseEvent) => void, isDeleting?: boolean }) {
+function formatExpiryDate(isoDate: string | null): string {
+    if (!isoDate) return '';
+    const date = new Date(isoDate);
+    return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+function ShopCard({
+    shop,
+    onSelect,
+    onDelete,
+    isDeleting,
+    onRefreshToken,
+    isRefreshing,
+    reviveStatus = 'idle',
+    isAdminView = false,
+    isOwnShop = true,
+    disconnectingShopName,
+    onDismissDisconnect
+}: {
+    shop: Shop,
+    onSelect: () => void,
+    onDelete?: (e: React.MouseEvent) => void,
+    isDeleting?: boolean,
+    onRefreshToken?: () => void,
+    isRefreshing?: boolean,
+    reviveStatus?: 'idle' | 'refreshing' | 'reauthorizing',
+    isAdminView?: boolean,
+    isOwnShop?: boolean,
+    disconnectingShopName?: string | null,
+    onDismissDisconnect?: () => void
+}) {
+    const tokenHealth = shop.tokenHealth;
+    const isExpired = tokenHealth?.status === 'expired';
+    const needsAttention = tokenHealth?.status === 'warning' || tokenHealth?.status === 'critical';
+
+    // Determine the expired message based on context
+    const getExpiredMessage = () => {
+        if (isAdminView && !isOwnShop) {
+            return {
+                title: 'Client Authorization Expired',
+                subtitle: 'The client needs to reauthorize their TikTok Shop connection.',
+                buttonText: 'Contact Client'
+            };
+        }
+        return {
+            title: 'Authorization Expired',
+            subtitle: 'Your TikTok Shop authorization has expired. Please reconnect to continue.',
+            buttonText: 'Reconnect Shop'
+        };
+    };
+
+    const expiredContent = getExpiredMessage();
+
     return (
-        <div
-            onClick={onSelect}
-            className="bg-gray-800 rounded-xl p-6 border border-gray-700 hover:border-pink-500 transition-all cursor-pointer group relative overflow-hidden"
-        >
-            <div className={`absolute top-0 right-0 p-4 transition-opacity flex space-x-2 ${isDeleting ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
-                {onDelete && (
-                    <button
-                        onClick={onDelete}
-                        disabled={isDeleting}
-                        className={`p-2 rounded-lg transition-colors ${isDeleting
-                            ? 'bg-red-500/10 text-red-500 cursor-wait'
-                            : 'bg-red-500/10 hover:bg-red-500 text-red-500 hover:text-white'
-                            }`}
-                        title="Delete Shop"
-                    >
-                        {isDeleting ? (
-                            <RefreshCw size={16} className="animate-spin" />
-                        ) : (
-                            <Trash2 size={16} />
-                        )}
-                    </button>
-                )}
-                <ExternalLink size={20} className="text-gray-400 group-hover:text-pink-500" />
-            </div>
-
-            <div className="flex items-start space-x-4">
-                <div className="p-3 bg-gray-700 rounded-lg group-hover:bg-pink-500/10 group-hover:text-pink-500 transition-colors">
-                    <ShoppingBag size={24} />
-                </div>
-                <div>
-                    <h3 className="text-lg font-semibold text-white mb-1">{shop.shop_name}</h3>
-                    <div className="flex items-center text-gray-400 text-sm mb-2">
-                        <MapPin size={14} className="mr-1" />
-                        {shop.region}
+        <div className="relative">
+            {/* Disconnect Prompt Overlay */}
+            {disconnectingShopName && (
+                <div className="absolute inset-0 z-20 bg-gray-900/95 backdrop-blur-sm rounded-xl flex flex-col items-center justify-center p-6 text-center">
+                    <div className="p-3 bg-pink-500/20 rounded-full mb-3">
+                        <ExternalLink className="w-7 h-7 text-pink-400" />
                     </div>
-                    <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-900/50 text-green-400">
-                        Active
-                    </span>
+                    <h4 className="text-white font-semibold mb-1 text-sm">To Remove This Shop</h4>
+                    <p className="text-gray-400 text-xs leading-relaxed mb-4">
+                        You need to cancel the authorization<br />from your TikTok Seller Center.<br />Find <span className="text-pink-400 font-medium">Mamba</span> in the list and click <span className="text-white font-medium">"Cancel Authorization"</span>.
+                    </p>
+                    <div className="flex gap-2">
+                        <a
+                            href="https://seller-us.tiktok.com/services/authorizations?shop_region=US&tab=apps"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="px-4 py-2 bg-pink-600 hover:bg-pink-500 text-white text-xs font-medium rounded-lg transition-colors flex items-center gap-1.5"
+                        >
+                            <ExternalLink size={12} />
+                            Open TikTok Seller Center
+                        </a>
+                        <button
+                            onClick={(e) => { e.stopPropagation(); onDismissDisconnect?.(); }}
+                            className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-gray-300 text-xs font-medium rounded-lg transition-colors"
+                        >
+                            Dismiss
+                        </button>
+                    </div>
+                </div>
+            )
+            }
+
+            {/* Expired Overlay - TEMPORARILY DISABLED FOR DEBUGGING */}
+            {
+                false && isExpired && (
+                    <div className="absolute inset-0 z-10 bg-gray-900/90 backdrop-blur-sm rounded-xl flex flex-col items-center justify-center p-6 text-center">
+                        <div className="p-3 bg-red-500/20 rounded-full mb-3">
+                            <AlertTriangle className="w-8 h-8 text-red-400" />
+                        </div>
+                        <h4 className="text-white font-semibold mb-2">{expiredContent.title}</h4>
+                        <p className="text-gray-400 text-sm mb-4">
+                            {expiredContent.subtitle}
+                        </p>
+                        <div className="flex gap-2">
+                            <button
+                                onClick={(e) => {
+                                    e.stopPropagation();
+                                    onRefreshToken?.();
+                                }}
+                                disabled={isRefreshing || reviveStatus !== 'idle'}
+                                className="px-4 py-2 bg-pink-600 hover:bg-pink-700 text-white rounded-lg font-medium transition-colors flex items-center gap-2 disabled:opacity-70"
+                            >
+                                <RefreshCw size={18} className={(isRefreshing || reviveStatus !== 'idle') ? "animate-spin" : ""} />
+                                {reviveStatus === 'reauthorizing'
+                                    ? 'Redirecting to TikTok...'
+                                    : reviveStatus === 'refreshing'
+                                        ? 'Attempting Revival...'
+                                        : 'Revive Connection'}
+                            </button>
+                        </div>
+                    </div>
+                )
+            }
+
+
+            <div
+                onClick={onSelect} // TEMPORARILY ALLOW CLICKING EXPIRED SHOPS
+                className={`bg-gray-800 rounded-xl p-6 border transition-all relative overflow-hidden ${isDeleting
+                    ? 'border-red-500/50 cursor-wait'
+                    : isExpired
+                        ? 'border-red-500/50 opacity-60 cursor-not-allowed filter blur-[1px]'
+                        : 'border-gray-700 hover:border-pink-500 cursor-pointer group'
+                    }`}
+            >
+                {/* Full-card deletion overlay */}
+                {isDeleting && (
+                    <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-gray-900/80 rounded-xl">
+                        <RefreshCw size={24} className="animate-spin text-red-400" />
+                        <span className="text-sm font-medium text-red-300">Removing shop…</span>
+                    </div>
+                )}
+                <div className={`absolute top-0 right-0 p-4 transition-opacity flex space-x-2 ${isDeleting || isExpired ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
+                    {isOwnShop && onDelete && (
+                        <button
+                            onClick={(e) => { e.stopPropagation(); onDelete(e); }}
+                            disabled={isDeleting}
+                            className={`p-2 rounded-lg transition-colors ${isDeleting
+                                ? 'bg-red-500/10 text-red-500 cursor-wait'
+                                : 'bg-red-500/10 hover:bg-red-500 text-red-500 hover:text-white'
+                                }`}
+                            title={isExpired ? 'Remove expired shop & free TikTok slot' : 'Delete Shop'}
+                        >
+                            {isDeleting ? (
+                                <RefreshCw size={16} className="animate-spin" />
+                            ) : (
+                                <Trash2 size={16} />
+                            )}
+                        </button>
+                    )}
+                    {!isExpired && <ExternalLink size={20} className="text-gray-400 group-hover:text-pink-500" />}
+                </div>
+
+                <div className="flex items-start space-x-4">
+                    <div className="p-3 bg-gray-700 rounded-lg group-hover:bg-pink-500/10 group-hover:text-pink-500 transition-colors">
+                        <ShoppingBag size={24} />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                        <h3 className="text-lg font-semibold text-white mb-1 truncate">{shop.shop_name}</h3>
+                        <div className="flex items-center text-gray-400 text-sm mb-2">
+                            <MapPin size={14} className="mr-1 flex-shrink-0" />
+                            {shop.region}
+                        </div>
+                        <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${isExpired
+                            ? 'bg-red-900/50 text-red-400'
+                            : 'bg-green-900/50 text-green-400'
+                            }`}>
+                            {isExpired ? 'Expired' : 'Active'}
+                        </span>
+                    </div>
+                </div>
+
+                {/* Token Warning Banner */}
+                {needsAttention && tokenHealth && (
+                    <div className={`mt-4 p-3 rounded-lg flex items-center justify-between gap-2 ${tokenHealth.status === 'critical'
+                        ? 'bg-orange-500/10 border border-orange-500/30'
+                        : 'bg-yellow-500/10 border border-yellow-500/30'
+                        }`}>
+                        <div className="flex items-center gap-2 text-sm flex-1 min-w-0">
+                            <Clock size={14} className={tokenHealth.status === 'critical' ? 'text-orange-400' : 'text-yellow-400'} />
+                            <span className={`truncate ${tokenHealth.status === 'critical' ? 'text-orange-200' : 'text-yellow-200'}`}>
+                                Reauthorize by {formatExpiryDate(tokenHealth.expiresAt)}
+                            </span>
+                        </div>
+                        <button
+                            onClick={(e) => {
+                                e.stopPropagation();
+                                onRefreshToken?.();
+                            }}
+                            disabled={isRefreshing}
+                            className={`p-1.5 rounded-md transition-colors flex-shrink-0 ${isRefreshing
+                                ? 'bg-gray-600 cursor-wait'
+                                : tokenHealth.status === 'critical'
+                                    ? 'bg-orange-500/20 hover:bg-orange-500/40 text-orange-300'
+                                    : 'bg-yellow-500/20 hover:bg-yellow-500/40 text-yellow-300'
+                                }`}
+                            title="Refresh Token"
+                        >
+                            <RefreshCw size={14} className={isRefreshing ? 'animate-spin' : ''} />
+                        </button>
+                    </div>
+                )}
+
+                <div className="mt-6 pt-4 border-t border-gray-700 flex justify-between items-center text-sm text-gray-400">
+                    <span className="truncate">ID: {shop.shop_id}</span>
+                    <span>{shop.created_at ? new Date(shop.created_at).toLocaleDateString() : 'N/A'}</span>
                 </div>
             </div>
-
-            <div className="mt-6 pt-4 border-t border-gray-700 flex justify-between items-center text-sm text-gray-400">
-                <span>ID: {shop.shop_id}</span>
-                <span>{shop.created_at ? new Date(shop.created_at).toLocaleDateString() : 'N/A'}</span>
-            </div>
-        </div>
+        </div >
     );
 }
 
-export function ShopList({ shops, adminAccounts, currentUserId, deletingShopId, onSelectShop, onAddShop, onAddAgency, onSyncShops, onDeleteShop, isLoading, isSyncing }: ShopListProps) {
+export function ShopList({ shops, adminAccounts, currentUserId, deletingShopId, disconnectPrompt, onDismissDisconnect, onSelectShop, onAddShop, onAddAgency, onSyncShops, onDeleteShop, isLoading, isSyncing }: ShopListProps) {
+    const [refreshingShopId, setRefreshingShopId] = useState<string | null>(null);
+    const [reviveStatus, setReviveStatus] = useState<'idle' | 'refreshing' | 'reauthorizing'>('idle');
+
+    const handleReauthorize = async (accountId: string) => {
+        try {
+            setReviveStatus('reauthorizing');
+            const response = await fetch(`${API_BASE_URL}/api/tiktok-shop/auth/start`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ accountId })
+            });
+            const data = await response.json();
+            if (data.authUrl) {
+                window.location.href = data.authUrl;
+            }
+        } catch (err) {
+            console.error('Error starting re-auth:', err);
+            setReviveStatus('idle');
+        }
+    };
+
+    const handleRefreshToken = async (shop: Shop) => {
+        if (!shop.account_id) return;
+
+        setRefreshingShopId(shop.shop_id);
+        setReviveStatus('refreshing');
+
+        try {
+            // Step 1: Attempt to sync/refresh the shop data
+            const response = await fetch(`${API_BASE_URL}/api/tiktok-shop/sync/${shop.account_id}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ shopId: shop.shop_id, syncType: 'orders' })
+            });
+            const data = await response.json();
+
+            if (data.success) {
+                // Token refresh worked! Refresh the shops list.
+                setReviveStatus('idle');
+                onSyncShops();
+            } else {
+                // Step 2: Check if the error is due to expired refresh token
+                const isRefreshTokenExpired =
+                    data.error?.includes('REFRESH_TOKEN_EXPIRED') ||
+                    data.error?.includes('Authorization has expired') ||
+                    data.error?.includes('expired') ||
+                    data.code === 105002 ||
+                    data.tokenExpired === true;
+
+                if (isRefreshTokenExpired) {
+                    console.log('[Revive] Refresh token expired, initiating re-authorization...');
+                    // Automatically fallback to full re-auth
+                    await handleReauthorize(shop.account_id);
+                } else {
+                    console.error('[Revive] Sync failed with unexpected error:', data.error);
+                    setReviveStatus('idle');
+                }
+            }
+        } catch (err) {
+            console.error('Error refreshing token:', err);
+            setReviveStatus('idle');
+        } finally {
+            setRefreshingShopId(null);
+        }
+    };
+
     if (isLoading) {
         return (
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
@@ -135,7 +379,7 @@ export function ShopList({ shops, adminAccounts, currentUserId, deletingShopId, 
 
             {isAdmin ? (
                 <div className="space-y-12">
-                    {adminAccounts.map((account) => (
+                    {adminAccounts.filter(a => a.stores.length > 0).map((account) => (
                         <div key={account.id} className="space-y-6">
                             <div className="flex items-center gap-3 border-b border-gray-700 pb-4">
                                 <div className="p-2 bg-pink-500/10 rounded-lg">
@@ -157,19 +401,19 @@ export function ShopList({ shops, adminAccounts, currentUserId, deletingShopId, 
                                 {account.stores.map((shop) => (
                                     <ShopCard
                                         key={shop.shop_id}
-                                        shop={shop}
+                                        shop={{ ...shop, account_id: account.id }}
                                         isDeleting={deletingShopId === shop.shop_id}
+                                        isRefreshing={refreshingShopId === shop.shop_id}
+                                        reviveStatus={refreshingShopId === shop.shop_id ? reviveStatus : 'idle'}
+                                        isAdminView={true}
+                                        isOwnShop={account.owner_id === currentUserId}
+                                        disconnectingShopName={disconnectPrompt?.shopName === shop.shop_name ? disconnectPrompt.shopName : null}
+                                        onDismissDisconnect={onDismissDisconnect}
                                         onSelect={() => onSelectShop(shop, account)}
-                                        onDelete={
-                                            // Only show delete button if current user owns this account
-                                            account.owner_id === currentUserId
-                                                ? (e) => {
-                                                    e.stopPropagation();
-                                                    onDeleteShop(shop);
-                                                }
-                                                : undefined
-                                        }
+                                        onRefreshToken={() => handleRefreshToken({ ...shop, account_id: account.id })}
+                                        onDelete={() => onDeleteShop({ ...shop, account_id: account.id })}
                                     />
+
                                 ))}
                             </div>
                         </div>
@@ -182,11 +426,13 @@ export function ShopList({ shops, adminAccounts, currentUserId, deletingShopId, 
                             key={shop.shop_id}
                             shop={shop}
                             isDeleting={deletingShopId === shop.shop_id}
+                            isRefreshing={refreshingShopId === shop.shop_id}
+                            reviveStatus={refreshingShopId === shop.shop_id ? reviveStatus : 'idle'}
+                            disconnectingShopName={disconnectPrompt?.shopName === shop.shop_name ? disconnectPrompt.shopName : null}
+                            onDismissDisconnect={onDismissDisconnect}
                             onSelect={() => onSelectShop(shop)}
-                            onDelete={(e) => {
-                                e.stopPropagation();
-                                onDeleteShop(shop);
-                            }}
+                            onRefreshToken={() => handleRefreshToken(shop)}
+                            onDelete={() => onDeleteShop(shop)}
                         />
                     ))}
 

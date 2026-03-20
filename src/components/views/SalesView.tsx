@@ -1,9 +1,11 @@
 import { ShoppingBag, DollarSign, TrendingUp, Package, CreditCard } from 'lucide-react';
 import { useState, useEffect } from 'react';
 import { StatCard } from '../StatCard';
+import { CalculationTooltip } from '../CalculationTooltip';
 import { useKPIData } from '../../hooks/useKPIData';
 import { Account, SalesCampaign, supabase } from '../../lib/supabase';
 import { DateRangePicker, DateRange } from '../DateRangePicker';
+import { toLocalDateString } from '../../utils/dateUtils';
 
 interface SalesViewProps {
   account: Account;
@@ -14,8 +16,8 @@ const getDefaultDateRange = (): DateRange => {
   const start = new Date();
   start.setDate(start.getDate() - 30);
   return {
-    startDate: start.toISOString().split('T')[0],
-    endDate: end.toISOString().split('T')[0]
+    startDate: toLocalDateString(start),
+    endDate: toLocalDateString(end)
   };
 };
 
@@ -99,6 +101,11 @@ export function SalesView({ account }: SalesViewProps) {
           change={18.4}
           icon={DollarSign}
           iconColor="bg-gradient-to-r from-green-500 to-emerald-500"
+          tooltip={<CalculationTooltip
+            source="TikTok Ads/Shop"
+            calculation="Sum(revenue)"
+            api="useKPIData hook"
+          />}
         />
         <StatCard
           title="Total Orders"
@@ -106,6 +113,11 @@ export function SalesView({ account }: SalesViewProps) {
           change={12.7}
           icon={ShoppingBag}
           iconColor="bg-gradient-to-r from-blue-500 to-cyan-500"
+          tooltip={<CalculationTooltip
+            source="TikTok Ads/Shop"
+            calculation="Sum(conversions)"
+            api="useKPIData hook"
+          />}
         />
         <StatCard
           title="Avg Order Value"
@@ -113,6 +125,11 @@ export function SalesView({ account }: SalesViewProps) {
           change={5.3}
           icon={CreditCard}
           iconColor="bg-gradient-to-r from-purple-500 to-pink-500"
+          tooltip={<CalculationTooltip
+            source="Calculated"
+            calculation="Revenue / Conversions"
+            api="Calculated"
+          />}
         />
         <StatCard
           title="Profit"
@@ -120,6 +137,11 @@ export function SalesView({ account }: SalesViewProps) {
           change={22.1}
           icon={TrendingUp}
           iconColor="bg-gradient-to-r from-teal-500 to-green-500"
+          tooltip={<CalculationTooltip
+            source="Calculated"
+            calculation="Revenue - Spend"
+            api="Calculated"
+          />}
         />
       </div>
 
@@ -133,6 +155,11 @@ export function SalesView({ account }: SalesViewProps) {
             icon={DollarSign}
             iconColor="bg-gradient-to-r from-red-500 to-pink-500"
             subtitle="Marketing costs"
+            tooltip={<CalculationTooltip
+              source="TikTok Ads"
+              calculation="Sum(spend)"
+              api="useKPIData hook"
+            />}
           />
           <StatCard
             title="Profit Margin"
@@ -140,6 +167,11 @@ export function SalesView({ account }: SalesViewProps) {
             change={3.5}
             icon={TrendingUp}
             iconColor="bg-gradient-to-r from-green-500 to-teal-500"
+            tooltip={<CalculationTooltip
+              source="Calculated"
+              calculation="(Revenue - Spend) / Revenue"
+              api="Calculated"
+            />}
           />
           <StatCard
             title="Products Sold"
@@ -147,6 +179,11 @@ export function SalesView({ account }: SalesViewProps) {
             change={15.2}
             icon={Package}
             iconColor="bg-gradient-to-r from-indigo-500 to-purple-500"
+            tooltip={<CalculationTooltip
+              source="TikTok Ads"
+              calculation="Sum(conversions)"
+              api="useKPIData hook"
+            />}
           />
         </div>
       </div>
@@ -160,6 +197,11 @@ export function SalesView({ account }: SalesViewProps) {
             change={10.3}
             icon={TrendingUp}
             iconColor="bg-gradient-to-r from-blue-500 to-cyan-500"
+            tooltip={<CalculationTooltip
+              source="TikTok Ads"
+              calculation="Sum(impressions)"
+              api="useKPIData hook"
+            />}
           />
           <StatCard
             title="Conversion Rate"
@@ -167,6 +209,11 @@ export function SalesView({ account }: SalesViewProps) {
             change={7.1}
             icon={ShoppingBag}
             iconColor="bg-gradient-to-r from-pink-500 to-red-500"
+            tooltip={<CalculationTooltip
+              source="Calculated"
+              calculation="Conversions / Clicks"
+              api="Calculated"
+            />}
           />
           <StatCard
             title="ROAS"
@@ -175,6 +222,11 @@ export function SalesView({ account }: SalesViewProps) {
             icon={TrendingUp}
             iconColor="bg-gradient-to-r from-green-500 to-emerald-500"
             subtitle="Return on ad spend"
+            tooltip={<CalculationTooltip
+              source="Calculated"
+              calculation="Revenue / Spend"
+              api="Calculated"
+            />}
           />
         </div>
       </div>
@@ -224,13 +276,12 @@ export function SalesView({ account }: SalesViewProps) {
                           <p className="text-gray-300">{campaign.product_name}</p>
                         </td>
                         <td className="px-6 py-4">
-                          <span className={`px-3 py-1 rounded-full text-xs font-medium ${
-                            campaign.status === 'active'
+                          <span className={`px-3 py-1 rounded-full text-xs font-medium ${campaign.status === 'active'
                               ? 'bg-green-500/20 text-green-400 border border-green-500/30'
                               : campaign.status === 'paused'
-                              ? 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/30'
-                              : 'bg-gray-500/20 text-gray-400 border border-gray-500/30'
-                          }`}>
+                                ? 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/30'
+                                : 'bg-gray-500/20 text-gray-400 border border-gray-500/30'
+                            }`}>
                             {campaign.status}
                           </span>
                         </td>
@@ -239,9 +290,8 @@ export function SalesView({ account }: SalesViewProps) {
                         <td className="px-6 py-4 text-right text-red-400">{formatCurrency(campaign.cost)}</td>
                         <td className="px-6 py-4 text-right text-green-400 font-medium">{formatCurrency(campaign.profit)}</td>
                         <td className="px-6 py-4 text-right">
-                          <span className={`font-medium ${
-                            parseFloat(profitMargin) >= 50 ? 'text-green-400' : parseFloat(profitMargin) >= 30 ? 'text-yellow-400' : 'text-red-400'
-                          }`}>
+                          <span className={`font-medium ${parseFloat(profitMargin) >= 50 ? 'text-green-400' : parseFloat(profitMargin) >= 30 ? 'text-yellow-400' : 'text-red-400'
+                            }`}>
                             {profitMargin}%
                           </span>
                         </td>

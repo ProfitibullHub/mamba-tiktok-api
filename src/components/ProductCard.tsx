@@ -1,12 +1,13 @@
-import { Package, BarChart2, AlertCircle } from 'lucide-react';
+import { Package, BarChart2, AlertCircle, DollarSign } from 'lucide-react';
 import { Product } from '../store/useShopStore';
 
 interface ProductCardProps {
     product: Product;
     onClick: () => void;
+    salesCount?: number;
 }
 
-export function ProductCard({ product, onClick }: ProductCardProps) {
+export function ProductCard({ product, onClick, salesCount }: ProductCardProps) {
     const getStatusColor = (status: string) => {
         switch (status?.toLowerCase()) {
             case 'active': return 'text-green-400 bg-green-900/50';
@@ -55,6 +56,11 @@ export function ProductCard({ product, onClick }: ProductCardProps) {
                     <span className={`px-2 py-1 bg-gray-700/100 rounded-full text-xs font-medium ${getStatusColor(product.status)}`}>
                         {product.status}
                     </span>
+                    {product.is_fbt && (
+                        <span className="px-2 py-1 rounded-full text-xs font-medium bg-blue-900/100 text-blue-400" title="Fulfilled by TikTok">
+                            FBT
+                        </span>
+                    )}
                     {hasMultipleSkus && (
                         <span className="px-2 py-1 rounded-full text-xs font-medium bg-pink-900/100 text-pink-400">
                             {skus.length} variants
@@ -92,7 +98,7 @@ export function ProductCard({ product, onClick }: ProductCardProps) {
                         <p className="text-gray-400 text-xs mb-1">Sales</p>
                         <p className="text-white font-medium flex items-center gap-1">
                             <BarChart2 size={12} />
-                            {product.sales_count}
+                            {salesCount !== undefined ? salesCount : product.sales_count}
                         </p>
                     </div>
                 </div>
@@ -102,6 +108,14 @@ export function ProductCard({ product, onClick }: ProductCardProps) {
                 <div className="mt-3 flex items-center gap-2 text-red-400 text-xs bg-red-900/20 p-2 rounded-lg">
                     <AlertCircle size={12} />
                     <span>Out of stock</span>
+                </div>
+            )}
+
+            {/* Show COGS missing indicator for all products without COGS */}
+            {(product.cogs === null || product.cogs === undefined || product.cogs === 0) && (
+                <div className="mt-3 flex items-center gap-2 text-orange-400 text-xs bg-orange-900/20 p-2 rounded-lg">
+                    <DollarSign size={12} />
+                    <span>COGS not set — Click to add</span>
                 </div>
             )}
         </div>

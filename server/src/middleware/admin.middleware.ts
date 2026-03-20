@@ -21,8 +21,16 @@ export const adminMiddleware = async (req: Request, res: Response, next: NextFun
             return res.status(401).json({ success: false, error: 'No token provided' });
         }
 
-        // Verify token with Supabase
-        const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+        // Verify token with Supabase (retry once on transient network/SSL errors)
+        let user: any = null;
+        let authError: any = null;
+        for (let attempt = 0; attempt < 2; attempt++) {
+            const result = await supabase.auth.getUser(token);
+            user = result.data?.user;
+            authError = result.error;
+            if (user || (authError && !authError.message?.includes('fetch failed'))) break;
+            if (attempt === 0) console.log('[Auth] Retrying getUser after transient error...');
+        }
 
         if (authError || !user) {
             return res.status(401).json({ success: false, error: 'Invalid token' });

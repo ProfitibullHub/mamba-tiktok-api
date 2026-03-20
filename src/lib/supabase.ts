@@ -98,6 +98,16 @@ export interface AffiliateProgram {
   updated_at: string;
 }
 
+export interface UserPreference {
+  id: string;
+  user_id: string;
+  account_id: string;
+  preference_key: string;
+  preference_value: any;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface SalesCampaign {
   id: string;
   account_id: string;
@@ -113,4 +123,37 @@ export interface SalesCampaign {
   avg_order_value: number;
   created_at: string;
   updated_at: string;
+}
+
+export interface AffiliateSettlement {
+  id: string;
+  account_id: string;
+  shop_id: string;
+  date: string;
+  affiliate_name: string;
+  amount: number;
+  description?: string;
+  created_at: string;
+}
+export type AgencyFeeType = 'retainer' | 'commission' | 'both';
+export type AgencyFeeRecurrence = 'monthly' | 'quarterly' | 'biannual' | 'annual';
+export type AgencyCommissionBase = 'gmv' | 'gross_profit' | 'net_revenue';
+
+export interface AgencyFee {
+  id: string;
+  account_id: string;
+  shop_id: string;
+  /** Start date of the recurring fee (YYYY-MM-DD) */
+  date: string;
+  agency_name: string;
+  /** Legacy flat amount — still used for pure retainer entries created before this schema */
+  amount: number;
+  description?: string;
+  created_at: string;
+  // --- Enhanced fields ---
+  fee_type: AgencyFeeType;
+  retainer_amount: number;
+  commission_rate: number;   // stored as a percentage, e.g. 10 means 10%
+  commission_base: AgencyCommissionBase;
+  recurrence: AgencyFeeRecurrence;
 }

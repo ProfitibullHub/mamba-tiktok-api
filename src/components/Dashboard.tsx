@@ -2,11 +2,15 @@ import { useState, useEffect } from 'react';
 import { Sidebar } from './Sidebar';
 import { OverlayLoader } from './OverlayLoader';
 import { SyncProgressBar } from './SyncProgressBar';
+import { NewOrdersToast } from './NewOrdersToast';
 import { OverviewView } from './views/OverviewView';
 import { ProfitLossView } from './views/ProfitLossView';
 import { OrdersView } from './views/OrdersView';
 import { ProductsView } from './views/ProductsView';
 import { FinanceDebugView } from './views/FinanceDebugView';
+import { DataAuditView } from './views/DataAuditView';
+import { MarketingDashboardView } from './views/MarketingDashboardView';
+import { AdsDataReviewView } from './views/AdsDataReviewView';
 import { AdminDashboard } from './views/AdminDashboard';
 import { AdminUserManagement } from './views/AdminUserManagement';
 import { AdminStoreManagement } from './views/AdminStoreManagement';
@@ -18,13 +22,14 @@ import { ArrowLeft } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useShopStore } from '../store/useShopStore';
+import { getTimezoneDisplay } from '../utils/timezoneMapping';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001';
 
 export function Dashboard() {
   const { user, profile } = useAuth();
   const queryClient = useQueryClient();
-  const [activeTab, setActiveTab] = useState(profile?.role === 'admin' ? 'admin-dashboard' : 'overview');
+  const [activeTab, setActiveTab] = useState('overview');
   // We still keep selectedAccount state to allow switching if we ever re-enable it, 
   // but we'll default it to the first account from the query.
   const [selectedAccount, setSelectedAccount] = useState<Account | null>(null);
@@ -35,7 +40,8 @@ export function Dashboard() {
   const [viewMode, setViewMode] = useState<'list' | 'details'>('list');
   const [isSyncing, setIsSyncing] = useState(false);
   const [deletingShopId, setDeletingShopId] = useState<string | null>(null);
-  const isShopLoading = useShopStore(state => state.isLoading);
+  const [disconnectPrompt, setDisconnectPrompt] = useState<{ shopName: string } | null>(null);
+
   const cacheMetadata = useShopStore(state => state.cacheMetadata);
 
   // --- Queries ---
@@ -181,6 +187,56 @@ export function Dashboard() {
       supabase.removeChannel(channel);
     };
   }, [(selectedAccount as any)?.owner_id]);
+
+  // 5. Poll for shop deletion after user initiates disconnect via TikTok Seller Center
+  useEffect(() => {
+    if (!disconnectPrompt || !selectedAccount?.id) return;
+
+    // Find the shop_id that matches the disconnect prompt
+    const disconnectingShop = shops.find((s: any) => s.shop_name === disconnectPrompt.shopName);
+    const targetShopId = disconnectingShop?.shop_id;
+
+    if (!targetShopId) return;
+
+    console.log('[Dashboard] Polling for shop deletion...', { shopName: disconnectPrompt.shopName, targetShopId });
+
+    const pollInterval = setInterval(async () => {
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/tiktok-shop/shops/${selectedAccount.id}`);
+        const data = await response.json();
+
+        if (data.success) {
+          const shopStillExists = data.data.some((s: any) => s.shop_id === targetShopId);
+
+          if (!shopStillExists) {
+            console.log('[Dashboard] 🔔 Shop no longer exists — webhook has processed deauthorization');
+
+            // Show spinner on the card
+            setDeletingShopId(targetShopId);
+            clearInterval(pollInterval);
+
+            // Brief delay so the user sees the spinner, then clean up
+            setTimeout(() => {
+              setDisconnectPrompt(null);
+              setDeletingShopId(null);
+
+              if (selectedShop?.shop_id === targetShopId) {
+                setSelectedShop(null);
+                setViewMode('list');
+              }
+
+              queryClient.invalidateQueries({ queryKey: ['shops', selectedAccount?.id] });
+              queryClient.invalidateQueries({ queryKey: ['admin-stores-grouped'] });
+            }, 1500);
+          }
+        }
+      } catch (err) {
+        console.warn('[Dashboard] Poll error:', err);
+      }
+    }, 5000); // Check every 5 seconds
+
+    return () => clearInterval(pollInterval);
+  }, [disconnectPrompt, selectedAccount?.id, selectedShop?.shop_id, shops, queryClient]);
 
   // Prefetch Admin Data on Mount
   useEffect(() => {
@@ -377,38 +433,11 @@ export function Dashboard() {
   };
 
   const handleDeleteShop = async (shop: any) => {
-    if (!selectedAccount || !shop) return;
+    if (!shop) return;
 
-    if (!confirm(`Are you sure you want to delete ${shop.shop_name}? This will remove all data associated with this shop.`)) {
-      return;
-    }
-
-    try {
-      setDeletingShopId(shop.shop_id);
-      const response = await fetch(`${API_BASE_URL}/api/tiktok-shop/auth/disconnect/${selectedAccount.id}/${shop.shop_id}`, {
-        method: 'DELETE',
-      });
-      const data = await response.json();
-
-      if (data.success) {
-        await queryClient.invalidateQueries({ queryKey: ['shops', selectedAccount.id] });
-        if (profile?.role === 'admin') {
-          await queryClient.invalidateQueries({ queryKey: ['admin-stores-grouped'] });
-        }
-        // If the deleted shop was selected, deselect it
-        if (selectedShop?.shop_id === shop.shop_id) {
-          setSelectedShop(null);
-          setViewMode('list');
-        }
-      } else {
-        throw new Error(data.error || 'Failed to delete shop');
-      }
-    } catch (error: any) {
-      console.error('Error deleting shop:', error);
-      alert(`Failed to delete shop: ${error.message}`);
-    } finally {
-      setDeletingShopId(null);
-    }
+    // All users (including admins) must cancel authorization from TikTok Seller Center.
+    // The webhook will automatically clean up all data once they cancel on TikTok's side.
+    setDisconnectPrompt({ shopName: shop.shop_name });
   };
 
   const handleSyncShops = async () => {
@@ -530,15 +559,20 @@ export function Dashboard() {
             </div>
 
             {viewMode === 'details' && selectedShop && (
-              <div className="text-gray-400 text-sm">
+              <div className="text-gray-400 text-sm flex items-center gap-2">
                 Viewing: <span className="text-white font-medium">{selectedShop.shop_name}</span>
+                {selectedShop.timezone && (
+                  <span className="text-gray-500 text-xs">
+                    ({getTimezoneDisplay(selectedShop.timezone)})
+                  </span>
+                )}
               </div>
             )}
           </div>
 
           <OverlayLoader
-            isLoading={(!selectedAccount && accounts.length > 0) || (viewMode === 'list' ? (isLoadingShops || (profile?.role === 'admin' && isLoadingAdminStores)) : isShopLoading)}
-            message={viewMode === 'list' ? "Loading shops..." : "Loading shop data..."}
+            isLoading={(!selectedAccount && accounts.length > 0) || (viewMode === 'list' && (isLoadingShops || (profile?.role === 'admin' && isLoadingAdminStores)))}
+            message="Loading shops..."
           >
             {viewMode === 'list' ? (
               <ShopList
@@ -546,6 +580,8 @@ export function Dashboard() {
                 adminAccounts={adminAccounts}
                 currentUserId={user?.id}
                 deletingShopId={deletingShopId}
+                disconnectPrompt={disconnectPrompt}
+                onDismissDisconnect={() => setDisconnectPrompt(null)}
                 onSelectShop={(shop: any, accountContext?: any) => {
                   const targetAccountId = accountContext?.id || selectedAccount?.id;
 
@@ -587,17 +623,22 @@ export function Dashboard() {
             ) : (
               // Details Views
               (() => {
+                const shopTimezone = selectedShop?.timezone || 'America/Los_Angeles';
                 switch (activeTab) {
-                  case 'overview': return selectedAccount ? <OverviewView account={selectedAccount} shopId={selectedShop?.shop_id} onNavigate={setActiveTab} /> : null;
-                  case 'orders': return selectedAccount ? <OrdersView account={selectedAccount} shopId={selectedShop?.shop_id} /> : null;
+                  case 'overview': return selectedAccount ? <OverviewView account={selectedAccount} shopId={selectedShop?.shop_id} timezone={shopTimezone} /> : null;
+                  case 'orders': return selectedAccount ? <OrdersView account={selectedAccount} shopId={selectedShop?.shop_id} timezone={shopTimezone} /> : null;
                   case 'products': return selectedAccount ? <ProductsView account={selectedAccount} shopId={selectedShop?.shop_id} /> : null;
-                  case 'profit-loss': return selectedAccount ? <ProfitLossView account={selectedAccount} shopId={selectedShop?.shop_id} /> : null;
+                  case 'profit-loss': return selectedAccount ? <ProfitLossView account={selectedAccount} shopId={selectedShop?.shop_id} timezone={shopTimezone} /> : null;
+                  case 'data-audit': return selectedAccount ? <DataAuditView account={selectedAccount} shopId={selectedShop?.shop_id} /> : null;
                   case 'finance-debug': return selectedAccount ? <FinanceDebugView account={selectedAccount} shopId={selectedShop?.shop_id} /> : null;
+
                   case 'profile': return <ProfileView />;
+                  case 'marketing': return selectedAccount ? <MarketingDashboardView account={selectedAccount} shopId={selectedShop?.shop_id} /> : null;
+                  case 'ads-review': return <AdsDataReviewView />;
                   case 'admin-dashboard': return <AdminDashboard />;
                   case 'admin-users': return <AdminUserManagement />;
                   case 'admin-stores': return <AdminStoreManagement />;
-                  default: return selectedAccount ? <OverviewView account={selectedAccount} shopId={selectedShop?.shop_id} /> : null;
+                  default: return selectedAccount ? <OverviewView account={selectedAccount} shopId={selectedShop?.shop_id} timezone={shopTimezone} /> : null;
                 }
               })()
             )}
@@ -605,6 +646,7 @@ export function Dashboard() {
 
           {/* Sync Progress Bar */}
           <SyncProgressBar />
+          <NewOrdersToast />
         </div>
       </main>
     </div>
