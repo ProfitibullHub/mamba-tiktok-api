@@ -1,10 +1,11 @@
-import { useState, useMemo } from 'react';
+import { useState } from 'react';
 import { Account } from '../../lib/supabase';
 import { toLocalDateString } from '../../utils/dateUtils';
 
 interface DataAuditViewProps {
     account: Account;
     shopId?: string;
+    timezone?: string;
 }
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001';
@@ -42,8 +43,37 @@ interface AuditData {
         authentication_method: string;
         note: string;
         date_filter?: { startDate: string; endDate: string } | null;
+        timezone_used?: string;
     };
     api_results: ApiResult[];
+    finance_reconciliation?: {
+        statement_totals: {
+            revenue_amount_sum: number;
+            settlement_amount_sum: number;
+            fee_amount_sum: number;
+            shipping_cost_amount_sum: number;
+            statement_count: number;
+        };
+        transaction_totals: {
+            revenue_amount_sum: number;
+            settlement_amount_sum: number;
+            shipping_cost_amount_sum: number;
+            fee_tax_amount_sum: number;
+            platform_fee_sum: number;
+            affiliate_fee_sum: number;
+            transaction_count: number;
+        };
+        deltas: {
+            shipping_delta: number;
+            fee_tax_minus_statement_fee_delta: number;
+            settlement_delta: number;
+            revenue_delta: number;
+        };
+        buckets: {
+            affiliate_fee_sum: number;
+            platform_fee_sum: number;
+        };
+    };
     smart_sync_explanation?: {
         title: string;
         overview: string;
@@ -66,7 +96,7 @@ let cachedMaxPages: number = 20;
 let cachedExpandedApis: Set<number> = new Set();
 let cachedExpandedResponses: Set<number> = new Set();
 
-export function DataAuditView({ account, shopId }: DataAuditViewProps) {
+export function DataAuditView({ account, shopId, timezone }: DataAuditViewProps) {
     const [data, setData] = useState<AuditData | null>(cachedData);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
@@ -74,7 +104,6 @@ export function DataAuditView({ account, shopId }: DataAuditViewProps) {
     const [expandedResponses, setExpandedResponses] = useState<Set<number>>(cachedExpandedResponses);
     const [expandedCancelledOrders, setExpandedCancelledOrders] = useState(false);
     const [visibleRawDataOrders, setVisibleRawDataOrders] = useState<Set<string>>(new Set());
-    const [expandedCustomerIds, setExpandedCustomerIds] = useState<Set<string>>(new Set());
 
     // Date range state
     const [startDate, setStartDate] = useState(cachedStartDate);
@@ -108,6 +137,7 @@ export function DataAuditView({ account, shopId }: DataAuditViewProps) {
             if (shopId) params.set('shopId', shopId);
             if (startDate) params.set('startDate', startDate);
             if (endDate) params.set('endDate', endDate);
+            if (timezone) params.set('timezone', timezone);
             if (testOrderId.trim()) params.set('testOrderId', testOrderId.trim());
 
             const url = `${API_BASE_URL}/api/tiktok-shop/debug/raw-data/${account.id}?${params.toString()}`;
@@ -160,52 +190,6 @@ export function DataAuditView({ account, shopId }: DataAuditViewProps) {
     };
 
     const counts = data ? getCounts() : null;
-
-    // Compute unique customers from raw TikTok API data (after audit is run)
-    const customerAudit = useMemo(() => {
-        type CRow = { userId: string; nickname: string; orderCount: number; totalSpent: number; idType: string; orders: any[] };
-
-        if (!data) return { total: 0, unidentified: 0, ordersInRange: 0, allCustomers: [] as CRow[] };
-
-        // Extract all orders from the Search Orders API result
-        const orderApi = data.api_results.find(a => a.api_name === 'Search Orders');
-        const allOrders: any[] = [];
-        if (orderApi && Array.isArray(orderApi.raw_response)) {
-            orderApi.raw_response.forEach((page: any) => {
-                if (page.response?.orders) allOrders.push(...page.response.orders);
-                else if (page.response?.data?.orders) allOrders.push(...page.response.data.orders);
-            });
-        } else if (orderApi?.raw_response?.orders) {
-            allOrders.push(...orderApi.raw_response.orders);
-        } else if (orderApi?.raw_response?.data?.orders) {
-            allOrders.push(...orderApi.raw_response.data.orders);
-        }
-
-        const map = new Map<string, CRow>();
-        let unidentified = 0;
-        for (const o of allOrders) {
-            const userId: string | undefined = o.buyer_user_id || o.buyer_uid || o.buyer_info?.buyer_user_id;
-            const email: string | undefined = o.buyer_email || o.buyer_info?.buyer_email;
-            const id = userId || email;
-            if (!id) { unidentified++; continue; }
-            const spent = parseFloat(o.payment_info?.total_amount || o.total_amount || '0');
-            const nickname: string = o.buyer_info?.buyer_nickname || o.recipient_address?.name || o.buyer_nickname || 'Customer';
-            const existing = map.get(id);
-            if (existing) {
-                existing.orderCount += 1;
-                existing.totalSpent += spent;
-                existing.orders.push(o);
-            } else {
-                map.set(id, { userId: id, nickname, orderCount: 1, totalSpent: spent, idType: userId ? 'TikTok ID' : 'Email', orders: [o] });
-            }
-        }
-        return {
-            total: map.size,
-            unidentified,
-            ordersInRange: allOrders.length,
-            allCustomers: Array.from(map.values()).sort((a, b) => b.orderCount - a.orderCount),
-        };
-    }, [data]);
 
     return (
         <div style={{ fontFamily: 'monospace', color: '#fff', maxWidth: 960 }}>
@@ -388,6 +372,7 @@ export function DataAuditView({ account, shopId }: DataAuditViewProps) {
                         <p>Shop: <strong>{data.audit.shop_name}</strong> (ID: {data.audit.shop_id})</p>
                         <p>TikTok API Server: <strong>{data.audit.tiktok_api_base}</strong></p>
                         <p>Authentication: {data.audit.authentication_method}</p>
+                        <p>Timezone used for audit range: <strong>{data.audit.timezone_used || timezone || 'America/Los_Angeles'}</strong></p>
                         {data.audit.date_filter && (
                             <p>Date Filter: <strong>{data.audit.date_filter.startDate} to {data.audit.date_filter.endDate}</strong></p>
                         )}
@@ -396,6 +381,48 @@ export function DataAuditView({ account, shopId }: DataAuditViewProps) {
                         <p>Audit completed: {new Date(data.audit.audit_completed_at).toLocaleString()}</p>
                         <p style={{ marginTop: 8, color: '#aaa' }}><em>{data.audit.note}</em></p>
                     </div>
+
+                    {/* Finance Reconciliation */}
+                    {data.finance_reconciliation && (
+                        <div style={{ border: '1px solid #22c55e', padding: 16, marginBottom: 24 }}>
+                            <h2 style={{ marginTop: 0, marginBottom: 12, borderBottom: '1px solid #14532d', paddingBottom: 8 }}>
+                                FINANCE RECONCILIATION REPORT
+                            </h2>
+                            <p style={{ color: '#a7f3d0', fontSize: 12, marginBottom: 12 }}>
+                                One-click discrepancy summary: statement totals vs statement transaction sums.
+                            </p>
+                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+                                <div style={{ border: '1px solid #334155', padding: 12 }}>
+                                    <p><strong>Statement Totals</strong></p>
+                                    <p>Statements: {data.finance_reconciliation.statement_totals.statement_count}</p>
+                                    <p>Revenue: ${data.finance_reconciliation.statement_totals.revenue_amount_sum.toFixed(2)}</p>
+                                    <p>Settlement: ${data.finance_reconciliation.statement_totals.settlement_amount_sum.toFixed(2)}</p>
+                                    <p>Fees: ${data.finance_reconciliation.statement_totals.fee_amount_sum.toFixed(2)}</p>
+                                    <p>Shipping: ${data.finance_reconciliation.statement_totals.shipping_cost_amount_sum.toFixed(2)}</p>
+                                </div>
+                                <div style={{ border: '1px solid #334155', padding: 12 }}>
+                                    <p><strong>Transaction Sums</strong></p>
+                                    <p>Transactions: {data.finance_reconciliation.transaction_totals.transaction_count}</p>
+                                    <p>Revenue: ${data.finance_reconciliation.transaction_totals.revenue_amount_sum.toFixed(2)}</p>
+                                    <p>Settlement: ${data.finance_reconciliation.transaction_totals.settlement_amount_sum.toFixed(2)}</p>
+                                    <p>Fee+Tax: ${data.finance_reconciliation.transaction_totals.fee_tax_amount_sum.toFixed(2)}</p>
+                                    <p>Shipping: ${data.finance_reconciliation.transaction_totals.shipping_cost_amount_sum.toFixed(2)}</p>
+                                </div>
+                            </div>
+                            <div style={{ border: '1px solid #334155', padding: 12, marginTop: 12 }}>
+                                <p><strong>Key Buckets (from transaction rows)</strong></p>
+                                <p>Affiliate Fees: ${data.finance_reconciliation.buckets.affiliate_fee_sum.toFixed(2)}</p>
+                                <p>Platform Fees: ${data.finance_reconciliation.buckets.platform_fee_sum.toFixed(2)}</p>
+                            </div>
+                            <div style={{ border: '1px solid #334155', padding: 12, marginTop: 12 }}>
+                                <p><strong>Deltas (Tx - Statement)</strong></p>
+                                <p>Shipping Delta: ${data.finance_reconciliation.deltas.shipping_delta.toFixed(2)}</p>
+                                <p>Fee/Tax vs Statement Fee Delta: ${data.finance_reconciliation.deltas.fee_tax_minus_statement_fee_delta.toFixed(2)}</p>
+                                <p>Settlement Delta: ${data.finance_reconciliation.deltas.settlement_delta.toFixed(2)}</p>
+                                <p>Revenue Delta: ${data.finance_reconciliation.deltas.revenue_delta.toFixed(2)}</p>
+                            </div>
+                        </div>
+                    )}
 
                     {/* Cancelled Orders Audit Section */}
                     {/* Cancelled Orders Audit Section */}
@@ -574,152 +601,6 @@ export function DataAuditView({ account, shopId }: DataAuditViewProps) {
                             </p>
                         </div>
                     )}
-
-                    {/* Total Customers — from TikTok API raw data */}
-                    <div style={{ border: '1px solid #7c3aed', padding: 16, marginBottom: 24 }}>
-                        <h2 style={{ marginTop: 0, marginBottom: 12, borderBottom: '1px solid #444', paddingBottom: 8 }}>
-                            ALL CUSTOMERS — TikTok API data ({startDate} to {endDate})
-                        </h2>
-
-                        <div style={{ marginBottom: 16 }}>
-                            <div style={{ fontSize: 40, fontWeight: 'bold', color: '#a78bfa' }}>
-                                {customerAudit.total.toLocaleString()}
-                            </div>
-                            <div style={{ color: '#aaa', fontSize: 12, marginTop: 4 }}>
-                                unique identified customers across {customerAudit.ordersInRange.toLocaleString()} orders fetched directly from TikTok API
-                            </div>
-                            {customerAudit.unidentified > 0 && (
-                                <div style={{ color: '#888', fontSize: 11, marginTop: 4 }}>
-                                    {customerAudit.unidentified} order(s) had no buyer identifier and were excluded.
-                                </div>
-                            )}
-                        </div>
-
-                        <p style={{ marginBottom: 6, fontWeight: 'bold' }}>HOW WE COUNT CUSTOMERS:</p>
-                        <p style={{ fontSize: 12, color: '#ccc', marginBottom: 4 }}>
-                            1. <strong>Primary key:</strong> <code style={{ background: '#111', padding: '1px 4px' }}>buyer_user_id</code> — TikTok's permanent unique user ID.
-                        </p>
-                        <p style={{ fontSize: 12, color: '#ccc', marginBottom: 4 }}>
-                            2. <strong>Fallback:</strong> <code style={{ background: '#111', padding: '1px 4px' }}>buyer_email</code> — Used when no user ID is present.
-                        </p>
-                        <p style={{ fontSize: 12, color: '#ccc', marginBottom: 12 }}>
-                            3. Orders where <em>neither</em> field exists are <strong>excluded</strong> to avoid inflating the count.
-                        </p>
-                        <p style={{ fontSize: 11, color: '#666', marginTop: 8, borderTop: '1px solid #333', paddingTop: 8 }}>
-                            NOTE: Customers are computed from the raw TikTok API data — up to {maxPages * 100} orders ({maxPages} pages × 100/page).
-                            Increase "Max Pages" above and re-run the audit for a larger sample.
-                        </p>
-
-                        {customerAudit.allCustomers.length > 0 && (
-                            <div style={{ marginTop: 16 }}>
-                                <p style={{ marginBottom: 8, fontWeight: 'bold' }}>
-                                    ALL {customerAudit.allCustomers.length} CUSTOMERS (sorted by order count):
-                                </p>
-                                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
-                                    <thead>
-                                        <tr style={{ borderBottom: '1px solid #444', color: '#aaa' }}>
-                                            <th style={{ textAlign: 'left', padding: '4px 8px' }}>#</th>
-                                            <th style={{ textAlign: 'left', padding: '4px 8px' }}>TikTok ID / Email</th>
-                                            <th style={{ textAlign: 'left', padding: '4px 8px' }}>Name</th>
-                                            <th style={{ textAlign: 'center', padding: '4px 8px' }}>Orders</th>
-                                            <th style={{ textAlign: 'right', padding: '4px 8px' }}>Total Spent</th>
-                                            <th style={{ textAlign: 'right', padding: '4px 8px' }}>Type</th>
-                                            <th style={{ textAlign: 'center', padding: '4px 8px' }}>Details</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody>
-                                        {customerAudit.allCustomers.map((c, i) => (
-                                            <>
-                                                <tr key={c.userId} style={{ borderBottom: expandedCustomerIds.has(c.userId) ? 'none' : '1px solid #222' }}>
-                                                    <td style={{ padding: '4px 8px', color: '#555' }}>{i + 1}</td>
-                                                    <td style={{ padding: '4px 8px', color: '#888', fontSize: 11 }}>
-                                                        {c.userId.length > 24 ? c.userId.slice(0, 24) + '…' : c.userId}
-                                                    </td>
-                                                    <td style={{ padding: '4px 8px', color: '#fff' }}>{c.nickname}</td>
-                                                    <td style={{ padding: '4px 8px', textAlign: 'center', color: '#a78bfa', fontWeight: 'bold' }}>{c.orderCount}</td>
-                                                    <td style={{ padding: '4px 8px', textAlign: 'right', color: '#4ade80' }}>${c.totalSpent.toFixed(2)}</td>
-                                                    <td style={{ padding: '4px 8px', textAlign: 'right', color: '#555', fontSize: 11 }}>{c.idType}</td>
-                                                    <td style={{ padding: '4px 8px', textAlign: 'center' }}>
-                                                        <span
-                                                            onClick={() => setExpandedCustomerIds(prev => {
-                                                                const next = new Set(prev);
-                                                                if (next.has(c.userId)) next.delete(c.userId); else next.add(c.userId);
-                                                                return next;
-                                                            })}
-                                                            style={{ color: '#60a5fa', cursor: 'pointer', fontSize: 11 }}
-                                                        >
-                                                            {expandedCustomerIds.has(c.userId) ? '[-] Hide' : '[+] Orders'}
-                                                        </span>
-                                                    </td>
-                                                </tr>
-                                                {expandedCustomerIds.has(c.userId) && (
-                                                    <tr key={`${c.userId}-orders`} style={{ borderBottom: '1px solid #222' }}>
-                                                        <td colSpan={7} style={{ padding: 0, paddingLeft: 24, background: '#0a0a0a' }}>
-                                                            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
-                                                                <thead>
-                                                                    <tr style={{ color: '#666' }}>
-                                                                        <th style={{ textAlign: 'left', padding: '4px 8px' }}>Order ID</th>
-                                                                        <th style={{ textAlign: 'left', padding: '4px 8px' }}>Status</th>
-                                                                        <th style={{ textAlign: 'right', padding: '4px 8px' }}>Amount</th>
-                                                                        <th style={{ textAlign: 'right', padding: '4px 8px' }}>Date</th>
-                                                                        <th style={{ textAlign: 'center', padding: '4px 8px' }}>Raw</th>
-                                                                    </tr>
-                                                                </thead>
-                                                                <tbody>
-                                                                    {c.orders.map((o: any) => {
-                                                                        const rawKey = `cust-${o.id}`;
-                                                                        return (
-                                                                            <>
-                                                                                <tr key={o.id} style={{ borderTop: '1px solid #1a1a1a' }}>
-                                                                                    <td style={{ padding: '4px 8px', fontFamily: 'monospace', color: '#ccc' }}>{o.id}</td>
-                                                                                    <td style={{ padding: '4px 8px', color: '#aaa' }}>{o.order_status}</td>
-                                                                                    <td style={{ padding: '4px 8px', textAlign: 'right', color: '#4ade80' }}>
-                                                                                        ${parseFloat(o.payment_info?.total_amount || o.total_amount || '0').toFixed(2)}
-                                                                                    </td>
-                                                                                    <td style={{ padding: '4px 8px', textAlign: 'right', color: '#888' }}>
-                                                                                        {o.create_time ? new Date(o.create_time * 1000).toLocaleDateString() : '-'}
-                                                                                    </td>
-                                                                                    <td style={{ padding: '4px 8px', textAlign: 'center' }}>
-                                                                                        <span
-                                                                                            onClick={() => {
-                                                                                                const next = new Set(visibleRawDataOrders);
-                                                                                                if (next.has(rawKey)) next.delete(rawKey); else next.add(rawKey);
-                                                                                                setVisibleRawDataOrders(next);
-                                                                                            }}
-                                                                                            style={{ color: '#60a5fa', cursor: 'pointer' }}
-                                                                                        >
-                                                                                            {visibleRawDataOrders.has(rawKey) ? 'Hide' : 'Raw'}
-                                                                                        </span>
-                                                                                    </td>
-                                                                                </tr>
-                                                                                {visibleRawDataOrders.has(rawKey) && (
-                                                                                    <tr key={`${o.id}-raw`}>
-                                                                                        <td colSpan={5} style={{ padding: 0 }}>
-                                                                                            <pre style={{
-                                                                                                margin: 0, padding: 12, background: '#0f0f0f',
-                                                                                                color: '#aaa', fontSize: 10, overflowX: 'auto',
-                                                                                                borderTop: '1px dashed #222',
-                                                                                            }}>
-                                                                                                {JSON.stringify(o, null, 2)}
-                                                                                            </pre>
-                                                                                        </td>
-                                                                                    </tr>
-                                                                                )}
-                                                                            </>
-                                                                        );
-                                                                    })}
-                                                                </tbody>
-                                                            </table>
-                                                        </td>
-                                                    </tr>
-                                                )}
-                                            </>
-                                        ))}
-                                    </tbody>
-                                </table>
-                            </div>
-                        )}
-                    </div>
 
                     {/* Each API */}
                     {data.api_results.map((api, index) => (

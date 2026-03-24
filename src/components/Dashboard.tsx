@@ -624,21 +624,24 @@ export function Dashboard() {
               // Details Views
               (() => {
                 const shopTimezone = selectedShop?.timezone || 'America/Los_Angeles';
+                const handleTimezoneChange = (newTz: string) => {
+                  setSelectedShop((prev: any) => prev ? { ...prev, timezone: newTz } : prev);
+                };
                 switch (activeTab) {
-                  case 'overview': return selectedAccount ? <OverviewView account={selectedAccount} shopId={selectedShop?.shop_id} timezone={shopTimezone} /> : null;
+                  case 'overview': return selectedAccount ? <OverviewView account={selectedAccount} shopId={selectedShop?.shop_id} timezone={shopTimezone} onTimezoneChange={handleTimezoneChange} /> : null;
                   case 'orders': return selectedAccount ? <OrdersView account={selectedAccount} shopId={selectedShop?.shop_id} timezone={shopTimezone} /> : null;
                   case 'products': return selectedAccount ? <ProductsView account={selectedAccount} shopId={selectedShop?.shop_id} /> : null;
                   case 'profit-loss': return selectedAccount ? <ProfitLossView account={selectedAccount} shopId={selectedShop?.shop_id} timezone={shopTimezone} /> : null;
-                  case 'data-audit': return selectedAccount ? <DataAuditView account={selectedAccount} shopId={selectedShop?.shop_id} /> : null;
-                  case 'finance-debug': return selectedAccount ? <FinanceDebugView account={selectedAccount} shopId={selectedShop?.shop_id} /> : null;
+                  case 'data-audit': return selectedAccount ? <DataAuditView account={selectedAccount} shopId={selectedShop?.shop_id} timezone={shopTimezone} /> : null;
+                  case 'finance-debug': return selectedAccount ? <FinanceDebugView account={selectedAccount} shopId={selectedShop?.shop_id} timezone={shopTimezone} /> : null;
 
                   case 'profile': return <ProfileView />;
-                  case 'marketing': return selectedAccount ? <MarketingDashboardView account={selectedAccount} shopId={selectedShop?.shop_id} /> : null;
+                  case 'marketing': return selectedAccount ? <MarketingDashboardView account={selectedAccount} shopId={selectedShop?.shop_id} timezone={shopTimezone} /> : null;
                   case 'ads-review': return <AdsDataReviewView />;
                   case 'admin-dashboard': return <AdminDashboard />;
                   case 'admin-users': return <AdminUserManagement />;
                   case 'admin-stores': return <AdminStoreManagement />;
-                  default: return selectedAccount ? <OverviewView account={selectedAccount} shopId={selectedShop?.shop_id} timezone={shopTimezone} /> : null;
+                  default: return selectedAccount ? <OverviewView account={selectedAccount} shopId={selectedShop?.shop_id} timezone={shopTimezone} onTimezoneChange={handleTimezoneChange} /> : null;
                 }
               })()
             )}

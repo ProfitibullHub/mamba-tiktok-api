@@ -2,8 +2,15 @@ import express from 'express';
 import { tiktokShopApi } from '../services/tiktok-shop-api.service.js';
 import { getShopWithToken } from './tiktok-shop-data.routes.js';
 import { supabase } from '../config/supabase.js';
+import {
+    enforceRequestAccountAccess,
+    verifyAccountIdParam,
+} from '../middleware/account-access.middleware.js';
 
 const router = express.Router();
+
+router.use(enforceRequestAccountAccess);
+router.param('accountId', verifyAccountIdParam);
 
 // Helper to handle API errors
 const handleApiError = (res: express.Response, error: any) => {
@@ -102,6 +109,58 @@ router.get('/transactions/:accountId/:statementId', async (req, res) => {
         const data = await tiktokShopApi.getStatementTransactions(shop.access_token, shop.shop_cipher, statementId, query);
 
         res.json({ success: true, data });
+    } catch (error) {
+        handleApiError(res, error);
+    }
+});
+
+/**
+ * POST /api/tiktok-shop/finance/raw-call/:accountId
+ *
+ * Safely exposes important raw finance APIs for audit/debugging.
+ * Body:
+ * {
+ *   shopId: string,
+ *   endpoint: "statements" | "statement_transactions",
+ *   statementId?: string,
+ *   params?: Record<string, any>
+ * }
+ */
+router.post('/raw-call/:accountId', async (req, res) => {
+    try {
+        const { accountId } = req.params;
+        const { shopId, endpoint, statementId, params = {} } = req.body || {};
+
+        if (!shopId) {
+            return res.status(400).json({ success: false, error: 'shopId is required' });
+        }
+        if (!endpoint || !['statements', 'statement_transactions'].includes(endpoint)) {
+            return res.status(400).json({ success: false, error: 'endpoint must be one of: statements, statement_transactions' });
+        }
+
+        const shop = await getShopWithToken(accountId, String(shopId));
+
+        let raw: any = null;
+        let resolvedPath = '';
+
+        if (endpoint === 'statements') {
+            resolvedPath = '/finance/202309/statements';
+            raw = await tiktokShopApi.getStatements(shop.access_token, shop.shop_cipher, params);
+        } else if (endpoint === 'statement_transactions') {
+            if (!statementId) {
+                return res.status(400).json({ success: false, error: 'statementId is required for statement_transactions' });
+            }
+            resolvedPath = `/finance/202501/statements/${statementId}/statement_transactions`;
+            raw = await tiktokShopApi.getStatementTransactions(shop.access_token, shop.shop_cipher, String(statementId), params);
+        }
+
+        return res.json({
+            success: true,
+            endpoint,
+            resolved_path: resolvedPath,
+            request_params: params,
+            raw_response: raw
+        });
     } catch (error) {
         handleApiError(res, error);
     }

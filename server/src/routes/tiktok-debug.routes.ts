@@ -2,30 +2,65 @@ import { Router, Request, Response } from 'express';
 import { tiktokShopApi } from '../services/tiktok-shop-api.service.js';
 import { getShopWithToken } from './tiktok-shop-data.routes.js';
 import { getHistoricalStartTime } from '../config/dataRetention.js';
+import { getShopDayStartTimestamp } from '../utils/dateUtils.js';
 
 const router = Router();
 
-function getShopTimestamp(dateStr: string): number {
-    // Start with assumed Standard Time (UTC-8) -> 08:00 UTC
-    let d = new Date(`${dateStr}T08:00:00Z`);
+function getSafeTimezone(requested?: string, fallback: string = 'America/Los_Angeles'): string {
+    const tz = requested || fallback;
+    try {
+        Intl.DateTimeFormat(undefined, { timeZone: tz });
+        return tz;
+    } catch {
+        return fallback;
+    }
+}
 
-    // Check what time this is in Shop Timezone (America/Los_Angeles)
-    const timeString = d.toLocaleString('en-US', {
-        timeZone: 'America/Los_Angeles',
-        hour: 'numeric',
-        hour12: false
-    });
+function parseAmount(value: any): number {
+    if (value === null || value === undefined || value === '') return 0;
+    const num = parseFloat(String(value));
+    return Number.isFinite(num) ? num : 0;
+}
 
-    let hour = parseInt(timeString);
-    if (isNaN(hour)) hour = 0;
+function aggregateTransactionReconciliation(transactions: any[]) {
+    let platformFees = 0;
+    let affiliateFees = 0;
+    let taxes = 0;
+    let shipping = 0;
+    let revenue = 0;
+    let settlement = 0;
 
-    if (hour === 1) {
-        // We are in PDT (UTC-7), so 08:00 UTC is 01:00 PDT.
-        // We want 00:00 PDT, so subtract 1 hour.
-        d = new Date(d.getTime() - 3600000);
+    for (const tx of transactions) {
+        revenue += parseAmount(tx.revenue_amount);
+        settlement += parseAmount(tx.settlement_amount);
+        shipping += parseAmount(tx.shipping_cost_amount);
+        taxes += parseAmount(tx.fee_tax_amount);
+
+        const fee = tx.fee_tax_breakdown?.fee || {};
+        platformFees +=
+            parseAmount(fee.platform_commission_amount) +
+            parseAmount(fee.referral_fee_amount) +
+            parseAmount(fee.transaction_fee_amount) +
+            parseAmount(fee.refund_administration_fee_amount) +
+            parseAmount(fee.credit_card_handling_fee_amount);
+
+        affiliateFees +=
+            parseAmount(fee.affiliate_commission_amount) +
+            parseAmount(fee.affiliate_partner_commission_amount) +
+            parseAmount(fee.affiliate_ads_commission_amount) +
+            parseAmount(fee.external_affiliate_marketing_fee_amount) +
+            parseAmount(fee.cofunded_creator_bonus_amount);
     }
 
-    return Math.floor(d.getTime() / 1000);
+    return {
+        revenue_amount_sum: revenue,
+        settlement_amount_sum: settlement,
+        shipping_cost_amount_sum: shipping,
+        fee_tax_amount_sum: taxes,
+        platform_fee_sum: platformFees,
+        affiliate_fee_sum: affiliateFees,
+        transaction_count: transactions.length
+    };
 }
 
 /**
@@ -68,6 +103,7 @@ router.get('/raw-data/:accountId', async (req: Request, res: Response) => {
     const maxPages = Number(req.query.maxPages) || 10;
     const startDate = req.query.startDate as string | undefined; // 'YYYY-MM-DD'
     const endDate = req.query.endDate as string | undefined; // 'YYYY-MM-DD'
+    const requestedTimezone = req.query.timezone as string | undefined;
     const testOrderId = req.query.testOrderId as string | undefined; // Optional order_id for testing price_detail API
 
     console.log(`[Debug] Raw data audit requested for account ${accountId}, shop ${shopId || 'default'}, maxPages: ${maxPages}, testOrderId: ${testOrderId || 'auto'}`);
@@ -77,16 +113,17 @@ router.get('/raw-data/:accountId', async (req: Request, res: Response) => {
         const shop = await getShopWithToken(accountId, shopId);
         const accessToken = shop.access_token;
         const shopCipher = shop.shop_cipher;
+        const effectiveTimezone = getSafeTimezone(requestedTimezone, shop.timezone || 'America/Los_Angeles');
 
         const results: ApiCallResult[] = [];
         const auditStartTime = new Date().toISOString();
 
         // Use Shop Timezone so users get consistent results matching the dashboard
         const orderStartTime = startDate
-            ? getShopTimestamp(startDate)
+            ? getShopDayStartTimestamp(startDate, effectiveTimezone)
             : getHistoricalStartTime();
         const orderEndTime = endDate
-            ? getShopTimestamp(endDate) + 86400
+            ? getShopDayStartTimestamp(endDate, effectiveTimezone) + 86400
             : Math.floor(Date.now() / 1000);
 
         // ============================================================
@@ -407,6 +444,8 @@ router.get('/raw-data/:accountId', async (req: Request, res: Response) => {
         // ============================================================
         // API 5: GET FINANCE STATEMENTS
         // ============================================================
+        let fetchedStatements: any[] = [];
+        let txByStatementForRecon: any[] = [];
         try {
             const start = Date.now();
             const rawResponse = await tiktokShopApi.getStatements(accessToken, shopCipher, {
@@ -416,6 +455,7 @@ router.get('/raw-data/:accountId', async (req: Request, res: Response) => {
                 start_time: orderStartTime,
                 end_time: orderEndTime,
             });
+            fetchedStatements = rawResponse?.statements || rawResponse?.statement_list || [];
             results.push({
                 api_name: 'Get Finance Statements',
                 endpoint: 'GET /finance/202309/statements',
@@ -436,6 +476,70 @@ router.get('/raw-data/:accountId', async (req: Request, res: Response) => {
                 method: 'GET',
                 description: 'Returns settlement statements.',
                 how_we_use_it: 'Used in P&L and Finance views.',
+                request_params: {},
+                raw_response: null,
+                record_count: 0,
+                status: 'error',
+                error_message: error.message,
+                called_at: new Date().toISOString(),
+                response_time_ms: 0,
+            });
+        }
+
+        // ============================================================
+        // API 5B: GET STATEMENT TRANSACTIONS (RAW) for recent statements
+        // ============================================================
+        try {
+            const start = Date.now();
+            const statementsToInspect = fetchedStatements.slice(0, 5); // keep audit latency bounded
+            const txByStatement: any[] = [];
+
+            for (const stmt of statementsToInspect) {
+                const statementId = stmt.id || stmt.statement_id;
+                if (!statementId) continue;
+
+                const txResp = await tiktokShopApi.getStatementTransactions(
+                    accessToken,
+                    shopCipher,
+                    String(statementId),
+                    { page_size: 100, sort_field: 'order_create_time', sort_order: 'DESC' }
+                );
+
+                txByStatement.push({
+                    statement_id: statementId,
+                    statement_time: stmt.statement_time || null,
+                    response: txResp,
+                    transaction_count: txResp?.transactions?.length || txResp?.transaction_list?.length || 0
+                });
+            }
+
+            const txCount = txByStatement.reduce((sum, s) => sum + Number(s.transaction_count || 0), 0);
+            txByStatementForRecon = txByStatement;
+            results.push({
+                api_name: 'Get Statement Transactions (Raw)',
+                endpoint: 'GET /finance/202501/statements/{statement_id}/statement_transactions',
+                method: 'GET',
+                description: `Returns raw transaction-level fee/shipping/affiliate breakdown rows. Pulled for ${txByStatement.length} recent statement(s).`,
+                how_we_use_it: 'This endpoint is the ground truth for reconciling P&L discrepancies in affiliate commission, shipping cost, and fee categories.',
+                request_params: {
+                    statements_inspected: txByStatement.map(s => s.statement_id),
+                    per_statement_page_size: 100,
+                    sort_field: 'order_create_time',
+                    sort_order: 'DESC'
+                },
+                raw_response: txByStatement,
+                record_count: txCount,
+                status: 'success',
+                called_at: new Date().toISOString(),
+                response_time_ms: Date.now() - start,
+            });
+        } catch (error: any) {
+            results.push({
+                api_name: 'Get Statement Transactions (Raw)',
+                endpoint: 'GET /finance/202501/statements/{statement_id}/statement_transactions',
+                method: 'GET',
+                description: 'Returns transaction-level statement rows for detailed finance audit.',
+                how_we_use_it: 'Used for raw discrepancy analysis in P&L.',
                 request_params: {},
                 raw_response: null,
                 record_count: 0,
@@ -578,6 +682,30 @@ router.get('/raw-data/:accountId', async (req: Request, res: Response) => {
         // Build final response
         const successCount = results.filter(r => r.status === 'success').length;
         const errorCount = results.filter(r => r.status === 'error').length;
+        const allStatementTransactions = txByStatementForRecon.flatMap((s: any) => s?.response?.transactions || s?.response?.transaction_list || []);
+
+        const statementTotals = {
+            revenue_amount_sum: fetchedStatements.reduce((sum: number, s: any) => sum + parseAmount(s.revenue_amount), 0),
+            settlement_amount_sum: fetchedStatements.reduce((sum: number, s: any) => sum + parseAmount(s.settlement_amount), 0),
+            fee_amount_sum: fetchedStatements.reduce((sum: number, s: any) => sum + parseAmount(s.fee_amount), 0),
+            shipping_cost_amount_sum: fetchedStatements.reduce((sum: number, s: any) => sum + parseAmount(s.shipping_cost_amount), 0),
+            statement_count: fetchedStatements.length
+        };
+        const txTotals = aggregateTransactionReconciliation(allStatementTransactions);
+        const reconciliation = {
+            statement_totals: statementTotals,
+            transaction_totals: txTotals,
+            deltas: {
+                shipping_delta: txTotals.shipping_cost_amount_sum - statementTotals.shipping_cost_amount_sum,
+                fee_tax_minus_statement_fee_delta: txTotals.fee_tax_amount_sum - statementTotals.fee_amount_sum,
+                settlement_delta: txTotals.settlement_amount_sum - statementTotals.settlement_amount_sum,
+                revenue_delta: txTotals.revenue_amount_sum - statementTotals.revenue_amount_sum
+            },
+            buckets: {
+                affiliate_fee_sum: txTotals.affiliate_fee_sum,
+                platform_fee_sum: txTotals.platform_fee_sum
+            }
+        };
 
         res.json({
             success: true,
@@ -597,8 +725,10 @@ router.get('/raw-data/:accountId', async (req: Request, res: Response) => {
                 authentication_method: 'OAuth 2.0 with HMAC-SHA256 signed requests',
                 note: 'Access tokens are obtained via TikTok\'s official OAuth flow. The only database interaction is retrieving the stored OAuth token to authenticate API calls.',
                 date_filter: startDate && endDate ? { startDate, endDate } : null,
+                timezone_used: effectiveTimezone
             },
             api_results: results,
+            finance_reconciliation: reconciliation,
             smart_sync_explanation: {
                 title: 'How Mamba\'s Smart Auto-Stop Sync Works',
                 overview: 'When syncing data from TikTok, Mamba does NOT blindly re-download everything every time. It uses a "Smart Auto-Stop" system to only fetch what\'s new, saving time and avoiding TikTok API rate limits.',

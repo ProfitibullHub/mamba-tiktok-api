@@ -220,6 +220,9 @@ interface TikTokAdsState {
     dailySettlementSpend: DailySettlementAdSpend[] | null;
     assets: AdAssets | null;
     lastFetchTime: number | null;
+    assetsDateRange: { start: string; end: string } | null;
+    assetsLastFetchTime: number | null;
+    lastConnectionCheckTime: number | null;
 
     // Actions
     checkConnection: (accountId: string) => Promise<boolean>;
@@ -265,6 +268,9 @@ export const useTikTokAdsStore = create<TikTokAdsState>((set, get) => ({
     dailySettlementSpend: null,
     assets: null,
     lastFetchTime: null,
+    assetsDateRange: null,
+    assetsLastFetchTime: null,
+    lastConnectionCheckTime: null,
 
     // DB-First state
     marketingDaily: [],
@@ -275,13 +281,19 @@ export const useTikTokAdsStore = create<TikTokAdsState>((set, get) => ({
 
     checkConnection: async (accountId: string) => {
         try {
+            const state = get();
+            if (state.connected && state.advertiserInfo && state.lastConnectionCheckTime && (Date.now() - state.lastConnectionCheckTime < 5 * 60 * 1000)) {
+                return true;
+            }
+
             const response = await fetch(`${API_BASE_URL}/api/tiktok-ads/status/${accountId}`);
             const result = await response.json();
 
             if (result.success) {
                 const updates: Partial<TikTokAdsState> = {
                     connected: result.connected,
-                    advertiserInfo: null
+                    advertiserInfo: null,
+                    lastConnectionCheckTime: Date.now()
                 };
                 if (result.connected && result.advertiser) {
                     updates.advertiserInfo = {
@@ -527,7 +539,12 @@ export const useTikTokAdsStore = create<TikTokAdsState>((set, get) => ({
             const result = await response.json();
 
             if (result.success) {
-                set({ assets: result.data, error: null });
+                set({ 
+                    assets: result.data, 
+                    error: null,
+                    assetsLastFetchTime: Date.now(),
+                    assetsDateRange: startDate && endDate ? { start: startDate, end: endDate } : null
+                });
             } else {
                 throw new Error(result.error || 'Failed to fetch assets');
             }

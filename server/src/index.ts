@@ -21,8 +21,8 @@ const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
 const allowedOrigins = [
     'http://localhost:5173',
     'https://tiktok-dashboard-frontend-eight.vercel.app',
-    'https://mamba-phase1.vercel.app/',
-    'https://mamba-phase1-back-end.vercel.app',
+    'https://mamba-frontend.vercel.app',
+    'https://mamba-red.vercel.app',
     FRONTEND_URL
 ];
 

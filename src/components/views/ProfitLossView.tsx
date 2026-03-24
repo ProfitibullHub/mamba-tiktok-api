@@ -1,4 +1,4 @@
-import { DollarSign, TrendingUp, TrendingDown, Wallet, PieChart, Calculator, AlertTriangle, ChevronDown, ChevronUp, Package, Truck, Receipt, Users, Megaphone, Building2, Zap, SlidersHorizontal, RotateCcw, Download, Plus, Trash2, Calendar } from 'lucide-react';
+import { DollarSign, TrendingUp, TrendingDown, Wallet, PieChart, AlertTriangle, ChevronDown, ChevronUp, Package, Truck, Receipt, Users, Megaphone, Building2, Zap, SlidersHorizontal, RotateCcw, Download, Plus, Trash2, Calendar } from 'lucide-react';
 // Note: LayoutGrid, Layers are used by the View Mode Toggle — re-add to import when uncommenting the toggle
 import { useState, useEffect, useMemo, useCallback } from 'react';
 import { useShopStore, Order } from '../../store/useShopStore';
@@ -132,76 +132,6 @@ function ExpandableItem({
           <div className="bg-gray-900/50 rounded-lg p-4 border border-gray-700/50 ml-10">
             {expandedContent}
           </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// Expandable Metric Card Component (for top-level stats)
-interface ExpandableMetricCardProps {
-  title: string;
-  value: string;
-  icon: React.ComponentType<{ className?: string }>;
-  iconColor: string;
-  valueColor: string;
-  tooltip?: {
-    source: string;
-    calculation: string;
-    api: string;
-  };
-  expandedContent?: React.ReactNode;
-}
-
-function ExpandableMetricCard({
-  title,
-  value,
-  icon: Icon,
-  iconColor,
-  valueColor,
-  tooltip,
-  expandedContent
-}: ExpandableMetricCardProps) {
-  const [isExpanded, setIsExpanded] = useState(false);
-
-  return (
-    <div className="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
-      <div
-        className={`p-6 ${expandedContent ? 'cursor-pointer hover:bg-gray-750 transition-colors' : ''}`}
-        onClick={() => expandedContent && setIsExpanded(!isExpanded)}
-      >
-        <div className="flex items-start justify-between mb-4">
-          <div className={`p-3 rounded-lg ${iconColor}`}>
-            <Icon className="w-6 h-6 text-white" />
-          </div>
-          {expandedContent && (
-            <span className="text-gray-500 hover:text-gray-300 transition-colors">
-              {isExpanded ? <ChevronUp size={20} /> : <ChevronDown size={20} />}
-            </span>
-          )}
-        </div>
-
-        <div>
-          <div className="flex items-center gap-2 mb-1">
-            <p className="text-gray-400 text-sm font-medium">{title}</p>
-            {tooltip && (
-              <CalculationTooltip
-                source={tooltip.source}
-                calculation={tooltip.calculation}
-                api={tooltip.api}
-              />
-            )}
-          </div>
-          <p className={`text-3xl font-bold ${valueColor}`}>{value}</p>
-          {expandedContent && (
-            <p className="text-gray-500 text-xs mt-2">Click for details</p>
-          )}
-        </div>
-      </div>
-
-      {isExpanded && expandedContent && (
-        <div className="border-t border-gray-700 bg-gray-900/30 p-4 animate-in slide-in-from-top-2 duration-200">
-          {expandedContent}
         </div>
       )}
     </div>
@@ -380,19 +310,27 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
 
   // TikTok Ads store
   const {
-    spendData: adsSpendData,
-    fetchSpendData: fetchAdsSpend,
     connected: adsConnected,
     advertiserInfo,
-    fetchDashboard: fetchAdsDashboard,
-    checkConnection: checkAdsConnection
+    marketingDaily,
+    marketingLoaded,
+    loadMarketingFromDB
   } = useTikTokAdsStore();
 
   const handleSync = async () => {
     if (!shopId) return;
     await syncData(account.id, shopId, 'finance');
     // Force refetch after sync
-    fetchPLData(account.id, shopId, dateRange.startDate, dateRange.endDate, true);
+    fetchPLData(account.id, shopId, dateRange.startDate, dateRange.endDate, true, timezone);
+    fetchAffiliateSettlements(account.id, shopId, dateRange.startDate, dateRange.endDate);
+    fetchAgencyFees(account.id, shopId, dateRange.startDate, dateRange.endDate);
+  };
+
+  const handleFullSync = async () => {
+    if (!shopId) return;
+    await syncData(account.id, shopId, 'finance', true); // forceFullSync = true
+    // Force refetch after sync
+    fetchPLData(account.id, shopId, dateRange.startDate, dateRange.endDate, true, timezone);
     fetchAffiliateSettlements(account.id, shopId, dateRange.startDate, dateRange.endDate);
     fetchAgencyFees(account.id, shopId, dateRange.startDate, dateRange.endDate);
   };
@@ -402,22 +340,15 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
     if (shopId) {
       // Load any missing orders data for this date range (smart cache — only fetches what isn't loaded yet)
       fetchShopData(account.id, shopId, { skipSyncCheck: true }, dateRange.startDate, dateRange.endDate);
-      fetchPLData(account.id, shopId, dateRange.startDate, dateRange.endDate);
+      fetchPLData(account.id, shopId, dateRange.startDate, dateRange.endDate, false, timezone);
       fetchAffiliateSettlements(account.id, shopId, dateRange.startDate, dateRange.endDate);
       fetchAgencyFees(account.id, shopId, dateRange.startDate, dateRange.endDate);
-      // Also fetch TikTok Ads spend data
-      fetchAdsSpend(account.id, dateRange.startDate, dateRange.endDate);
-
-      // Ensure we have latest advertiser info (balance)
-      if (account.id) {
-        checkAdsConnection(account.id).then(connected => {
-          if (connected) {
-            fetchAdsDashboard(account.id);
-          }
-        });
+      // Load synced marketing data from DB if not loaded yet
+      if (!marketingLoaded) {
+        loadMarketingFromDB(account.id);
       }
     }
-  }, [account.id, shopId, dateRange, fetchShopData, fetchPLData, fetchAdsSpend, checkAdsConnection, fetchAdsDashboard, fetchAffiliateSettlements]);
+  }, [account.id, shopId, dateRange, fetchShopData, fetchPLData, loadMarketingFromDB, marketingLoaded, fetchAffiliateSettlements]);
 
   // Calculate COGS from orders (useMemo avoids extra re-renders)
   const cogsStats = useMemo(() => {
@@ -623,7 +554,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
         skuBreakdown
       }
     };
-  }, [products, orders, dateRange, dataVersion]);
+  }, [products, orders, dateRange, dataVersion, timezone]);
 
   const formatCurrency = (num: number): string => {
     return `$${Math.abs(num).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
@@ -709,58 +640,86 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
       return sum + Math.abs(shippingFeeDiscount);
     }, 0);
 
-    // Get Ad Spend (already calculated below)
-    // Packaging/Supplies = 0 for now (manual input needed)
-
-    // Total Ad Spend = Marketing API Spend + Shop settlement ads fees
-    const apiAdSpend = adsSpendData?.totals.total_spend || 0;
+    // Get Ad Spend — use ONLY the synced marketing data (same source as the Marketing Dashboard)
     const shopAdsFees = adSpendFeeKeys.reduce((sum, key) => sum + Math.abs(plData?.fees?.[key] || 0), 0);
-    const adSpend = apiAdSpend + shopAdsFees;
 
-    const adConversionValue = adsSpendData?.totals.conversion_value || 0;
+    // Marketing Ad Spend (Synced) — from tiktok_ad_spend_daily table, filtered by P&L date range
+    // This matches exactly what the Marketing Dashboard shows as "Cost"
+    // NOTE: spend_date may include time component, so append T23:59:59 to endDate (same as marketing dashboard)
+    const spendEnd = dateRange.endDate + 'T23:59:59';
+    const syncedMarketingSpend = marketingDaily
+      .filter((d: any) => d.spend_date >= dateRange.startDate && d.spend_date <= spendEnd)
+      .reduce((sum: number, d: any) => sum + (parseFloat(d.total_spend) || 0), 0);
+
+    const syncedMarketingConversionValue = marketingDaily
+      .filter((d: any) => d.spend_date >= dateRange.startDate && d.spend_date <= spendEnd)
+      .reduce((sum: number, d: any) => sum + (parseFloat(d.conversion_value) || 0), 0);
+
+    const adSpend = syncedMarketingSpend;
+    const adConversionValue = syncedMarketingConversionValue;
     const adROAS = adSpend > 0 ? adConversionValue / adSpend : 0;
 
     // ── Recurring agency fee calculation ──────────────────────────────────────
-    // Each fee entry has a start date + recurrence. Count how many occurrences
-    // fall within [startTs, endTs] and multiply the per-occurrence amount.
+    // ── Prorated agency fee calculation ──────────────────────────────────────
     const rangeStart = new Date(dateRange.startDate);
+    rangeStart.setHours(0, 0, 0, 0);
     const rangeEnd = new Date(dateRange.endDate);
-
-    const countOccurrences = (startDate: string, recurrence: string): number => {
-      const feeStart = new Date(startDate);
-      if (feeStart > rangeEnd) return 0;
-      let count = 0;
-      let cur = new Date(feeStart);
-      while (cur <= rangeEnd) {
-        if (cur >= rangeStart) count++;
-        if (recurrence === 'monthly') cur.setMonth(cur.getMonth() + 1);
-        else if (recurrence === 'quarterly') cur.setMonth(cur.getMonth() + 3);
-        else if (recurrence === 'biannual') cur.setMonth(cur.getMonth() + 6);
-        else if (recurrence === 'annual') cur.setFullYear(cur.getFullYear() + 1);
-        else break; // unknown recurrence — count once
-      }
-      return Math.max(count, 1); // always at least 1 if the fee started before range end
-    };
+    rangeEnd.setHours(23, 59, 59, 999);
 
     const totalAgencyFees = agencyFees.reduce((sum, fee) => {
-      const occurrences = countOccurrences(fee.date, fee.recurrence || 'monthly');
       const feeType = fee.fee_type || 'retainer';
-      let perOccurrence = 0;
+      const recurrence = fee.recurrence || 'monthly';
+      
+      const feeStart = new Date(fee.date);
+      feeStart.setHours(0, 0, 0, 0);
 
-      if (feeType === 'retainer' || feeType === 'both') {
-        perOccurrence += Number(fee.retainer_amount ?? fee.amount ?? 0);
-      }
-      if (feeType === 'commission' || feeType === 'both') {
-        const rate = Number(fee.commission_rate || 0) / 100;
-        const base = fee.commission_base || 'gmv';
-        const baseValue =
-          base === 'gross_profit' ? grossProfit :
-            base === 'net_revenue' ? netRevenue :
-              grossSalesGMV; // default: GMV
-        perOccurrence += rate * baseValue;
+      let retainerPart = 0;
+      let commissionPart = 0;
+
+      if (feeStart <= rangeEnd) {
+        const effectiveStart = feeStart > rangeStart ? feeStart : rangeStart;
+        
+        // --- 1. Retainer Calculation (Prorated daily) ---
+        if (feeType === 'retainer' || feeType === 'both') {
+          const amount = Number(fee.retainer_amount ?? fee.amount ?? 0);
+          let curr = new Date(effectiveStart);
+          
+          while (curr <= rangeEnd) {
+            const y = curr.getFullYear();
+            const m = curr.getMonth();
+            const daysInMonth = new Date(y, m + 1, 0).getDate();
+            
+            let dailyRate = 0;
+            if (recurrence === 'monthly')       dailyRate = amount / daysInMonth;
+            else if (recurrence === 'quarterly') dailyRate = (amount / 3) / daysInMonth;
+            else if (recurrence === 'biannual')  dailyRate = (amount / 6) / daysInMonth;
+            else if (recurrence === 'annual')    dailyRate = (amount / 12) / daysInMonth;
+            else                                dailyRate = amount / daysInMonth;
+            
+            retainerPart += dailyRate;
+            curr.setDate(curr.getDate() + 1);
+          }
+        }
+        
+        // --- 2. Commission Calculation (Proportional to active lifespan) ---
+        if (feeType === 'commission' || feeType === 'both') {
+          const rate = Number(fee.commission_rate || 0) / 100;
+          const base = fee.commission_base || 'gmv';
+          const baseValue =
+            base === 'gross_profit' ? grossProfit :
+              base === 'net_revenue' ? netRevenue :
+                grossSalesGMV;
+          
+          // Calculate the proportion of the date range where the fee was active
+          const totalRangeDays = Math.max(1, Math.round((rangeEnd.getTime() - rangeStart.getTime()) / 86400000));
+          const activeDays = Math.max(0, Math.round((rangeEnd.getTime() - effectiveStart.getTime()) / 86400000) + 1);
+          const activeRatio = Math.min(1, activeDays / totalRangeDays);
+          
+          commissionPart = rate * baseValue * activeRatio;
+        }
       }
 
-      return sum + perOccurrence * occurrences;
+      return sum + retainerPart + commissionPart;
     }, 0);
 
     // FBT Fulfillment Fees — calculated here so they can be included in shipping for opex
@@ -861,7 +820,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
       operatingIncome,
       operatingIncomePct,
     };
-  }, [orders, cogsStats, adsSpendData, dateRange, dataVersion, affiliateSettlements, agencyFees, plData, includeCancelledFinancials]);
+  }, [orders, cogsStats, dateRange, dataVersion, affiliateSettlements, agencyFees, plData, includeCancelledFinancials, marketingDaily, timezone]);
 
   // Destructure for easier usage in render
   const {
@@ -871,17 +830,11 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
     grossProfit,
     adSpend,
     totalExpenses,
-    netProfit,
-    grossMargin,
-    roi,
-    adConversionValue,
-    adROAS,
     totalUnitsSold,
     realOperatingExpenses,
     manualAffiliateRetainers,
     autoAffiliateCommission,
     totalAffiliateCost,
-    shopAdsFees,
     totalAgencyFees
   } = financials;
 
@@ -1208,6 +1161,15 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
           >
             <RefreshCw size={20} className={cacheMetadata.isSyncing ? "animate-spin" : ""} />
             <span>{cacheMetadata.isSyncing ? 'Syncing...' : 'Sync Finance'}</span>
+          </button>
+          <button
+            onClick={handleFullSync}
+            disabled={cacheMetadata.isSyncing || isLoading}
+            className="flex items-center space-x-2 px-3 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg transition-colors disabled:opacity-50 text-sm"
+            title="Full re-sync: fetches all settlements with complete transaction details (affiliate commissions, platform fees, etc.)"
+          >
+            <RotateCcw size={16} className={cacheMetadata.isSyncing ? "animate-spin" : ""} />
+            <span>Full Sync</span>
           </button>
 
           {/* Export Dropdown */}
@@ -1780,109 +1742,24 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
           </div>
 
           {/* ═══════════════════ MARKETING COSTS (AD SPEND) ═══════════════════ */}
-          {adsConnected && (
+          {adSpend > 0 && (
             <div className="bg-gray-800 rounded-xl border border-gray-700 p-6">
               <h3 className="text-lg font-semibold text-white mb-2">Marketing Costs</h3>
-              <p className="text-gray-500 text-sm mb-4">Total Marketing Expenditure (Ads API + Shop Settlement Deductions)</p>
+              <p className="text-gray-500 text-sm mb-4">Total ad spend from synced marketing data (same as Marketing Dashboard)</p>
               <div className="space-y-1">
                 <ExpandableItem
                   icon={<Megaphone className="w-5 h-5 text-white" />}
                   iconBgColor="bg-gradient-to-r from-pink-600 to-red-600"
                   title="TikTok Ad Spend"
-                  subtitle={`${adsSpendData?.daily.length || 0} days of ad data`}
+                  subtitle="Synced from Marketing Dashboard"
                   value={formatCurrency(adSpend)}
                   valueColor="text-red-400"
                   isNegative
                   tooltip={{
-                    source: "TikTok Business API + Shop Settlements",
-                    calculation: "Marketing API Spend + Shop Ads Fees (TAP/Affiliate Ads)",
-                    api: "GET /tiktok-ads/spend + GET /finance/pl-data"
+                    source: "Synced Marketing Data (tiktok_ad_spend_daily)",
+                    calculation: "Sum of daily total_spend within selected date range",
+                    api: "GET /api/tiktok-ads/marketing-data (synced DB)"
                   }}
-                  expandedContent={
-                    <div className="space-y-4">
-                      <div className="bg-gray-800 rounded-lg p-4 border border-gray-700">
-                        <h4 className="text-white font-medium mb-3">Ad Performance Summary</h4>
-                        <div className="space-y-2 text-sm">
-                          <div className="flex justify-between">
-                            <span className="text-gray-400">Total Impressions</span>
-                            <span className="text-white font-medium">
-                              {(adsSpendData?.totals.total_impressions || 0).toLocaleString()}
-                            </span>
-                          </div>
-                          <div className="flex justify-between">
-                            <span className="text-gray-400">Total Clicks</span>
-                            <span className="text-white font-medium">
-                              {(adsSpendData?.totals.total_clicks || 0).toLocaleString()}
-                            </span>
-                          </div>
-                          <div className="flex justify-between">
-                            <span className="text-gray-400">CTR (Click-Through Rate)</span>
-                            <span className="text-white font-medium">
-                              {((adsSpendData?.totals.total_clicks || 0) / (adsSpendData?.totals.total_impressions || 1) * 100).toFixed(2)}%
-                            </span>
-                          </div>
-                          <div className="flex justify-between">
-                            <span className="text-gray-400">Avg. CPC</span>
-                            <span className="text-white font-medium">
-                              ${(adsSpendData?.average_cpc || 0).toFixed(2)}
-                            </span>
-                          </div>
-                          <div className="flex justify-between">
-                            <span className="text-gray-400">Avg. CPM</span>
-                            <span className="text-white font-medium">
-                              ${(adsSpendData?.average_cpm || 0).toFixed(2)}
-                            </span>
-                          </div>
-                        </div>
-                      </div>
-                      {adConversionValue > 0 && (
-                        <div className="bg-gray-800 rounded-lg p-4 border border-gray-700">
-                          <h4 className="text-white font-medium mb-3">Conversion Data</h4>
-                          <div className="space-y-2 text-sm">
-                            <div className="flex justify-between">
-                              <span className="text-gray-400">Total Conversions</span>
-                              <span className="text-white font-medium">
-                                {(adsSpendData?.totals.total_conversions || 0).toLocaleString()}
-                              </span>
-                            </div>
-                            <div className="flex justify-between">
-                              <span className="text-gray-400">Conversion Value</span>
-                              <span className="text-green-400 font-medium">
-                                {formatCurrency(adConversionValue)}
-                              </span>
-                            </div>
-                            <div className="flex justify-between items-center pt-2 border-t border-gray-700">
-                              <span className="text-white font-bold">ROAS</span>
-                              <span className={`font-bold text-lg ${adROAS >= 1 ? 'text-green-400' : 'text-red-400'}`}>
-                                {adROAS.toFixed(2)}x
-                              </span>
-                            </div>
-                          </div>
-                          <p className="text-gray-500 text-xs mt-3">
-                            {adROAS >= 1
-                              ? `Great! You're making $${adROAS.toFixed(2)} for every $1 spent on ads.`
-                              : `You're losing money on ads. For every $1 spent, you make $${adROAS.toFixed(2)}.`
-                            }
-                          </p>
-                        </div>
-                      )}
-                      {shopAdsFees > 0 && (
-                        <div className="bg-gray-800 rounded-lg p-4 border border-gray-700">
-                          <h4 className="text-white font-medium mb-3">Shop Settlement Deductions</h4>
-                          <BreakdownRows
-                            items={adSpendFeeKeys
-                              .filter(k => Math.abs(plData?.fees?.[k] || 0) >= 0.01)
-                              .map(k => ({
-                                label: AFFILIATE_LABELS[k] || k.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
-                                value: Math.abs(plData?.fees?.[k] || 0)
-                              }))
-                            }
-                            color="text-red-400"
-                          />
-                        </div>
-                      )}
-                    </div>
-                  }
                 />
 
                 {/* Total Marketing Costs */}
@@ -1894,9 +1771,9 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                     <div className="flex items-center gap-2">
                       <p className="text-lg font-bold text-white">Total Marketing Costs</p>
                       <CalculationTooltip
-                        source="TikTok Business API + Shop Settlements"
-                        calculation="Marketing API Spend + Shop Ads Fees (TAP/Affiliate Ads)"
-                        api="GET /tiktok-ads/spend + GET /finance/pl-data"
+                        source="Synced Marketing Data (tiktok_ad_spend_daily)"
+                        calculation="Sum of total_spend within selected date range"
+                        api="GET /api/tiktok-ads/marketing-data (synced DB)"
                       />
                     </div>
                   </div>

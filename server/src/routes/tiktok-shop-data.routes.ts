@@ -471,6 +471,7 @@ router.get('/shops/:accountId', async (req: Request, res: Response) => {
                 shop_id: shop.shop_id,
                 shop_name: shop.shop_name,
                 region: shop.region,
+                timezone: shop.timezone || 'America/Los_Angeles',
                 seller_type: shop.seller_type,
                 created_at: shop.created_at,
                 account_id: shop.account_id,
@@ -523,6 +524,45 @@ router.get('/shop/:accountId', async (req: Request, res: Response) => {
             success: false,
             error: error.message,
         });
+    }
+});
+
+/**
+ * PATCH /api/tiktok-shop/shops/:shopId/timezone
+ * Update the timezone for a specific shop
+ */
+router.patch('/shops/:shopId/timezone', async (req: Request, res: Response) => {
+    try {
+        const { shopId } = req.params;
+        const { timezone, accountId } = req.body;
+
+        if (!timezone || !accountId) {
+            return res.status(400).json({ success: false, error: 'timezone and accountId are required' });
+        }
+
+        // Validate IANA timezone string
+        try {
+            Intl.DateTimeFormat(undefined, { timeZone: timezone });
+        } catch {
+            return res.status(400).json({ success: false, error: `Invalid timezone: ${timezone}` });
+        }
+
+        const { data, error } = await supabase
+            .from('tiktok_shops')
+            .update({ timezone, updated_at: new Date().toISOString() })
+            .eq('shop_id', shopId)
+            .eq('account_id', accountId)
+            .select('shop_id, shop_name, timezone')
+            .single();
+
+        if (error) throw error;
+
+        console.log(`[Timezone] Updated shop ${data.shop_name} (${shopId}) timezone to ${timezone}`);
+
+        res.json({ success: true, data });
+    } catch (error: any) {
+        console.error('Error updating shop timezone:', error);
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
@@ -2758,7 +2798,7 @@ router.get('/categories/:accountId', async (req: Request, res: Response) => {
 router.post('/sync/:accountId', async (req: Request, res: Response) => {
     try {
         const { accountId } = req.params;
-        const { shopId, syncType = 'all', startDate, endDate } = req.body;
+        const { shopId, syncType = 'all', startDate, endDate, forceFullSync = false } = req.body;
 
         const shop = await getShopWithToken(accountId, shopId);
 
@@ -2773,7 +2813,9 @@ router.post('/sync/:accountId', async (req: Request, res: Response) => {
 
         const isFirstSync = (existingOrdersCount || 0) === 0;
 
-        if (isHistoricalFetch) {
+        if (forceFullSync) {
+            console.log(`[Sync] ⚡ Force Full Sync requested for ${shop.shop_name} - will fetch all settlement data with transactions`);
+        } else if (isHistoricalFetch) {
             console.log(`[Sync] Historical fetch for ${shop.shop_name}: ${startDate} to ${endDate}`);
         } else if (isFirstSync) {
             console.log(`[Sync] First-time sync detected for ${shop.shop_name} - will fetch all data`);
@@ -2793,7 +2835,8 @@ router.post('/sync/:accountId', async (req: Request, res: Response) => {
         }
 
         if (syncType === 'all' || syncType === 'settlements' || syncType === 'finance') {
-            syncResults.settlements = await syncSettlements(shop, isFirstSync);
+            // Force full sync for settlements when requested (bypasses Smart Stop)
+            syncResults.settlements = await syncSettlements(shop, isFirstSync || forceFullSync);
         }
 
         if (syncType === 'all') {
@@ -4274,6 +4317,78 @@ async function syncSettlements(shop: any, isFirstSync: boolean = true): Promise<
                 console.error('[Final Write] Failed:', writeError.message);
                 throw writeError;
             }
+        }
+
+        // ==========================================
+        // BACKFILL: Fix settlements with NULL transaction_summary
+        // This catches settlements that were synced before the transaction-fetching
+        // feature was added, or whose transaction fetch previously failed.
+        // ==========================================
+        let backfilledCount = 0;
+        try {
+            // Find settlements with NULL or empty transaction_summary for this shop
+            const { data: missingTxSettlements, error: missingErr } = await supabase
+                .from('shop_settlements')
+                .select('settlement_id, settlement_data')
+                .eq('shop_id', shop.id)
+                .or('transaction_summary.is.null,transaction_summary->>transaction_count.eq.0')
+                .limit(100); // Process up to 100 at a time to avoid timeout
+
+            if (!missingErr && missingTxSettlements && missingTxSettlements.length > 0) {
+                console.log(`[Backfill] Found ${missingTxSettlements.length} settlements with missing transaction_summary for ${shop.shop_name}. Backfilling...`);
+
+                const TX_CHUNK = 10;
+                for (let i = 0; i < missingTxSettlements.length; i += TX_CHUNK) {
+                    const chunk = missingTxSettlements.slice(i, i + TX_CHUNK);
+                    await Promise.all(chunk.map(async (settlement) => {
+                        try {
+                            let allTx: any[] = [];
+                            let txToken = '';
+                            let txPage = 1;
+                            const stmtId = settlement.settlement_id;
+
+                            while (true) {
+                                const txParams: any = { page_size: '100', sort_field: 'order_create_time', sort_order: 'DESC' };
+                                if (txToken) txParams.page_token = txToken;
+
+                                const txRes = await executeWithRefresh(
+                                    shop.account_id,
+                                    shop.shop_id,
+                                    (token, cipher) => tiktokShopApi.getStatementTransactions(token, cipher, stmtId, txParams)
+                                );
+                                const txs = txRes?.transactions || [];
+                                allTx = [...allTx, ...txs];
+
+                                if (!txRes?.next_page_token || txRes.next_page_token === txToken || txs.length === 0) break;
+                                txToken = txRes.next_page_token;
+                                txPage++;
+                                if (txPage > 20) break;
+                            }
+
+                            const txSummary = allTx.length > 0 ? aggregateTransactions(allTx) : { transaction_count: 0 };
+
+                            // Update the settlement in DB
+                            await supabase
+                                .from('shop_settlements')
+                                .update({
+                                    transaction_summary: txSummary,
+                                    transactions_synced_at: new Date().toISOString()
+                                })
+                                .eq('shop_id', shop.id)
+                                .eq('settlement_id', stmtId);
+
+                            if (allTx.length > 0) backfilledCount++;
+                        } catch (e: any) {
+                            console.warn(`[Backfill] Failed for settlement ${settlement.settlement_id}: ${e.message}`);
+                        }
+                    }));
+                    if (i + TX_CHUNK < missingTxSettlements.length) await new Promise(r => setTimeout(r, 100));
+                }
+
+                console.log(`[Backfill] ✅ Backfilled ${backfilledCount}/${missingTxSettlements.length} settlements with transaction data`);
+            }
+        } catch (backfillErr: any) {
+            console.warn(`[Backfill] Error during backfill (non-fatal): ${backfillErr.message}`);
         }
 
         // Update sync timestamp

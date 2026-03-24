@@ -1,0 +1,111 @@
+TikTok Shop Profit & Loss: Data Sources Audit
+
+Overview
+This document outlines exactly how each line item in the Profit & Loss statement is calculated. It provides the definition of the metric and the underlying API and database sources used.
+
+Important Note on Accounting Methodology:
+The Mamba P&L uses a *cash-based accounting method anchored to settlement dates* for all deductions, fees, and expenses. This ensures that the P&L reflects *actual* money movement and exact TikTok deductions, rather than estimated marketing metrics.
+
+Because TikTok holds funds for 15+ days before settling an order, P&L expenses for a specific date (e.g., March 16) reflect orders that *settled* on that date, but were likely *placed* weeks prior.
+
+---
+
+1. Revenue Metrics
+
+Total Order Amount (Gross Revenue)
+* Definition: The total gross value of all orders placed within the selected date range, including product price, shipping fees, and all taxes.
+* Data Source: Mamba Database (shop_orders table).
+* API Origin: TikTok Shop API (GET /orders/search).
+* Calculation: Sum of payment_info.total_amount (or order_amount) for all active orders in the date range.
+
+Gross Sales (GMV)
+* Definition: The total value of merchandise sold, excluding taxes but including shipping fees and before any discounts are applied.
+* Data Source: Mamba Database (shop_orders table).
+* Calculation: Sum of (Product Price × Quantity) + Shipping Fees - Seller Discounts - Platform Discounts for all active orders.
+
+Refunds
+* Definition: The total GMV of orders that were cancelled or refunded within the selected date range.
+* Data Source: Mamba Database (shop_orders table).
+* Calculation: Sum of GMV for orders where the order status is CANCELED (130) or REFUNDED (140).
+
+Net Revenue
+* Definition: The actual revenue generated after subtracting refunds from Gross Sales. This is the top-line number used for margin calculations.
+* Calculation: Gross Sales (GMV) - Refunds
+
+---
+
+2. Cost of Goods Sold (COGS) & Affiliate Costs
+
+Product COGS
+* Definition: The total manufacturing or sourcing cost of the physical products sold.
+* Data Source: Mamba Database (shop_products table) joined with Order line items.
+* API Origin: User-inputted COGS values per SKU in the Mamba interface.
+* Calculation: Sum of (Quantity Sold × Unit COGS) for all items in non-refunded orders.
+
+Shipping COGS (Fulfillment)
+* Definition: The direct cost of shipping products to customers (e.g., postage, 3PL fees).
+* Data Source: Mamba Database (shop_orders table).
+* API Origin: User-inputted default shipping costs or order-specific shipping overrides in the Mamba interface.
+* Calculation: Sum of product_shipping_cost for all non-refunded orders.
+
+Affiliate Commissions
+* Definition: Commissions paid out to affiliates and creators. Treated as a Cost of Goods Sold item before calculating Gross Profit.
+* Why it differs from TikTok's "Est. commission": TikTok's marketing dashboard shows *estimated* commissions for orders *placed* today. Mamba's P&L shows *actual* commissions deducted from orders that *settled* today.
+* Data Source: Mamba Database (shop_settlements table -> transaction_summary) and manual retainers.
+* API Origin: TikTok Shop API (GET /finance/statements - Transaction level).
+* Calculation: 
+  - Auto: Sum of affiliate_commission, affiliate_partner_commission, and cofunded_creator_bonus from itemized settlement transactions.
+  - Manual: Sum of user-inputted manual affiliate retainers for the period.
+
+Gross Profit
+* Definition: Profit remaining after deducting the direct costs of creating and selling the product (COGS and Affiliate payouts).
+* Calculation: Net Revenue - Product COGS - Shipping COGS - Affiliate Commissions
+
+---
+
+3. Operating Expenses
+
+Platform Fees
+* Definition: Fees charged directly by TikTok for using the platform and processing payments.
+* Data Source: Mamba Database (shop_settlements table -> transaction_summary).
+* API Origin: TikTok Shop API (GET /finance/statements - Transaction level).
+* Calculation: Sum of itemized fees from settled transactions:
+  - platform_commission
+  - referral_fee
+  - transaction_fee
+  - refund_administration_fee
+  - credit_card_handling_fee
+
+Shipping Deficits / Costs
+* Definition: The difference between what the customer paid for shipping and what TikTok charged for shipping labels (when using TikTok Shipping).
+* Data Source: Mamba Database (shop_orders table).
+* API Origin: TikTok Shop API (GET /orders/search).
+* Calculation: Sum of payment_info.shipping_fee_seller_discount across all orders.
+
+Ad Spend (Marketing)
+* Definition: Money spent on TikTok Ads campaigns.
+* Data Source: Mamba Database (tiktok_ad_spend_daily).
+* API Origin: TikTok Ads API.
+* Calculation: Sum of synced marketing spend from connected Ad accounts for the selected date range.
+
+Agency Fees
+* Definition: Retainers or commission-based fees paid to external agencies managing the shop or ads.
+* Data Source: Mamba Database (agency_fees table).
+* API Origin: User-inputted agency agreements in the Mamba interface.
+* Calculation: Prorated daily retainer amounts + active commission splits based on Gross Profit/Revenue for the period.
+
+---
+
+4. Bottom Line Metrics
+
+Net Profit (Operating Income)
+* Definition: The final actual profit after all costs, fees, and expenses have been deducted.
+* Calculation: Gross Profit - Platform Fees - Shipping Costs - Ad Spend - Agency Fees
+
+Gross Margin
+* Definition: Gross profit expressed as a percentage of Net Revenue.
+* Calculation: (Gross Profit / Net Revenue) * 100
+
+ROI (Return on Investment)
+* Definition: The net profit generated relative to the total costs invested (COGS + Affiliate + Opex).
+* Calculation: (Net Profit / Total Costs) * 100

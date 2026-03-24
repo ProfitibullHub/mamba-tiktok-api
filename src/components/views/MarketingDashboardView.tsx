@@ -40,6 +40,7 @@ import {
 interface MarketingDashboardViewProps {
     account: Account;
     shopId?: string;
+    timezone?: string;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -49,7 +50,7 @@ const fmt = (n: number, decimals = 2) =>
         : n >= 1_000 ? `${(n / 1_000).toFixed(1)}K`
             : n.toFixed(decimals);
 
-const fmtCurrency = (n: number) => `$${fmt(n)}`;
+const fmtCurrency = (n: number) => `$${Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 const fmtPct = (n: number) => `${n.toFixed(2)}%`;
 const fmtInt = (n: number) => n.toLocaleString();
 
@@ -75,6 +76,8 @@ function KpiCard({ label, value, icon: Icon, color, subtitle }: {
 function EngagementRow({ label, value, icon: Icon, color }: {
     label: string; value: number; icon: any; color: string;
 }) {
+    if (!value || value <= 0) return null;
+
     return (
         <div className="flex items-center gap-3 py-2">
             <div className={`p-2 rounded-lg ${color}`}>
@@ -192,7 +195,7 @@ function AdRow({ ad }: { ad: AdAsset }) {
 
 // ─── Main Component ──────────────────────────────────────────────────────────
 
-export function MarketingDashboardView({ account, shopId: _shopId }: MarketingDashboardViewProps) {
+export function MarketingDashboardView({ account, shopId: _shopId, timezone: shopTimezone = 'America/Los_Angeles' }: MarketingDashboardViewProps) {
     const accountId = account.id;
 
     const {
@@ -231,26 +234,25 @@ export function MarketingDashboardView({ account, shopId: _shopId }: MarketingDa
         const start = new Date();
         start.setDate(end.getDate() - 90); // Default to 90 days inclusive
 
-        // Match DateRangePicker format and static timezone logic
-        const tz = 'America/Los_Angeles';
-
         return {
-            startDate: formatShopDateISO(start, tz),
-            endDate: formatShopDateISO(end, tz),
+            startDate: formatShopDateISO(start, shopTimezone),
+            endDate: formatShopDateISO(end, shopTimezone),
         };
     });
 
     // Audience now uses the 90-day window (matches backend default)
-    const AUDIENCE_END = formatShopDateISO(new Date(), 'America/Los_Angeles');
+    const AUDIENCE_END = formatShopDateISO(new Date(), shopTimezone);
     const AUDIENCE_START = (() => {
         const d = new Date();
         d.setDate(d.getDate() - 90);
-        return formatShopDateISO(d, 'America/Los_Angeles');
+        return formatShopDateISO(d, shopTimezone);
     })();
 
     const [activeTab, setActiveTab] = useState<'overview' | 'campaigns' | 'audience'>('overview');
     const [showAdvertiserSwitcher, setShowAdvertiserSwitcher] = useState(false);
-    const [hasCheckedConnection, setHasCheckedConnection] = useState(false);
+    const [hasCheckedConnection, setHasCheckedConnection] = useState(() => {
+        return Boolean(connected && marketingAccountId === accountId && marketingLoaded);
+    });
 
     // Disconnect state
     const [showDisconnectModal, setShowDisconnectModal] = useState(false);
@@ -303,8 +305,15 @@ export function MarketingDashboardView({ account, shopId: _shopId }: MarketingDa
         }
 
         // Date-dependent static endpoints still need calling correctly
-        // (but backend could be optimized later, keeping existing logic for assets)
-        fetchAssets(accountId, desiredStart, desiredEnd);
+        const assetsState = useTikTokAdsStore.getState();
+        const assetsSameRange = assetsState.assetsDateRange?.start === desiredStart && assetsState.assetsDateRange?.end === desiredEnd;
+        const assetsFresh = typeof assetsState.assetsLastFetchTime === 'number'
+            ? (Date.now() - assetsState.assetsLastFetchTime) < STALE_MS
+            : false;
+        
+        if (!assetsState.assets || !assetsSameRange || !assetsFresh) {
+            fetchAssets(accountId, desiredStart, desiredEnd);
+        }
     }, [
         accountId,
         connected,
@@ -321,12 +330,24 @@ export function MarketingDashboardView({ account, shopId: _shopId }: MarketingDa
     // Date-independent endpoints fetch ONCE per account
     useEffect(() => {
         if (!connected || !accountId) return;
-        // Clear stale data from previous account immediately
-        useTikTokAdsStore.setState({ availableAdvertisers: null, gmvMaxSessions: null, audienceData: null });
-        fetchAvailableAdvertisers(accountId);
-        fetchGmvMaxSessions(accountId);
-        fetchAudienceData(accountId, AUDIENCE_START, AUDIENCE_END);
-    }, [accountId, connected, fetchAvailableAdvertisers, fetchGmvMaxSessions, fetchAudienceData]);
+        
+        if (marketingAccountId && marketingAccountId !== accountId) {
+            useTikTokAdsStore.setState({ availableAdvertisers: null, gmvMaxSessions: null, audienceData: null });
+        }
+
+        const state = useTikTokAdsStore.getState();
+        const isCurrentAccount = marketingAccountId === accountId;
+
+        if (!isCurrentAccount || !state.availableAdvertisers) {
+            fetchAvailableAdvertisers(accountId);
+        }
+        if (!isCurrentAccount || !state.gmvMaxSessions) {
+            fetchGmvMaxSessions(accountId);
+        }
+        if (!isCurrentAccount || !state.audienceData) {
+            fetchAudienceData(accountId, AUDIENCE_START, AUDIENCE_END);
+        }
+    }, [accountId, connected, fetchAvailableAdvertisers, fetchGmvMaxSessions, fetchAudienceData, marketingAccountId, AUDIENCE_START, AUDIENCE_END]);
 
     // ─── LOCAL FILTERING (The Magic) ─────────────────────────────────────
     // If DB data is loaded, filter it locally by date range instead of calling the API
@@ -726,50 +747,60 @@ export function MarketingDashboardView({ account, shopId: _shopId }: MarketingDa
                 <div className="space-y-6">
                     {/* Primary KPI rows — financial metrics (2 rows × 3 cards) */}
                     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-                        <KpiCard
-                            label="Cost"
-                            value={fmtCurrency(kpis.spend || 0)}
-                            icon={DollarSign}
-                            color="bg-amber-500/20"
-                            subtitle="Total ad spend"
-                        />
-                        <KpiCard
-                            label="Orders"
-                            value={fmtInt(kpis.conversions || 0)}
-                            icon={Megaphone}
-                            color="bg-emerald-500/20"
-                            subtitle="Attributed orders"
-                        />
-                        <KpiCard
-                            label="Cost per Order"
-                            value={fmtCurrency(kpis.cost_per_conversion || 0)}
-                            icon={DollarSign}
-                            color="bg-orange-500/20"
-                            subtitle="Average cost per order"
-                        />
-                        <KpiCard
-                            label="Gross Revenue"
-                            value={fmtCurrency(kpis.gmv_max_revenue || kpis.revenue || 0)}
-                            icon={TrendingUp}
-                            color="bg-purple-500/20"
-                            subtitle={`All GMV Max revenue`}
-                        />
-                        <KpiCard
-                            label="ROI (GMV Max)"
-                            value={kpis.gmv_max_spend > 0 && (kpis.gmv_max_revenue || 0) > 0
-                                ? `${((kpis.gmv_max_revenue || 0) / kpis.gmv_max_spend).toFixed(2)}x`
-                                : '—'}
-                            icon={Target}
-                            color="bg-blue-500/20"
-                            subtitle="GMV Max only"
-                        />
-                        <KpiCard
-                            label="ROAS (Blended)"
-                            value={`${kpis.roas.toFixed(2)}x`}
-                            icon={BarChart3}
-                            color="bg-indigo-500/20"
-                            subtitle="All campaigns"
-                        />
+                        {(kpis.spend || 0) > 0 && (
+                            <KpiCard
+                                label="Cost"
+                                value={fmtCurrency(kpis.spend)}
+                                icon={DollarSign}
+                                color="bg-amber-500/20"
+                                subtitle="Total ad spend"
+                            />
+                        )}
+                        {(kpis.conversions || 0) > 0 && (
+                            <KpiCard
+                                label="Orders"
+                                value={fmtInt(kpis.conversions)}
+                                icon={Megaphone}
+                                color="bg-emerald-500/20"
+                                subtitle="Attributed orders"
+                            />
+                        )}
+                        {(kpis.cost_per_conversion || 0) > 0 && (
+                            <KpiCard
+                                label="Cost per Order"
+                                value={fmtCurrency(kpis.cost_per_conversion)}
+                                icon={DollarSign}
+                                color="bg-orange-500/20"
+                                subtitle="Average cost per order"
+                            />
+                        )}
+                        {(kpis.gmv_max_revenue || kpis.revenue || 0) > 0 && (
+                            <KpiCard
+                                label="Gross Revenue"
+                                value={fmtCurrency(kpis.gmv_max_revenue || kpis.revenue || 0)}
+                                icon={TrendingUp}
+                                color="bg-purple-500/20"
+                                subtitle="All GMV Max revenue"
+                            />
+                        )}
+                        {kpis.gmv_max_spend > 0 && (kpis.gmv_max_revenue || 0) > 0 && (
+                            <KpiCard
+                                label="ROI (GMV Max)"
+                                value={`${((kpis.gmv_max_revenue || 0) / kpis.gmv_max_spend).toFixed(2)}x`}
+                                icon={Target}
+                                color="bg-blue-500/20"
+                                subtitle="GMV Max only"
+                            />
+                        )}
+                        {(kpis.roas || 0) > 0 && (
+                            <KpiCard
+                                label="ROAS (Blended)"
+                                value={`${kpis.roas.toFixed(2)}x`}
+                                icon={BarChart3}
+                                color="bg-indigo-500/20"
+                                subtitle="All campaigns"
+                            />
+                        )}
                     </div>
 
                     {/* Daily Spend Chart (Recharts) */}
@@ -827,33 +858,39 @@ export function MarketingDashboardView({ account, shopId: _shopId }: MarketingDa
 
                     {/* Secondary KPIs — delivery context under financial cards */}
                     <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
-                        <KpiCard
-                            label="Impressions"
-                            value={fmt(kpis.impressions, 0)}
-                            icon={Eye}
-                            color="bg-slate-500/20"
-                            subtitle={`CPM: $${kpis.cpm.toFixed(2)}`}
-                        />
-                        <KpiCard
-                            label="Clicks"
-                            value={fmtInt(kpis.clicks)}
-                            icon={MousePointerClick}
-                            color="bg-pink-500/20"
-                            subtitle={`CTR: ${fmtPct(kpis.ctr)}`}
-                        />
-                        <KpiCard
-                            label="Reach & Frequency"
-                            value={kpis.reach > 0 ? fmtInt(kpis.reach) : '—'}
-                            icon={Users}
-                            color="bg-cyan-500/20"
-                            subtitle={kpis.frequency > 0 ? `Freq: ${kpis.frequency.toFixed(2)}x` : 'No reach yet'}
-                        />
+                        {(kpis.impressions || 0) > 0 && (
+                            <KpiCard
+                                label="Impressions"
+                                value={fmt(kpis.impressions, 0)}
+                                icon={Eye}
+                                color="bg-slate-500/20"
+                                subtitle={`CPM: $${kpis.cpm.toFixed(2)}`}
+                            />
+                        )}
+                        {(kpis.clicks || 0) > 0 && (
+                            <KpiCard
+                                label="Clicks"
+                                value={fmtInt(kpis.clicks)}
+                                icon={MousePointerClick}
+                                color="bg-pink-500/20"
+                                subtitle={`CTR: ${fmtPct(kpis.ctr)}`}
+                            />
+                        )}
+                        {(kpis.reach || 0) > 0 && (
+                            <KpiCard
+                                label="Reach & Frequency"
+                                value={fmtInt(kpis.reach)}
+                                icon={Users}
+                                color="bg-cyan-500/20"
+                                subtitle={kpis.frequency > 0 ? `Freq: ${kpis.frequency.toFixed(2)}x` : 'No reach yet'}
+                            />
+                        )}
                     </div>
 
                     {/* Engagement + Video side by side */}
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                         {/* Engagement */}
-                        {eng && (
+                        {eng && (eng.likes > 0 || eng.comments > 0 || eng.shares > 0 || eng.follows > 0 || eng.profile_visits > 0) && (
                             <div className="bg-gray-800/60 border border-gray-700/50 rounded-xl p-5">
                                 <h3 className="text-white font-semibold mb-3 flex items-center gap-2">
                                     <Heart size={16} className="text-pink-400" />

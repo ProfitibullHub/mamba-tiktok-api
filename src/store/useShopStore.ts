@@ -273,12 +273,12 @@ interface ShopState {
     dataVersion: number; // Increments on every data update to force UI re-renders
 
     // Actions
-    fetchShopData: (accountId: string, shopId?: string, options?: { forceRefresh?: boolean; showCached?: boolean; skipSyncCheck?: boolean; includePreviousPeriod?: boolean; initialLoadDays?: number }, startDate?: string, endDate?: string) => Promise<void>;
+    fetchShopData: (accountId: string, shopId?: string, options?: { forceRefresh?: boolean; showCached?: boolean; skipSyncCheck?: boolean; includePreviousPeriod?: boolean; initialLoadDays?: number; timezone?: string }, startDate?: string, endDate?: string) => Promise<void>;
     setProducts: (products: Product[]) => void;
     setOrders: (orders: Order[]) => void;
     setMetrics: (metrics: Partial<ShopMetrics>) => void;
     clearData: () => void;
-    syncData: (accountId: string, shopId: string, syncType?: 'orders' | 'products' | 'finance' | 'all') => Promise<void>;
+    syncData: (accountId: string, shopId: string, syncType?: 'orders' | 'products' | 'finance' | 'all', forceFullSync?: boolean) => Promise<void>;
     cancelSync: () => void;
     dismissRefreshPrompt: () => void;
     autoSyncInProgress: string[];
@@ -326,7 +326,7 @@ interface ShopState {
     plDataKey: string;
     plLoading: boolean;
     plError: string | null;
-    fetchPLData: (accountId: string, shopId: string, startDate: string, endDate: string, forceRefresh?: boolean) => Promise<void>;
+    fetchPLData: (accountId: string, shopId: string, startDate: string, endDate: string, forceRefresh?: boolean, timezone?: string) => Promise<void>;
     memoryCache: Record<string, {
         products: Product[];
         orders: Order[];
@@ -673,7 +673,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
                 // CRITICAL: Use shop timezone, not browser local time
                 // Browser might be in CET (UTC+1) but shop is in America/Los_Angeles (UTC-8)
                 // This ensures we load today's data in the shop's timezone
-                const shopTimezone = 'America/Los_Angeles'; // TODO: Get from shop settings
+                const shopTimezone = options.timezone || 'America/Los_Angeles';
 
                 // Get current date in shop timezone
                 const now = new Date();
@@ -1044,7 +1044,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
                 // STEP 2: If there are more orders, progressively load them in background batches
                 if (hasMoreOrders && totalOrderCount > orders.length) {
                     const BATCH_SIZE = 1000;
-                    const MAX_BATCH_RETRIES = 3;   // Increased to 3 attempts max (60s each)
+                    const MAX_BATCH_RETRIES = 5;   // 5 attempts with exponential backoff
                     let hasMore = true;
                     // Initialize local accumulator with ALL orders (merged if gap-fetch, raw if full-fetch).
                     // CRITICAL: For gap-fetches, we must start from mergedOrders to preserve existing
@@ -1088,12 +1088,12 @@ export const useShopStore = create<ShopState>((set, get) => ({
                         let lastError: any = null;
                         for (let attempt = 0; attempt < MAX_BATCH_RETRIES; attempt++) {
                             if (attempt > 0) {
-                                const delay = 2000;
-                                console.log(`[Store] Retrying batch after ${delay}ms...`);
+                                const delay = Math.min(2000 * Math.pow(2, attempt - 1), 32000); // 2s, 4s, 8s, 16s, 32s
+                                console.log(`[Store] Retrying batch (attempt ${attempt + 1}/${MAX_BATCH_RETRIES}) after ${delay}ms...`);
                                 await new Promise(r => setTimeout(r, delay));
                             }
                             try {
-                                const response = await fetchWithTimeout(batchUrl, 60000); // 60s per attempt
+                                const response = await fetchWithTimeout(batchUrl, 55000); // 55s (under Vercel 60s limit)
                                 batchResult = await response.json();
                                 lastError = null;
                                 break; // success
@@ -1235,7 +1235,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
         loadedDateRange: { startDate: null, endDate: null }
     }),
 
-    syncData: async (accountId: string, shopId: string, syncType: string = 'all') => {
+    syncData: async (accountId: string, shopId: string, syncType: string = 'all', forceFullSync: boolean = false) => {
         // Preempt any running auto-sync — manual sync takes priority
         if (get().autoSyncInProgress.length > 0) {
             console.log('[Sync] Manual sync triggered, preempting auto-sync');
@@ -1290,7 +1290,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
                 fetch(`${API_BASE_URL}/api/tiktok-shop/sync/${accountId}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ shopId, syncType: type }),
+                    body: JSON.stringify({ shopId, syncType: type, forceFullSync }),
                     signal
                 }).then(r => r.json());
 
@@ -2617,7 +2617,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
         }
     },
 
-    fetchPLData: async (accountId: string, shopId: string, startDate: string, endDate: string, forceRefresh: boolean = false) => {
+    fetchPLData: async (accountId: string, shopId: string, startDate: string, endDate: string, forceRefresh: boolean = false, timezone: string = 'America/Los_Angeles') => {
         const key = `${accountId}:${shopId}:${startDate}:${endDate}`;
 
         // If we already have data for this exact key and not forcing refresh, skip
@@ -2633,7 +2633,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
         set({ plError: null });
 
         try {
-            const shopTimezone = 'America/Los_Angeles'; // TODO: Get from shop settings
+            const shopTimezone = timezone;
             const startUnix = getShopDayStartTimestamp(startDate, shopTimezone);
             const endUnix = getShopDayStartTimestamp(endDate, shopTimezone) + 86400;
 

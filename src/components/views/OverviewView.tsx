@@ -1,5 +1,6 @@
 
 import { TrendingUp, Star, RefreshCw, AlertCircle, Trash2, Calendar, Settings2, X, Plus, Zap } from 'lucide-react';
+import { TimezoneSelector } from '../TimezoneSelector';
 import { AffiliateCommissionCard } from '../AffiliateCommissionCard';
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { Account } from '../../lib/supabase';
@@ -33,8 +34,8 @@ import { ComparisonCharts } from '../ComparisonCharts';
 interface OverviewViewProps {
   account: Account;
   shopId?: string;
-
   timezone?: string; // Shop timezone for date calculations
+  onTimezoneChange?: (timezone: string) => void;
 }
 
 const getDefaultDateRange = (timezone: string): DateRange => {
@@ -57,7 +58,7 @@ const DATE_PRESETS = [
 ];
 
 
-export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles' }: OverviewViewProps) {
+export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles', onTimezoneChange }: OverviewViewProps) {
   const metrics = useShopStore(state => state.metrics);
 
   const error = useShopStore(state => state.error);
@@ -500,7 +501,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
         itemsSoldChange
       },
     };
-  }, [orders, finance.statements, dateRange, products, dataVersion, syncRenderKey, useHybridTimezone, affiliateSettlements, agencyFees, adsSpendData]);
+  }, [orders, finance.statements, dateRange, products, dataVersion, syncRenderKey, useHybridTimezone, affiliateSettlements, agencyFees, adsSpendData, timezone]);
 
 
   // Calculate Quick Stats
@@ -538,7 +539,17 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       pendingOrders,
       lowStockProducts
     };
-  }, [orders, products, dataVersion, syncRenderKey]);
+  }, [orders, products, dataVersion, syncRenderKey, timezone]);
+
+  // Re-fetch data when timezone changes to ensure server-side date filtering is correct
+  const prevTimezoneRef = useRef(timezone);
+  useEffect(() => {
+    if (prevTimezoneRef.current !== timezone && shopId) {
+      prevTimezoneRef.current = timezone;
+      console.log(`[OverviewView] Timezone changed to ${timezone}, re-fetching data...`);
+      handleDateRangeChange(dateRange.startDate, dateRange.endDate);
+    }
+  }, [timezone, shopId, dateRange.startDate, dateRange.endDate, handleDateRangeChange]);
 
 
   const handleSync = useCallback(async () => {
@@ -1247,6 +1258,14 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
                 {cacheMetadata.isSyncing ? 'Syncing...' : 'Sync Now'}
               </button>
 
+              {shopId && onTimezoneChange && (
+                <TimezoneSelector
+                  shopId={shopId}
+                  accountId={account.id}
+                  currentTimezone={timezone}
+                  onTimezoneChange={onTimezoneChange}
+                />
+              )}
 
             </div>
             {lastUpdated && (

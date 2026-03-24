@@ -2,18 +2,19 @@ import { useState } from 'react';
 import { Account } from '../../lib/supabase';
 import { Search, FileText, CreditCard, ArrowDownCircle, AlertCircle, Database, RefreshCw } from 'lucide-react';
 import { DateRangePicker, DateRange } from '../DateRangePicker';
-import { parseUTCDate, toLocalDateString } from '../../utils/dateUtils';
+import { getShopDayStartTimestamp, toLocalDateString } from '../../utils/dateUtils';
 
 interface FinanceDebugViewProps {
     account: Account;
     shopId?: string;
+    timezone?: string;
 }
 
 type TabType = 'statements' | 'payments' | 'withdrawals' | 'unsettled' | 'order_tx' | 'statement_tx';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001';
 
-export function FinanceDebugView({ account, shopId }: FinanceDebugViewProps) {
+export function FinanceDebugView({ account, shopId, timezone = 'America/Los_Angeles' }: FinanceDebugViewProps) {
     const [viewMode, setViewMode] = useState<'json' | 'table'>('table');
     const [activeTab, setActiveTab] = useState<TabType>('statements');
     const [data, setData] = useState<any>(null);
@@ -26,8 +27,6 @@ export function FinanceDebugView({ account, shopId }: FinanceDebugViewProps) {
         endDate: toLocalDateString(new Date())
     });
     const [pageSize, setPageSize] = useState(20);
-    const [targetId, setTargetId] = useState(''); // For Order ID or Statement ID
-
     const tabs = [
         { id: 'statements', label: 'Statements', icon: FileText },
         { id: 'payments', label: 'Payments', icon: CreditCard },
@@ -36,6 +35,74 @@ export function FinanceDebugView({ account, shopId }: FinanceDebugViewProps) {
         { id: 'order_tx', label: 'Order Transactions', icon: Search },
         { id: 'statement_tx', label: 'Statement Transactions', icon: Database },
     ];
+
+    const getRangeUnix = () => {
+        const start = getShopDayStartTimestamp(dateRange.startDate, timezone);
+        const end = getShopDayStartTimestamp(dateRange.endDate, timezone) + 86400;
+        return { start, end };
+    };
+
+    const parseAmount = (value: any): number => {
+        const n = parseFloat(String(value ?? '0'));
+        return Number.isFinite(n) ? n : 0;
+    };
+
+    const buildReconciliation = (statements: any[], transactions: any[]) => {
+        const statementTotals = {
+            revenue_amount_sum: statements.reduce((sum, s) => sum + parseAmount(s.revenue_amount), 0),
+            settlement_amount_sum: statements.reduce((sum, s) => sum + parseAmount(s.settlement_amount), 0),
+            fee_amount_sum: statements.reduce((sum, s) => sum + parseAmount(s.fee_amount), 0),
+            shipping_cost_amount_sum: statements.reduce((sum, s) => sum + parseAmount(s.shipping_cost_amount), 0),
+            statement_count: statements.length,
+        };
+
+        let platformFeeSum = 0;
+        let affiliateFeeSum = 0;
+        const transactionTotals = transactions.reduce((acc, tx) => {
+            acc.revenue_amount_sum += parseAmount(tx.revenue_amount);
+            acc.settlement_amount_sum += parseAmount(tx.settlement_amount);
+            acc.shipping_cost_amount_sum += parseAmount(tx.shipping_cost_amount);
+            acc.fee_tax_amount_sum += parseAmount(tx.fee_tax_amount);
+            return acc;
+        }, {
+            revenue_amount_sum: 0,
+            settlement_amount_sum: 0,
+            shipping_cost_amount_sum: 0,
+            fee_tax_amount_sum: 0,
+            transaction_count: transactions.length,
+        });
+
+        for (const tx of transactions) {
+            const fee = tx?.fee_tax_breakdown?.fee || {};
+            platformFeeSum +=
+                parseAmount(fee.platform_commission_amount) +
+                parseAmount(fee.referral_fee_amount) +
+                parseAmount(fee.transaction_fee_amount) +
+                parseAmount(fee.refund_administration_fee_amount) +
+                parseAmount(fee.credit_card_handling_fee_amount);
+            affiliateFeeSum +=
+                parseAmount(fee.affiliate_commission_amount) +
+                parseAmount(fee.affiliate_partner_commission_amount) +
+                parseAmount(fee.affiliate_ads_commission_amount) +
+                parseAmount(fee.external_affiliate_marketing_fee_amount) +
+                parseAmount(fee.cofunded_creator_bonus_amount);
+        }
+
+        return {
+            statement_totals: statementTotals,
+            transaction_totals: { ...transactionTotals, platform_fee_sum: platformFeeSum, affiliate_fee_sum: affiliateFeeSum },
+            deltas: {
+                shipping_delta: transactionTotals.shipping_cost_amount_sum - statementTotals.shipping_cost_amount_sum,
+                fee_tax_minus_statement_fee_delta: transactionTotals.fee_tax_amount_sum - statementTotals.fee_amount_sum,
+                settlement_delta: transactionTotals.settlement_amount_sum - statementTotals.settlement_amount_sum,
+                revenue_delta: transactionTotals.revenue_amount_sum - statementTotals.revenue_amount_sum,
+            },
+            buckets: {
+                affiliate_fee_sum: affiliateFeeSum,
+                platform_fee_sum: platformFeeSum,
+            }
+        };
+    };
 
     const fetchData = async () => {
         if (!shopId) {
@@ -70,47 +137,97 @@ export function FinanceDebugView({ account, shopId }: FinanceDebugViewProps) {
             switch (activeTab) {
                 case 'statements':
                     url = `${API_BASE_URL}/api/tiktok-shop/finance/statements/${account.id}`;
-                    // Statements usually take start_time/end_time or similar. 
-                    // Let's pass our date range and let the backend/API handle it.
-                    // Based on tiktok-shop-finance.routes.ts, it passes query params through.
-                    // TikTok API usually expects unix timestamp in seconds or milliseconds.
-                    // Let's try passing standard start_time/end_time in seconds.
-                    const start = Math.floor(parseUTCDate(dateRange.startDate).getTime() / 1000);
-                    const end = Math.floor(parseUTCDate(dateRange.endDate).getTime() / 1000) + 86400;
+                    const { start, end } = getRangeUnix();
                     params.append('start_time', start.toString());
                     params.append('end_time', end.toString());
                     break;
 
                 case 'payments':
                     url = `${API_BASE_URL}/api/tiktok-shop/finance/payments/${account.id}`;
-                    const pStart = Math.floor(parseUTCDate(dateRange.startDate).getTime() / 1000);
-                    const pEnd = Math.floor(parseUTCDate(dateRange.endDate).getTime() / 1000) + 86400;
+                    const { start: pStart, end: pEnd } = getRangeUnix();
                     params.append('create_time_ge', pStart.toString());
                     params.append('create_time_le', pEnd.toString());
                     break;
 
                 case 'withdrawals':
                     url = `${API_BASE_URL}/api/tiktok-shop/finance/withdrawals/${account.id}`;
-                    // Withdrawals might not support time filtering in the same way, but we'll try
+                    const { start: wStart, end: wEnd } = getRangeUnix();
+                    // Some shops/APIs may ignore these filters, but we pass range consistently.
+                    params.append('start_time', wStart.toString());
+                    params.append('end_time', wEnd.toString());
                     break;
 
                 case 'unsettled':
                     url = `${API_BASE_URL}/api/tiktok-shop/finance/unsettled/${account.id}`;
+                    const { start: uStart, end: uEnd } = getRangeUnix();
+                    params.append('order_create_time_ge', uStart.toString());
+                    params.append('order_create_time_le', uEnd.toString());
                     break;
 
                 case 'order_tx':
-                    if (!targetId) {
-                        throw new Error('Order ID is required');
+                case 'statement_tx': {
+                    const { start: sStart, end: sEnd } = getRangeUnix();
+                    const statementsUrl = `${API_BASE_URL}/api/tiktok-shop/finance/statements/${account.id}?shopId=${encodeURIComponent(shopId)}&page_size=${pageSize}&start_time=${sStart}&end_time=${sEnd}`;
+                    const statementsRes = await fetch(statementsUrl).then(r => r.json());
+                    if (!statementsRes.success) throw new Error(statementsRes.error || 'Failed to load statements');
+                    const statements = statementsRes.data?.statements || statementsRes.data?.statement_list || [];
+                    if (!Array.isArray(statements) || statements.length === 0) {
+                        setData({ mode: 'auto', statements: [], transactions: [], per_statement: [], reconciliation: null });
+                        return;
                     }
-                    url = `${API_BASE_URL}/api/tiktok-shop/finance/transactions/order/${account.id}/${targetId}`;
-                    break;
 
-                case 'statement_tx':
-                    if (!targetId) {
-                        throw new Error('Statement ID is required');
+                    const statementIds = statements
+                        .map((s: any) => s.id || s.statement_id)
+                        .filter(Boolean)
+                        .slice(0, pageSize);
+
+                    const perStatement: any[] = [];
+                    const allTransactions: any[] = [];
+                    for (const statementId of statementIds) {
+                        const txUrl = `${API_BASE_URL}/api/tiktok-shop/finance/transactions/${account.id}/${statementId}?shopId=${encodeURIComponent(shopId)}&page_size=100`;
+                        const txRes = await fetch(txUrl).then(r => r.json());
+                        if (!txRes.success) continue;
+                        const txRows = txRes.data?.transactions || txRes.data?.transaction_list || txRes.data?.statement_transactions || [];
+                        perStatement.push({ statement_id: statementId, transaction_count: txRows.length, raw_response: txRes.data });
+                        allTransactions.push(...txRows);
                     }
-                    url = `${API_BASE_URL}/api/tiktok-shop/finance/transactions/${account.id}/${targetId}`;
-                    break;
+
+                    if (activeTab === 'statement_tx') {
+                        setData({
+                            mode: 'auto',
+                            statements,
+                            statement_ids: statementIds,
+                            per_statement: perStatement,
+                            transactions: allTransactions,
+                            reconciliation: buildReconciliation(statements, allTransactions),
+                            timezone_used: timezone
+                        });
+                        return;
+                    }
+
+                    // order_tx mode: auto-discover order IDs from statement transactions, then fetch each order transaction payload.
+                    const orderIds = Array.from(new Set(allTransactions.map((tx: any) => tx.order_id).filter(Boolean))).slice(0, pageSize);
+                    const perOrder: any[] = [];
+                    const orderTransactions: any[] = [];
+                    for (const orderId of orderIds) {
+                        const orderUrl = `${API_BASE_URL}/api/tiktok-shop/finance/transactions/order/${account.id}/${orderId}?shopId=${encodeURIComponent(shopId)}&page_size=100`;
+                        const orderRes = await fetch(orderUrl).then(r => r.json());
+                        if (!orderRes.success) continue;
+                        const txRows = orderRes.data?.transactions || orderRes.data?.transaction_list || [];
+                        perOrder.push({ order_id: orderId, transaction_count: txRows.length, raw_response: orderRes.data });
+                        orderTransactions.push(...txRows);
+                    }
+
+                    setData({
+                        mode: 'auto',
+                        source_statement_ids: statementIds,
+                        order_ids: orderIds,
+                        per_order: perOrder,
+                        transactions: orderTransactions,
+                        timezone_used: timezone
+                    });
+                    return;
+                }
             }
 
             const response = await fetch(`${url}?${params.toString()}`);
@@ -199,6 +316,8 @@ export function FinanceDebugView({ account, shopId }: FinanceDebugViewProps) {
             rows = data.transaction_list;
         } else if (data.statement_transactions && Array.isArray(data.statement_transactions)) {
             rows = data.statement_transactions;
+        } else if (data.transactions && Array.isArray(data.transactions)) {
+            rows = data.transactions;
         } else {
             // Single object or unknown structure, fallback to JSON
             return (
@@ -299,6 +418,19 @@ export function FinanceDebugView({ account, shopId }: FinanceDebugViewProps) {
                 </div>
             </div>
 
+            {/* Master Date Range (shared by all tabs) */}
+            <div className="bg-gray-800 rounded-xl border border-gray-700 p-4">
+                <div className="flex items-center justify-between gap-4 flex-wrap">
+                    <div className="min-w-[320px]">
+                        <label className="block text-xs font-medium text-gray-400 mb-2 uppercase">Master Date Range</label>
+                        <DateRangePicker value={dateRange} onChange={setDateRange} timezone={timezone} />
+                    </div>
+                    <div className="text-xs text-gray-400">
+                        Applied to all tabs using timezone: <span className="text-gray-200">{timezone}</span>
+                    </div>
+                </div>
+            </div>
+
             {/* Tabs */}
             <div className="flex space-x-2 overflow-x-auto pb-2">
                 {tabs.map((tab) => {
@@ -334,25 +466,12 @@ export function FinanceDebugView({ account, shopId }: FinanceDebugViewProps) {
                 </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 items-end">
-                    {['statements', 'payments', 'withdrawals', 'unsettled'].includes(activeTab) && (
-                        <div className="col-span-2">
-                            <label className="block text-xs font-medium text-gray-400 mb-2 uppercase">Date Range</label>
-                            <DateRangePicker value={dateRange} onChange={setDateRange} />
-                        </div>
-                    )}
-
                     {['order_tx', 'statement_tx'].includes(activeTab) && (
                         <div className="col-span-2">
-                            <label className="block text-xs font-medium text-gray-400 mb-2 uppercase">
-                                {activeTab === 'order_tx' ? 'Order ID' : 'Statement ID'}
-                            </label>
-                            <input
-                                type="text"
-                                value={targetId}
-                                onChange={(e) => setTargetId(e.target.value)}
-                                placeholder={activeTab === 'order_tx' ? 'Enter Order ID...' : 'Enter Statement ID...'}
-                                className="w-full bg-gray-900 border border-gray-700 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-pink-500"
-                            />
+                            <label className="block text-xs font-medium text-gray-400 mb-2 uppercase">Auto Discovery</label>
+                            <div className="w-full bg-gray-900 border border-gray-700 rounded-lg px-4 py-2 text-gray-300 text-sm">
+                                IDs are auto-detected from statements/transactions filtered by selected date range + timezone.
+                            </div>
                         </div>
                     )}
 
@@ -405,10 +524,33 @@ export function FinanceDebugView({ account, shopId }: FinanceDebugViewProps) {
 
                 {data && (
                     <div className="space-y-4">
+                        {data.reconciliation && (
+                            <div className="bg-emerald-500/10 border border-emerald-500/30 rounded-lg p-4 text-emerald-200">
+                                <h4 className="font-semibold mb-2">Finance Reconciliation Report</h4>
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+                                    <div>
+                                        <p>Statement Count: {data.reconciliation.statement_totals.statement_count}</p>
+                                        <p>Statement Shipping: ${data.reconciliation.statement_totals.shipping_cost_amount_sum.toFixed(2)}</p>
+                                        <p>Statement Fees: ${data.reconciliation.statement_totals.fee_amount_sum.toFixed(2)}</p>
+                                    </div>
+                                    <div>
+                                        <p>Tx Shipping: ${data.reconciliation.transaction_totals.shipping_cost_amount_sum.toFixed(2)}</p>
+                                        <p>Tx Fee+Tax: ${data.reconciliation.transaction_totals.fee_tax_amount_sum.toFixed(2)}</p>
+                                        <p>Affiliate Bucket: ${data.reconciliation.buckets.affiliate_fee_sum.toFixed(2)}</p>
+                                    </div>
+                                </div>
+                                <div className="mt-3 text-xs text-emerald-100/80">
+                                    <p>Shipping Delta: ${data.reconciliation.deltas.shipping_delta.toFixed(2)}</p>
+                                    <p>Fee/Tax vs Statement Fee Delta: ${data.reconciliation.deltas.fee_tax_minus_statement_fee_delta.toFixed(2)}</p>
+                                    <p>Settlement Delta: ${data.reconciliation.deltas.settlement_delta.toFixed(2)}</p>
+                                    <p>Revenue Delta: ${data.reconciliation.deltas.revenue_delta.toFixed(2)}</p>
+                                </div>
+                            </div>
+                        )}
                         <div className="flex items-center justify-between">
                             <h3 className="text-white font-medium">Response Data</h3>
                             <span className="text-xs text-gray-500 bg-gray-800 px-2 py-1 rounded">
-                                {Array.isArray(data) ? `${data.length} items` : 'Object'}
+                                {Array.isArray(data) ? `${data.length} items` : (data?.transactions?.length ? `${data.transactions.length} transactions` : 'Object')}
                             </span>
                         </div>
 
