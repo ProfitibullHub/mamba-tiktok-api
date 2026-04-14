@@ -1,10 +1,12 @@
 import { useState } from 'react';
 import { useAuth } from '../../contexts/AuthContext';
+import { useTenantContext, primaryRoleBadgeClassName } from '../../contexts/TenantContext';
 import { supabase } from '../../lib/supabase';
 import { User, Key, ShieldCheck, AlertCircle, CheckCircle2, Eye, EyeOff } from 'lucide-react';
 
 export function ProfileView() {
     const { profile, user, signOut } = useAuth();
+    const { primaryRoleBadge } = useTenantContext();
     const [currentPassword, setCurrentPassword] = useState('');
     const [newPassword, setNewPassword] = useState('');
     const [confirmPassword, setConfirmPassword] = useState('');
@@ -86,8 +88,21 @@ export function ProfileView() {
                             </div>
                             <h3 className="text-xl font-bold text-white">{profile?.full_name}</h3>
                             <p className="text-gray-400 text-sm">{profile?.email}</p>
-                            <div className="mt-4 inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-pink-500/10 text-pink-400 border border-pink-500/20 uppercase tracking-wider">
-                                {profile?.role}
+                            <div className="mt-4 inline-flex flex-col items-center gap-1">
+                                <span
+                                    className={`inline-flex items-center px-3 py-1 rounded-full text-xs font-medium border uppercase tracking-wider ${
+                                        primaryRoleBadge
+                                            ? primaryRoleBadgeClassName(primaryRoleBadge.variant)
+                                            : profile?.role === 'admin'
+                                              ? 'bg-amber-500/20 text-amber-400 border-amber-500/30'
+                                              : 'bg-blue-500/20 text-blue-400 border-blue-500/30'
+                                    }`}
+                                >
+                                    {primaryRoleBadge?.label ?? profile?.role?.toUpperCase() ?? 'USER'}
+                                </span>
+                                {primaryRoleBadge && profile?.role && profile.role !== 'admin' && (
+                                    <span className="text-[10px] text-gray-500">Account type: {profile.role}</span>
+                                )}
                             </div>
                         </div>
                     </div>

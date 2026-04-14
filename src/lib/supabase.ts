@@ -25,6 +25,7 @@ export interface Account {
   avatar_url?: string;
   status: 'active' | 'inactive' | 'suspended';
   is_agency_view?: boolean;
+  tenant_id?: string;
   created_at: string;
   updated_at: string;
 }

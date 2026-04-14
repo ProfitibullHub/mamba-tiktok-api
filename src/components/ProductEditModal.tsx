@@ -5,8 +5,7 @@ import {
 } from 'lucide-react';
 import { Product, useShopStore } from '../store/useShopStore';
 import { RichTextEditor } from './RichTextEditor';
-
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001';
+import { apiFetch } from '../lib/apiClient';
 
 interface ProductEditModalProps {
     product: Product;
@@ -253,9 +252,8 @@ export function ProductEditModal({ product, accountId, onClose, onSave }: Produc
                 });
 
                 // Upload to TikTok via backend
-                const response = await fetch(`${API_BASE_URL}/api/tiktok-shop/images/upload`, {
+                const response = await apiFetch('/api/tiktok-shop/images/upload', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         accountId,
                         imageData: base64,
@@ -265,7 +263,7 @@ export function ProductEditModal({ product, accountId, onClose, onSave }: Produc
                 });
 
                 const data = await response.json();
-                if (!data.success) {
+                if (!response.ok || !data.success) {
                     throw new Error(data.error || 'Failed to upload image');
                 }
 
@@ -317,9 +315,8 @@ export function ProductEditModal({ product, accountId, onClose, onSave }: Produc
                 ...uploadedImages.map(img => ({ uri: img.uri }))
             ];
 
-            const response = await fetch(`${API_BASE_URL}/api/tiktok-shop/products/${product.product_id}/partial-edit`, {
+            const response = await apiFetch(`/api/tiktok-shop/products/${product.product_id}/partial-edit`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     accountId,
                     main_images: allImages
@@ -327,7 +324,7 @@ export function ProductEditModal({ product, accountId, onClose, onSave }: Produc
             });
 
             const data = await response.json();
-            if (!data.success) {
+            if (!response.ok || !data.success) {
                 throw new Error(data.error || 'Failed to update images');
             }
 

@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useState, ReactNode } from 'react';
 import { User } from '@supabase/supabase-js';
 import { supabase, Profile } from '../lib/supabase';
+import { queryClient } from '../queryClient';
 
 interface AuthContextType {
   user: User | null;
@@ -30,17 +31,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       const newUser = session?.user ?? null;
       setUser(current => {
+        // If the user identity has changed, clear ALL cached query data immediately
+        // so the incoming user never sees the outgoing user's shops/memberships/tenants.
+        if (current?.id !== newUser?.id) {
+          queryClient.clear();
+        }
         if (current?.id === newUser?.id && current?.email === newUser?.email) return current;
         return newUser;
       });
 
       if (newUser) {
-        // Only fetch profile if user changed or we don't have it
-        // We can rely on the user ID check above, but we need to trigger profile fetch
-        // Let's keep it simple: if we have a user, ensure we have a profile.
-        // But to avoid "reload on refocus", we should check if we already have the profile for this user.
-        // However, profile might have changed on server.
-        // Ideally we use React Query for profile.
         fetchProfile(newUser.id);
       } else {
         setProfile(null);
@@ -114,7 +114,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const signOut = async () => {
     try {
-      // Attempt to sign out from Supabase
       const { error } = await supabase.auth.signOut();
       if (error) {
         console.error('Error signing out from Supabase:', error);
@@ -122,12 +121,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     } catch (error) {
       console.error('Unexpected error during sign out:', error);
     } finally {
-      // Always clear local state, even if server request fails
+      // Clear the entire React Query cache so the next user starts fresh
+      queryClient.clear();
       setUser(null);
       setProfile(null);
       setLoading(false);
-      // Optional: Clear any other local storage items if needed
-      localStorage.removeItem('supabase.auth.token'); // Just in case, though client handles this
+      localStorage.removeItem('supabase.auth.token');
     }
   };
 

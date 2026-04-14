@@ -1,34 +1,42 @@
 
-import { TrendingUp, Star, RefreshCw, AlertCircle, Trash2, Calendar, Settings2, X, Plus, Zap } from 'lucide-react';
+import { TrendingUp, Star, RefreshCw, AlertCircle, Trash2, Calendar, Settings2, X, Plus, Zap, Bell, Mail, CheckCircle } from 'lucide-react';
 import { TimezoneSelector } from '../TimezoneSelector';
 import { AffiliateCommissionCard } from '../AffiliateCommissionCard';
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { Account } from '../../lib/supabase';
 import { supabase } from '../../lib/supabase';
+import { apiFetch } from '../../lib/apiClient';
 import { useAuth } from '../../contexts/AuthContext';
+import { useTenantContext } from '../../contexts/TenantContext';
 import { RefreshPrompt } from '../RefreshPrompt';
 import { useShopStore, Order } from '../../store/useShopStore';
 import { useTikTokAdsStore } from '../../store/useTikTokAdsStore';
 import { getPreviousPeriodRange } from '../../utils/dateUtils';
 import { calculateOrderGMV } from '../../utils/gmvCalculations';
 import { LOAD_DAY_OPTIONS, DEFAULT_LOAD_DAYS } from '../../config/dataRetention';
+import { useNotificationStore } from '../../store/useNotificationStore';
+import { useShopAccessFlags } from '../../hooks/useShopMutationAccess';
+import { isCancelledOrRefunded } from '../../utils/orderFinancials';
+import {
+  affiliateCogsFeeKeys,
+  tiktokEstCommissionFeeKeys,
+  tiktokEstCommissionLineLabels,
+  affiliateCogsLineLabels,
+  adSpendFeeKeys,
+  netByKeys,
+  expenseFromNet,
+  shippingTotalForOperatingExpenses,
+  mergeStatementFees,
+  mergeStatementShipping,
+  feesBaseFromStatements,
+} from '../../utils/plFeeAggregation';
 
 // Use paid_time for filtering (matches backend which loads by paid_time)
 const getOrderTs = (o: Order): number => Number(o.paid_time || o.created_time);
 
-// Helper function to detect cancelled or refunded orders
-const isCancelledOrRefunded = (order: Order): boolean => {
-  return (
-    order.order_status === 'CANCELLED' ||
-    !!order.cancel_reason ||
-    !!order.cancellation_initiator
-  );
-};
-
-
 import { DateRangePicker, DateRange } from '../DateRangePicker';
 import { TokenExpirationWarning } from '../TokenExpirationWarning';
-import { parseLocalDate, getShopDayStartTimestamp, formatShopDateISO } from '../../utils/dateUtils';
+import { parseLocalDate, getShopDayStartTimestamp, getShopDayEndExclusiveTimestamp, formatShopDateISO, formatShopTimeOnly } from '../../utils/dateUtils';
 import { ComparisonCharts } from '../ComparisonCharts';
 
 interface OverviewViewProps {
@@ -36,6 +44,7 @@ interface OverviewViewProps {
   shopId?: string;
   timezone?: string; // Shop timezone for date calculations
   onTimezoneChange?: (timezone: string) => void;
+  onTabChange?: (tab: string) => void;
 }
 
 const getDefaultDateRange = (timezone: string): DateRange => {
@@ -57,9 +66,26 @@ const DATE_PRESETS = [
   { id: 'lastMonth', label: 'Last Month' },
 ];
 
+/** Key Metrics trend pills: two decimal places (e.g. 5.16% not 5.2%). */
+function formatKeyMetricTrendPercent(pct: number): string {
+  return new Intl.NumberFormat('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(Math.abs(pct));
+}
 
-export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles', onTimezoneChange }: OverviewViewProps) {
+export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles', onTimezoneChange, onTabChange }: OverviewViewProps) {
+  const { user } = useAuth();
+  const { loading: tenantCtxLoading, isAccountManagerAssignedToSeller } = useTenantContext();
+  const canEmailDashboardExport =
+    !tenantCtxLoading &&
+    !!shopId &&
+    !!account.tenant_id &&
+    isAccountManagerAssignedToSeller(account.tenant_id);
+  const { canMutateShop, canSyncShop } = useShopAccessFlags(account);
+
   const metrics = useShopStore(state => state.metrics);
+  const unreadCount = useNotificationStore(state => state.unreadCount);
 
   const error = useShopStore(state => state.error);
   const fetchShopData = useShopStore(state => state.fetchShopData);
@@ -71,12 +97,10 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
   const products = useShopStore(state => state.products);
   const finance = useShopStore(state => state.finance);
   const dataVersion = useShopStore(state => state.dataVersion);
-
+  const plData = useShopStore(state => state.plData);
 
   // TikTok Ads store
 
-
-  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
 
   // Load default date preset from localStorage
   const [defaultDatePreset, setDefaultDatePreset] = useState<string>(() => {
@@ -106,10 +130,32 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
   const [isClearing, setIsClearing] = useState(false);
   const [loadDaysToast, setLoadDaysToast] = useState<{ days: number; visible: boolean } | null>(null);
 
+  const [emailModalOpen, setEmailModalOpen] = useState(false);
+  /** After send / schedule save we show a confirmation step instead of closing immediately. */
+  const [emailModalStep, setEmailModalStep] = useState<'form' | 'sent' | 'scheduleSaved'>('form');
+  const [emailSentTo, setEmailSentTo] = useState('');
+  const [emailWasDelivered, setEmailWasDelivered] = useState(true);
+  const [emailTo, setEmailTo] = useState('');
+  const [emailIncludeOrder, setEmailIncludeOrder] = useState(true);
+  const [emailIncludePl, setEmailIncludePl] = useState(true);
+  const [digestHourUtc, setDigestHourUtc] = useState(14);
+  const [emailBusy, setEmailBusy] = useState(false);
+  const [emailErr, setEmailErr] = useState<string | null>(null);
 
-  // Cancelled orders are ALWAYS included in totals and financials
-  const includeCancelledInTotal = true;
-  const includeCancelledFinancials = true;
+  const [liveClock, setLiveClock] = useState(() => new Date());
+  useEffect(() => {
+    const id = window.setInterval(() => setLiveClock(new Date()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  // Cancelled orders toggle mirror from P&L view
+  const includeCancelledInTotal = true; // Total Orders Raw/Count always includes cancelled natively
+  const [includeCancelledFinancials] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem(`mamba:view_settings:cancelled_financials:${shopId || 'default'}`);
+      return saved !== null ? saved === 'true' : true; // EXACT DEFAULT MATCH TO P&L
+    } catch { return true; }
+  });
 
   // Hybrid Timezone Logic (Default: true)
   // Toggle ON  → Applies 8-hour offset to previous period for America/Los_Angeles
@@ -153,14 +199,11 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
   // TikTok Ads (for ad spend)
   const { spendData: adsSpendData, fetchSpendData: fetchAdsSpend } = useTikTokAdsStore();
 
-  // Memoize API Base URL
-  const API_BASE_URL = useMemo(() => import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001', []);
-
   // Fetch token health status
   useEffect(() => {
     const fetchTokenHealth = async () => {
       try {
-        const response = await fetch(`${API_BASE_URL}/api/tiktok-shop/auth/status/${account.id}`);
+        const response = await apiFetch(`/api/tiktok-shop/auth/status/${account.id}`);
         const data = await response.json();
         if (data.success && data.tokenHealth) {
           setTokenHealth(data.tokenHealth);
@@ -173,7 +216,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
     if (account.id) {
       fetchTokenHealth();
     }
-  }, [account.id, API_BASE_URL]);
+  }, [account.id]);
 
   // Memoize the fetch function to prevent duplicate calls
   const handleDateRangeChange = useCallback((start: string, end: string) => {
@@ -181,12 +224,12 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       // Use includePreviousPeriod: true so the store handles fetching the historical data needed for trends
       // Pass initialLoadDays so the store uses the user's preferred default (matters for initial/no-date calls)
       console.log(`[OverviewView] Fetching ${start} to ${end} (with extended history for trends, defaultLoad=${defaultLoadDays}d)`);
-      fetchShopData(account.id, shopId, { skipSyncCheck: true, includePreviousPeriod: true, initialLoadDays: defaultLoadDays }, start, end);
+      fetchShopData(account.id, shopId, { skipSyncCheck: true, includePreviousPeriod: true, initialLoadDays: defaultLoadDays, timezone }, start, end);
       fetchAffiliateSettlements(account.id, shopId, start, end);
       fetchAgencyFees(account.id, shopId, start, end);
       fetchAdsSpend(account.id, start, end);
     }
-  }, [shopId, account.id, fetchShopData, fetchAffiliateSettlements, fetchAgencyFees, fetchAdsSpend, defaultLoadDays]);
+  }, [shopId, account.id, fetchShopData, fetchAffiliateSettlements, fetchAgencyFees, fetchAdsSpend, defaultLoadDays, timezone]);
 
   // Keep a ref to the latest handleDateRangeChange so the mount effect always
   // calls the current version without needing it in the dependency array.
@@ -240,9 +283,8 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
   // Handle reconnect - redirect to TikTok auth
   const handleReconnect = async () => {
     try {
-      const response = await fetch(`${API_BASE_URL}/api/tiktok-shop/auth/start`, {
+      const response = await apiFetch(`/api/tiktok-shop/auth/start`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ accountId: account.id })
       });
       const data = await response.json();
@@ -255,27 +297,19 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
   };
 
 
-  // Update lastUpdated when metrics change
-  useEffect(() => {
-    if (metrics.totalOrders > 0 || metrics.totalProducts > 0) {
-      setLastUpdated(new Date());
-    }
-  }, [metrics]);
-
-
   // Calculate metrics using P&L data (matching ProfitLossView exactly)
   const { calculatedMetrics, completedOrders, sampleOrderMetrics, cancelledRefundedMetrics, totalOrdersRaw, metricsData } = useMemo(() => {
 
-    // Use Shop Timezone for filtering
-    const start = getShopDayStartTimestamp(dateRange.startDate, timezone);
-    const end = getShopDayStartTimestamp(dateRange.endDate, timezone) + 86399;
+    // Use Shop Timezone for filtering — [shopPeriodStart, shopPeriodEndExclusive) matches server paid_time gte/lt.
+    const shopPeriodStart = getShopDayStartTimestamp(dateRange.startDate, timezone);
+    const shopPeriodEndExclusive = getShopDayEndExclusiveTimestamp(dateRange.endDate, timezone);
 
     // ── PAID_TIME POOL ─────────────────────────────────────────────────────────
     // All non-sample orders whose paid_time (or created_time fallback) falls in range.
     // This is the single source of truth for counts and financials.
     const allPaidTimeOrders = orders.filter(o => {
       const ts = getOrderTs(o);
-      return ts >= start && ts <= end && o.is_sample_order !== true;
+      return ts >= shopPeriodStart && ts < shopPeriodEndExclusive && o.is_sample_order !== true;
     });
 
     // Active orders = paid_time pool minus cancelled orders.
@@ -294,14 +328,14 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       if (!isCancelledOrRefunded(o)) return false;
       if (o.is_sample_order === true) return false;
       const ts = Number(o.update_time || o.paid_time || o.created_time);
-      return ts >= start && ts <= end;
+      return ts >= shopPeriodStart && ts < shopPeriodEndExclusive;
     });
 
     const cancelledRefundedOrderIds = new Set(cancelledRefundedOrders.map(o => o.order_id));
 
     // Calculate sample order metrics separately
     const sampleOrders = orders.filter(o =>
-      getOrderTs(o) >= start && getOrderTs(o) <= end && o.is_sample_order === true
+      getOrderTs(o) >= shopPeriodStart && getOrderTs(o) < shopPeriodEndExclusive && o.is_sample_order === true
     );
 
     // Create a Set of sample order IDs for efficient lookup
@@ -310,7 +344,12 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
 
     // --- Current Period Metrics ---
 
-    const currentGMV = ordersForFinancials.reduce((sum, o) => sum + calculateOrderGMV(o), 0);
+    const grossSalesGMV = ordersForFinancials.reduce((sum, o) => sum + calculateOrderGMV(o), 0);
+    const refundsInFinancialPool = ordersForFinancials
+      .filter(o => isCancelledOrRefunded(o))
+      .reduce((sum, o) => sum + calculateOrderGMV(o), 0);
+    const netRevenue = grossSalesGMV - refundsInFinancialPool;
+    const currentGMV = grossSalesGMV;
     const currentTotalOrders = ordersForCount.length;
     const currentItemsSold = ordersForCount.reduce((sum, o) => sum + (o.line_items?.reduce((total, item) => total + (item.quantity || 0), 0) || 0), 0);
     const getBuyerId = (o: Order): string =>
@@ -330,20 +369,25 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
 
     // --- Previous Period Logic (for trends) ---
 
-    // Calculate Previous Period using centralized helper (for Hybrid Timezone fix)
-    const { prevStart, prevEnd } = getPreviousPeriodRange(start, start + (Math.ceil((end - start) / 86400) * 86400), timezone, useHybridTimezone);
+    // Calculate Previous Period using shop calendar days (Hybrid Timezone optional for LA)
+    const { prevStart, prevEndExclusive } = getPreviousPeriodRange(
+      dateRange.startDate,
+      dateRange.endDate,
+      timezone,
+      useHybridTimezone
+    );
 
     // Previous period — paid_time pool (mirrors current period logic exactly)
     const prevAllPaidTimeOrders = orders.filter(o => {
       const ts = getOrderTs(o);
-      return ts >= prevStart && ts <= prevEnd && o.is_sample_order !== true;
+      return ts >= prevStart && ts < prevEndExclusive && o.is_sample_order !== true;
     });
     const prevActiveOrders = prevAllPaidTimeOrders.filter(o => !isCancelledOrRefunded(o));
 
     const prevOrdersForCount = includeCancelledInTotal ? prevAllPaidTimeOrders : prevActiveOrders;
     const prevOrdersForFinancials = includeCancelledFinancials ? prevAllPaidTimeOrders : prevActiveOrders;
 
-    const prevGMV = prevOrdersForFinancials.reduce((sum, o) => sum + calculateOrderGMV(o), 0);
+    const prevGrossSalesGMV = prevOrdersForFinancials.reduce((sum, o) => sum + calculateOrderGMV(o), 0);
     const prevTotalOrders = prevOrdersForCount.length;
     const prevItemsSold = prevOrdersForCount.reduce((sum, o) => sum + (o.line_items?.reduce((total, item) => total + (item.quantity || 0), 0) || 0), 0);
     const prevCustomers = groupDailyCustomers(prevOrdersForCount);
@@ -355,7 +399,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       return ((current - previous) / previous) * 100;
     };
 
-    const gmvChange = calculateChange(currentGMV, prevGMV);
+    const gmvChange = calculateChange(grossSalesGMV, prevGrossSalesGMV);
     const ordersChange = calculateChange(currentTotalOrders, prevTotalOrders);
     const itemsSoldChange = calculateChange(currentItemsSold, prevItemsSold);
     const customersChange = calculateChange(currentCustomers, prevCustomers);
@@ -366,7 +410,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
     const statements = finance.statements || [];
     const filteredStatements = statements.filter(s => {
       const ts = Number(s.statement_time || 0);
-      const isTimeMatch = ts >= start && ts <= end;
+      const isTimeMatch = ts >= shopPeriodStart && ts < shopPeriodEndExclusive;
 
       const isSampleStatement = s.order_id ? sampleOrderIds.has(s.order_id) : false;
       const isCancelledStatement = s.order_id ? cancelledRefundedOrderIds.has(s.order_id) : false;
@@ -376,10 +420,8 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       return isTimeMatch && !isSampleStatement;
     });
 
-    // Calculate GMV using formula: (Price × Items Sold) + Shipping Fees - Seller Discounts - Platform Discounts
-    const totalGMV = currentGMV;
-
-    // Total Revenue = GMV 
+    // Headline GMV matches Seller Center; net revenue nets cancelled/refund GMV when those orders sit in the financial pool
+    const totalGMV = grossSalesGMV;
     const totalRevenue = totalGMV;
     const orderTotalRevenue = totalGMV;
 
@@ -426,32 +468,104 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       });
     });
 
-    const totalFees = filteredStatements.reduce((sum, s) => {
-      const fees = s.transaction_summary?.fees || {};
-      const feeSum = Object.values(fees).reduce((acc, v) => acc + Math.abs(v), 0);
-      return sum + feeSum;
-    }, 0);
-
     const totalShipping = filteredStatements.reduce((sum, s) => {
       return sum + Math.abs(parseFloat(s.shipping_fee || '0'));
     }, 0);
 
-    // Manual affiliate retainers (not deducted by TikTok, so not in settlementAmount)
+    // Manual affiliate retainers
     const manualAffiliateRetainers = affiliateSettlements.reduce((sum, s) => sum + Number(s.amount), 0);
 
-    // Agency fees
-    const agencyFeesTotal = agencyFees.reduce((sum, s) => sum + Number(s.amount), 0);
-
-    // External ad spend (TikTok Ads API — separate from TikTok settlement fees)
     const adSpendTotal = adsSpendData?.totals.total_spend || 0;
 
-    // Net Profit = GMV minus every expense bucket
-    // Matches P&L's clientNetProfit formula exactly: GMV - COGS - Shipping - Fees - Ads - Agency
-    // Note: totalFees already includes auto-affiliate commissions and shop ads fees extracted from statements.
-    const netProfitFinal = currentGMV - totalCogs - totalProductShippingCost - totalFees - totalShipping - adSpendTotal - agencyFeesTotal - manualAffiliateRetainers;
+    let autoAffiliateCommission = 0;
+    let shopAdsFees = 0;
+    let feesBase = 0;
+    let shippingBaseForOpEx = 0;
 
-    // Gross Profit = Total Revenue - COGS
-    const grossProfit = totalRevenue - totalCogs;
+    if (plData && plData.statement_totals) {
+      feesBase =
+        plData.total_fee_tax != null
+          ? Math.abs(plData.total_fee_tax)
+          : Math.abs(plData.statement_totals.total_fees);
+      shippingBaseForOpEx = plData.shipping
+        ? shippingTotalForOperatingExpenses(plData.shipping)
+        : Math.abs(plData.statement_totals.total_shipping);
+      shopAdsFees = expenseFromNet(netByKeys(plData.fees, adSpendFeeKeys));
+      autoAffiliateCommission = expenseFromNet(netByKeys(plData.fees, affiliateCogsFeeKeys));
+    } else {
+      const aggFees = mergeStatementFees(filteredStatements);
+      const aggShip = mergeStatementShipping(filteredStatements);
+      shopAdsFees = expenseFromNet(netByKeys(aggFees, adSpendFeeKeys));
+      autoAffiliateCommission = expenseFromNet(netByKeys(aggFees, affiliateCogsFeeKeys));
+      feesBase = feesBaseFromStatements(filteredStatements);
+      shippingBaseForOpEx =
+        Object.keys(aggShip).length > 0
+          ? shippingTotalForOperatingExpenses(aggShip)
+          : totalShipping;
+    }
+
+    const totalAffiliateCost = autoAffiliateCommission + manualAffiliateRetainers;
+    const grossProfit = netRevenue - totalCogs - totalProductShippingCost - totalAffiliateCost;
+
+    const rangeStart = new Date(dateRange.startDate);
+    rangeStart.setHours(0, 0, 0, 0);
+    const rangeEnd = new Date(dateRange.endDate);
+    rangeEnd.setHours(23, 59, 59, 999);
+
+    const totalAgencyFees = agencyFees.reduce((sum, fee) => {
+      const feeType = fee.fee_type || 'retainer';
+      const recurrence = fee.recurrence || 'monthly';
+      const feeStart = new Date(fee.date);
+      feeStart.setHours(0, 0, 0, 0);
+
+      let retainerPart = 0;
+      let commissionPart = 0;
+
+      if (feeStart <= rangeEnd) {
+        const effectiveStart = feeStart > rangeStart ? feeStart : rangeStart;
+
+        if (feeType === 'retainer' || feeType === 'both') {
+          const amount = Number(fee.retainer_amount ?? fee.amount ?? 0);
+          let curr = new Date(effectiveStart);
+
+          while (curr <= rangeEnd) {
+            const y = curr.getFullYear();
+            const m = curr.getMonth();
+            const daysInMonth = new Date(y, m + 1, 0).getDate();
+
+            let dailyRate = 0;
+            if (recurrence === 'monthly') dailyRate = amount / daysInMonth;
+            else if (recurrence === 'quarterly') dailyRate = (amount / 3) / daysInMonth;
+            else if (recurrence === 'biannual') dailyRate = (amount / 6) / daysInMonth;
+            else if (recurrence === 'annual') dailyRate = (amount / 12) / daysInMonth;
+            else dailyRate = amount / daysInMonth;
+
+            retainerPart += dailyRate;
+            curr.setDate(curr.getDate() + 1);
+          }
+        }
+
+        if (feeType === 'commission' || feeType === 'both') {
+          const rate = Number(fee.commission_rate || 0) / 100;
+          const base = fee.commission_base || 'gmv';
+          const totalRangeDays = Math.max(1, Math.round((rangeEnd.getTime() - rangeStart.getTime()) / 86400000));
+          const activeDays = Math.max(0, Math.round((rangeEnd.getTime() - effectiveStart.getTime()) / 86400000) + 1);
+          const activeRatio = Math.min(1, activeDays / totalRangeDays);
+          const baseValue =
+            base === 'gross_profit'
+              ? grossProfit
+              : base === 'net_revenue'
+                ? netRevenue
+                : grossSalesGMV;
+          commissionPart = rate * baseValue * activeRatio;
+        }
+      }
+      return sum + retainerPart + commissionPart;
+    }, 0);
+
+    const realOperatingExpenses =
+      feesBase + shippingBaseForOpEx - shopAdsFees - autoAffiliateCommission + totalAgencyFees;
+    const netProfitFinal = grossProfit - (realOperatingExpenses + adSpendTotal);
 
     // Calculate Completed Orders
     const completedOrdersCount = activeOrders.filter(o => o.order_status === 'COMPLETED').length;
@@ -487,8 +601,8 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       // Performance: Calculate timestamps once, not for every order
       totalOrdersRaw: (() => {
         const rawStart = getShopDayStartTimestamp(dateRange.startDate, timezone);
-        const rawEnd = getShopDayStartTimestamp(dateRange.endDate, timezone) + 86400;
-        return orders.filter(o => getOrderTs(o) >= rawStart && getOrderTs(o) < rawEnd).length;
+        const rawEndExclusive = getShopDayEndExclusiveTimestamp(dateRange.endDate, timezone);
+        return orders.filter(o => getOrderTs(o) >= rawStart && getOrderTs(o) < rawEndExclusive).length;
       })(),
       metricsData: {
         gmv: currentGMV,
@@ -501,7 +615,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
         itemsSoldChange
       },
     };
-  }, [orders, finance.statements, dateRange, products, dataVersion, syncRenderKey, useHybridTimezone, affiliateSettlements, agencyFees, adsSpendData, timezone]);
+  }, [orders, finance.statements, dateRange, products, dataVersion, syncRenderKey, useHybridTimezone, affiliateSettlements, agencyFees, adsSpendData, timezone, includeCancelledFinancials, plData]);
 
 
   // Calculate Quick Stats
@@ -509,10 +623,10 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
     // Get today's date range using Shop Timezone (to match charts)
     const todayStr = formatShopDateISO(new Date(), timezone); // Get today's date in YYYY-MM-DD format
     const todayStart = getShopDayStartTimestamp(todayStr, timezone);
-    const todayEnd = todayStart + 86400;
+    const todayEndExclusive = getShopDayEndExclusiveTimestamp(todayStr, timezone);
 
     // Orders Today (excluding sample orders and cancelled/refunded orders)
-    const todaysOrders = orders.filter(o => getOrderTs(o) >= todayStart && getOrderTs(o) < todayEnd && o.is_sample_order !== true && !isCancelledOrRefunded(o));
+    const todaysOrders = orders.filter(o => getOrderTs(o) >= todayStart && getOrderTs(o) < todayEndExclusive && o.is_sample_order !== true && !isCancelledOrRefunded(o));
     const ordersToday = todaysOrders.length;
 
     // Revenue Today (sum of order totals, excluding sample and cancelled/refunded orders)
@@ -541,31 +655,29 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
     };
   }, [orders, products, dataVersion, syncRenderKey, timezone]);
 
-  // Re-fetch data when timezone changes to ensure server-side date filtering is correct
-  const prevTimezoneRef = useRef(timezone);
   useEffect(() => {
-    if (prevTimezoneRef.current !== timezone && shopId) {
-      prevTimezoneRef.current = timezone;
-      console.log(`[OverviewView] Timezone changed to ${timezone}, re-fetching data...`);
-      handleDateRangeChange(dateRange.startDate, dateRange.endDate);
+    if (emailModalOpen && user?.email) {
+      setEmailTo((prev) => (prev.trim() ? prev : user.email || ''));
     }
-  }, [timezone, shopId, dateRange.startDate, dateRange.endDate, handleDateRangeChange]);
+  }, [emailModalOpen, user?.email]);
 
+  // Timezone changes do not re-fetch orders: the same UTC order timestamps are re-bucketed
+  // client-side via getShopDayStartTimestamp / formatShopDateISO in memoized metrics.
 
   const handleSync = useCallback(async () => {
     if (!shopId) {
       console.error('Sync failed: No shopId provided');
       return;
     }
+    if (!canSyncShop) return;
     console.log('Starting sync for shop:', shopId);
     try {
       await syncData(account.id, shopId, 'all');
       console.log('Sync completed successfully');
-      setLastUpdated(new Date());
     } catch (err) {
       console.error('Sync failed with error:', err);
     }
-  }, [shopId, account.id, syncData]);
+  }, [shopId, account.id, syncData, canSyncShop]);
 
   const handleTodayClick = useCallback(() => {
     const today = new Date();
@@ -602,11 +714,11 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
   }, []);
 
   const handleClearShopData = async () => {
-    if (!shopId) return;
+    if (!shopId || !canMutateShop) return;
 
     setIsClearing(true);
     try {
-      const response = await fetch(`${API_BASE_URL}/api/tiktok-shop/shop-data/${account.id}/clear?shopId=${shopId}`, {
+      const response = await apiFetch(`/api/tiktok-shop/shop-data/${account.id}/clear?shopId=${shopId}`, {
         method: 'DELETE',
       });
 
@@ -643,6 +755,110 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
 
   const days = getDaysDifference();
   const dateRangeSubtitle = `within ${days} day${days !== 1 ? 's' : ''}`;
+
+  const handleSendDashboardEmail = useCallback(async () => {
+    if (!shopId) return;
+    if (!emailIncludeOrder && !emailIncludePl) {
+      setEmailErr('Choose at least one: order-based summary and/or P&L summary.');
+      return;
+    }
+    setEmailErr(null);
+    setEmailBusy(true);
+    try {
+      const reportTypes: ('order' | 'pl')[] = [];
+      if (emailIncludeOrder) reportTypes.push('order');
+      if (emailIncludePl) reportTypes.push('pl');
+
+      const plSummary =
+        emailIncludePl
+          ? {
+              gmv: metricsData.gmv,
+              totalOrders: metricsData.totalOrders,
+              totalRevenue: calculatedMetrics.totalRevenue,
+              netSales: calculatedMetrics.netSales,
+              grossProfit: calculatedMetrics.grossProfit,
+              netProfit: calculatedMetrics.netProfit,
+              adSpend: adsSpendData?.totals?.total_spend ?? 0,
+            }
+          : undefined;
+
+      const res = await apiFetch('/api/reports/email-dashboard', {
+        method: 'POST',
+        body: JSON.stringify({
+          accountId: account.id,
+          shopId,
+          startDate: dateRange.startDate,
+          endDate: dateRange.endDate,
+          to: emailTo.trim(),
+          timezone,
+          reportTypes,
+          ...(plSummary ? { plSummary } : {}),
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setEmailErr((data as { error?: string }).error || 'Failed to send email');
+        return;
+      }
+      const payload = data as { data?: { emailDelivered?: boolean } };
+      const delivered = payload.data?.emailDelivered !== false;
+      setEmailSentTo(emailTo.trim());
+      setEmailWasDelivered(delivered);
+      setEmailModalStep('sent');
+    } catch (e: unknown) {
+      setEmailErr(e instanceof Error ? e.message : 'Failed to send email');
+    } finally {
+      setEmailBusy(false);
+    }
+  }, [
+    shopId,
+    account.id,
+    dateRange.startDate,
+    dateRange.endDate,
+    emailTo,
+    timezone,
+    emailIncludeOrder,
+    emailIncludePl,
+    metricsData,
+    calculatedMetrics,
+    adsSpendData,
+  ]);
+
+  const handleCreateDigestSchedule = useCallback(async () => {
+    if (!shopId) return;
+    setEmailErr(null);
+    setEmailBusy(true);
+    try {
+      const res = await apiFetch('/api/reports/schedules', {
+        method: 'POST',
+        body: JSON.stringify({
+          accountId: account.id,
+          shopId,
+          recipientEmail: emailTo.trim(),
+          timezone,
+          hourUtc: digestHourUtc,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setEmailErr((data as { error?: string }).error || 'Failed to save schedule');
+        return;
+      }
+      setEmailSentTo(emailTo.trim());
+      setEmailModalStep('scheduleSaved');
+    } catch (e: unknown) {
+      setEmailErr(e instanceof Error ? e.message : 'Failed to save schedule');
+    } finally {
+      setEmailBusy(false);
+    }
+  }, [shopId, account.id, emailTo, timezone, digestHourUtc]);
+
+  const closeEmailModal = useCallback(() => {
+    if (emailBusy) return;
+    setEmailModalOpen(false);
+    setEmailModalStep('form');
+    setEmailErr(null);
+  }, [emailBusy]);
 
   // ═══════════════════ CUSTOMIZABLE METRIC CARDS ═══════════════════
 
@@ -762,23 +978,56 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
     },
   ], [metricsData, calculatedMetrics, completedOrders, cancelledRefundedMetrics, sampleOrderMetrics, totalOrdersRaw, dateRangeSubtitle]);
 
-  // Calculate Auto Commissions from already-loaded settlement statements
-  // Each statement has a transaction_summary with fee breakdowns including affiliate_commission
-  // Uses shop timezone boundaries to match P&L endpoint filtering
-  const autoAffiliateCommission = useMemo(() => {
-    const start = getShopDayStartTimestamp(dateRange.startDate, timezone);
-    const end = getShopDayStartTimestamp(dateRange.endDate, timezone) + 86400;
+  // Same auto-affiliate total as Profit & Loss, with per-line breakdown for the card
+  const autoAffiliateCommissionDetail = useMemo(() => {
+    const stmtRangeStart = getShopDayStartTimestamp(dateRange.startDate, timezone);
+    const stmtRangeEndExclusive = getShopDayEndExclusiveTimestamp(dateRange.endDate, timezone);
 
-    return Math.abs(
-      finance.statements
-        .filter(s => s.statement_time >= start && s.statement_time < end)
-        .reduce((sum, s) => sum + (s.transaction_summary?.fees?.affiliate_commission || 0), 0)
-    );
-  }, [finance.statements, dateRange, timezone]);
+    let fees: Record<string, number> = {};
+    if (plData?.fees) {
+      fees = plData.fees;
+    } else {
+      const inRange = (finance.statements || []).filter(
+        s => s.statement_time >= stmtRangeStart && s.statement_time < stmtRangeEndExclusive
+      );
+      fees = mergeStatementFees(inRange);
+    }
+
+    // Card front "Est. commission (TikTok)" = three Seller Center paths; lines also show affiliate ads + external COGS.
+    const tiktokLines = tiktokEstCommissionFeeKeys.map((key) => ({
+      key,
+      label: tiktokEstCommissionLineLabels[key],
+      value: Number(fees[key] ?? 0),
+    }));
+    const affiliateAdsVal = Number(fees.affiliate_ads_commission ?? 0);
+    const extVal = Number(fees.external_affiliate_marketing_fee ?? 0);
+    const extraLines: { key: string; label: string; value: number }[] = [];
+    if (Math.abs(affiliateAdsVal) >= 0.01) {
+      extraLines.push({
+        key: 'affiliate_ads_commission',
+        label: affiliateCogsLineLabels.affiliate_ads_commission,
+        value: affiliateAdsVal,
+      });
+    }
+    if (extVal !== 0) {
+      extraLines.push({
+        key: 'external_affiliate_marketing_fee',
+        label: `${affiliateCogsLineLabels.external_affiliate_marketing_fee} (not in Est. commission)`,
+        value: extVal,
+      });
+    }
+    const lines = [...tiktokLines, ...extraLines];
+
+    const netSigned = netByKeys(fees, [...tiktokEstCommissionFeeKeys, 'affiliate_ads_commission']);
+    const total = expenseFromNet(netByKeys(fees, tiktokEstCommissionFeeKeys));
+    const externalAbs = expenseFromNet(Number(fees.external_affiliate_marketing_fee ?? 0));
+    const affiliateAdsAbs = expenseFromNet(affiliateAdsVal);
+    const autoOtherAffiliateCogsCombined = externalAbs + affiliateAdsAbs;
+    return { total, lines, netSigned, externalAbs, affiliateAdsAbs, autoOtherAffiliateCogsCombined };
+  }, [finance.statements, dateRange, timezone, plData]);
 
   const DEFAULT_METRICS = ['gmv', 'netProfit', 'totalOrders', 'totalCustomers', 'itemsSold'];
 
-  const { user } = useAuth();
   const storageKey = `mamba:dashboard:${shopId || 'default'}`;
 
   // Load from localStorage first (instant), then overwrite from Supabase
@@ -1150,7 +1399,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
   return (
     <div className="space-y-6">
       {/* Refresh Prompt */}
-      {cacheMetadata.showRefreshPrompt && (
+      {cacheMetadata.showRefreshPrompt && canSyncShop && (
         <RefreshPrompt
           onRefresh={() => syncData(account.id, shopId!, 'all')}
           onDismiss={dismissRefreshPrompt}
@@ -1185,99 +1434,302 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
           </button>
         </div>
       )}
-      {/* Account Header */}
-      <div className="bg-gradient-to-r from-pink-500/10 to-red-500/10 border border-pink-500/30 rounded-xl p-6">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-4">
+      {/* Account Header — single toolbar row; scrolls horizontally on narrow viewports */}
+      <div className="bg-gradient-to-r from-pink-500/10 to-red-500/10 border border-pink-500/30 rounded-xl px-4 py-3 sm:px-5 sm:py-3.5">
+        <div className="flex flex-row items-center justify-between gap-3 min-w-0">
+          <div className="flex items-center gap-3 min-w-0 shrink-0 pr-2">
             {account.avatar_url ? (
-              <img src={account.avatar_url} alt={account.name} className="w-16 h-16 rounded-full" />
+              <img src={account.avatar_url} alt={account.name} className="w-11 h-11 sm:w-12 sm:h-12 rounded-full shrink-0" />
             ) : (
-              <div className="w-16 h-16 rounded-full bg-gradient-to-r from-pink-500 to-red-500 flex items-center justify-center text-white text-2xl font-bold">
+              <div className="w-11 h-11 sm:w-12 sm:h-12 rounded-full bg-gradient-to-r from-pink-500 to-red-500 flex items-center justify-center text-white text-lg font-bold shrink-0">
                 {account.name.charAt(0)}
               </div>
             )}
-            <div>
-              <h2 className="text-2xl font-bold text-white">{account.name}</h2>
-              <div className="flex items-center gap-2">
-                <p className="text-sm font-medium text-white truncate">
+            <div className="min-w-0">
+              <h2 className="text-base sm:text-lg font-bold text-white truncate leading-tight">{account.name}</h2>
+              <div className="flex items-center gap-1.5 mt-0.5 min-w-0">
+                <p className="text-xs text-gray-400 truncate">
                   {(account as any).tiktok_handle || account.tiktok_handle || 'TikTok Shop'}
                 </p>
                 {(account as any).owner_role && (
-                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-pink-500/20 text-pink-400 border border-pink-500/30">
+                  <span className="px-1.5 py-0.5 rounded-full text-[9px] font-bold uppercase tracking-wider bg-pink-500/20 text-pink-400 border border-pink-500/30 shrink-0 hidden sm:inline">
                     {(account as any).owner_role.toUpperCase()}
                   </span>
                 )}
                 {metrics.shopRating > 0 && (
-                  <div className="flex items-center gap-1 bg-yellow-500/10 px-2 py-0.5 rounded-full border border-yellow-500/20">
-                    <Star className="w-3 h-3 text-yellow-400 fill-yellow-400" />
-                    <span className="text-xs text-yellow-200">{metrics.shopRating.toFixed(1)}</span>
+                  <div className="flex items-center gap-0.5 bg-yellow-500/10 px-1.5 py-0.5 rounded-full border border-yellow-500/20 shrink-0">
+                    <Star className="w-2.5 h-2.5 text-yellow-400 fill-yellow-400" />
+                    <span className="text-[10px] text-yellow-200">{metrics.shopRating.toFixed(1)}</span>
                   </div>
                 )}
               </div>
             </div>
           </div>
 
-          <div className="flex flex-col items-end gap-2">
-            <div className="flex items-center gap-2">
+          <div className="flex min-w-0 flex-1 items-center justify-end gap-1.5 sm:gap-2 overflow-x-auto overflow-y-hidden py-0.5 [-webkit-overflow-scrolling:touch]">
+            <div className="inline-flex h-9 shrink-0 items-stretch rounded-lg border border-white/10 bg-black/30 p-0.5 gap-0.5">
               <button
+                type="button"
                 onClick={handleTodayClick}
-                className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all border ${isTodayActive()
-                  ? 'bg-pink-600 hover:bg-pink-700 text-white border-pink-500 shadow-lg shadow-pink-900/20'
-                  : 'bg-gray-800 border-gray-700 text-gray-300 hover:bg-gray-700 hover:text-white hover:border-gray-600'
+                className={`flex items-center gap-1 px-2 sm:px-2.5 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${isTodayActive()
+                  ? 'bg-pink-600 text-white'
+                  : 'text-gray-400 hover:text-white hover:bg-white/5'
                   }`}
               >
-                <Calendar className={`w-4 h-4 ${isTodayActive() ? 'text-white' : 'text-gray-400'}`} />
+                <Calendar className="w-3.5 h-3.5 shrink-0" />
                 Today
               </button>
               <button
+                type="button"
                 onClick={handleYesterdayClick}
-                className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all border ${isYesterdayActive()
-                  ? 'bg-pink-600 hover:bg-pink-700 text-white border-pink-500 shadow-lg shadow-pink-900/20'
-                  : 'bg-gray-800 border-gray-700 text-gray-300 hover:bg-gray-700 hover:text-white hover:border-gray-600'
+                className={`flex items-center gap-1 px-2 sm:px-2.5 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${isYesterdayActive()
+                  ? 'bg-pink-600 text-white'
+                  : 'text-gray-400 hover:text-white hover:bg-white/5'
                   }`}
               >
-                <Calendar className={`w-4 h-4 ${isYesterdayActive() ? 'text-white' : 'text-gray-400'}`} />
+                <Calendar className="w-3.5 h-3.5 shrink-0" />
                 Yesterday
               </button>
-              <DateRangePicker
-                value={dateRange}
-                onChange={(range) => {
-                  setDateRange(range);
-                  handleDateRangeChange(range.startDate, range.endDate);
-                }}
-              />
-              <button
-                onClick={handleSync}
-                disabled={cacheMetadata.isSyncing}
-                className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${cacheMetadata.isSyncing
-                  ? 'bg-gray-700 text-gray-400 cursor-not-allowed items-center space-x-2 px-4 py-2'
-                  : 'flex items-center space-x-2 px-4 py-2 bg-pink-600 hover:bg-pink-700 text-white rounded-lg transition-colors disabled:opacity-50'
-                  } `}
-              >
-                <RefreshCw className={`w-4 h-4 mr-2 ${cacheMetadata.isSyncing ? 'animate-spin' : ''} `} />
-                {cacheMetadata.isSyncing ? 'Syncing...' : 'Sync Now'}
-              </button>
-
-              {shopId && onTimezoneChange && (
-                <TimezoneSelector
-                  shopId={shopId}
-                  accountId={account.id}
-                  currentTimezone={timezone}
-                  onTimezoneChange={onTimezoneChange}
-                />
-              )}
-
             </div>
-            {lastUpdated && (
-              <p className="text-xs text-gray-500">
-                Updated: {lastUpdated.toLocaleTimeString()}
-              </p>
+
+            <DateRangePicker
+              compact
+              timezone={timezone}
+              value={dateRange}
+              onChange={(range) => {
+                setDateRange(range);
+                handleDateRangeChange(range.startDate, range.endDate);
+              }}
+            />
+
+            <button
+              type="button"
+              onClick={handleSync}
+              disabled={!canSyncShop || cacheMetadata.isSyncing}
+              title={!canSyncShop ? 'You do not have access to sync this shop' : undefined}
+              className={`inline-flex shrink-0 items-center justify-center gap-1.5 h-9 px-3 sm:px-3.5 rounded-lg text-xs sm:text-sm font-semibold transition-colors ${cacheMetadata.isSyncing
+                ? 'bg-gray-700 text-gray-400 cursor-not-allowed'
+                : 'bg-pink-600 hover:bg-pink-500 text-white disabled:opacity-50'
+                }`}
+            >
+              <RefreshCw className={`w-3.5 h-3.5 sm:w-4 sm:h-4 ${cacheMetadata.isSyncing ? 'animate-spin' : ''}`} />
+              <span className="hidden min-[380px]:inline">{cacheMetadata.isSyncing ? 'Syncing…' : 'Sync'}</span>
+            </button>
+
+            {canEmailDashboardExport && (
+              <button
+                type="button"
+                onClick={() => {
+                  setEmailErr(null);
+                  setEmailModalStep('form');
+                  setEmailModalOpen(true);
+                }}
+                className="inline-flex shrink-0 items-center justify-center gap-1.5 h-9 px-2.5 sm:px-3 rounded-lg text-xs sm:text-sm font-medium border border-white/10 bg-gray-900/70 text-gray-200 hover:bg-gray-800 hover:text-white transition-colors whitespace-nowrap"
+                title="Email dashboard summary (Account Managers assigned to this seller)"
+              >
+                <Mail className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+                <span className="hidden md:inline">Email</span>
+              </button>
             )}
+
+            <button
+              type="button"
+              onClick={() => onTabChange && onTabChange('notifications')}
+              className="relative inline-flex shrink-0 items-center justify-center h-9 w-9 rounded-lg border border-white/10 bg-gray-900/70 hover:bg-gray-800 transition-colors"
+              title="Notifications"
+            >
+              <Bell className="w-4 h-4 text-gray-400" />
+              {unreadCount > 0 && (
+                <span className="absolute -top-1 -right-1 min-w-[1.125rem] h-4 px-1 flex items-center justify-center rounded-full bg-pink-500 text-[9px] font-bold text-white border-2 border-gray-950 leading-none">
+                  {unreadCount > 99 ? '99+' : unreadCount}
+                </span>
+              )}
+            </button>
+
+            {shopId && onTimezoneChange && (
+              <TimezoneSelector
+                compact
+                shopId={shopId}
+                accountId={account.id}
+                currentTimezone={timezone}
+                onTimezoneChange={onTimezoneChange}
+                readOnly={!canMutateShop}
+              />
+            )}
+
+            <span
+              className="hidden lg:inline shrink-0 text-[10px] text-gray-500 whitespace-nowrap pl-2 ml-0.5 border-l border-white/10 tabular-nums"
+              title={`Current time in ${timezone}`}
+            >
+              {formatShopTimeOnly(liveClock, timezone)}
+            </span>
           </div>
         </div>
       </div>
 
+      {emailModalOpen && canEmailDashboardExport && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+          <button
+            type="button"
+            className="absolute inset-0 bg-black/70 backdrop-blur-sm"
+            aria-label="Close"
+            onClick={closeEmailModal}
+          />
+          <div className="relative w-full max-w-md rounded-2xl border border-white/10 bg-gray-950 p-6 shadow-2xl">
+            <div className="flex items-start justify-between gap-3 mb-4">
+              <h3 className="text-lg font-bold text-white">
+                {emailModalStep === 'form' && 'Email report'}
+                {emailModalStep === 'sent' && (emailWasDelivered ? 'Report sent' : 'Email not delivered')}
+                {emailModalStep === 'scheduleSaved' && 'Digest saved'}
+              </h3>
+              <button
+                type="button"
+                disabled={emailBusy}
+                onClick={closeEmailModal}
+                className="p-1 rounded-lg text-gray-400 hover:text-white hover:bg-white/10"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
 
+            {emailModalStep === 'sent' && (
+              <div className="py-2">
+                <CheckCircle
+                  className={`w-14 h-14 mx-auto mb-4 ${emailWasDelivered ? 'text-emerald-400' : 'text-amber-400'}`}
+                  aria-hidden
+                />
+                {emailWasDelivered ? (
+                  <p className="text-sm text-gray-300 text-center leading-relaxed">
+                    We sent the dashboard report to{' '}
+                    <span className="text-white font-medium">{emailSentTo}</span>. Check your inbox (and spam).
+                  </p>
+                ) : (
+                  <p className="text-sm text-amber-200/90 text-center leading-relaxed">
+                    The app accepted your request, but the server did not send email:{' '}
+                    <code className="text-[11px] text-pink-300/90">RESEND_API_KEY</code> is not set (or mail failed). Add it in your API
+                    environment and redeploy; until then, reports are not emailed.
+                  </p>
+                )}
+                <button
+                  type="button"
+                  onClick={closeEmailModal}
+                  className="w-full mt-6 py-2.5 rounded-xl bg-pink-600 hover:bg-pink-500 text-white text-sm font-semibold"
+                >
+                  Done
+                </button>
+              </div>
+            )}
+
+            {emailModalStep === 'scheduleSaved' && (
+              <div className="py-2">
+                <CheckCircle className="w-14 h-14 mx-auto mb-4 text-emerald-400" aria-hidden />
+                <p className="text-sm text-gray-300 text-center leading-relaxed">
+                  Daily digest is enabled for{' '}
+                  <span className="text-white font-medium">{emailSentTo}</span> (UTC hour {digestHourUtc}). The server cron must be configured
+                  to actually send.
+                </p>
+                <button
+                  type="button"
+                  onClick={closeEmailModal}
+                  className="w-full mt-6 py-2.5 rounded-xl bg-pink-600 hover:bg-pink-500 text-white text-sm font-semibold"
+                >
+                  Done
+                </button>
+              </div>
+            )}
+
+            {emailModalStep === 'form' && (
+              <>
+                <p className="text-sm text-gray-400 mb-4 leading-relaxed">
+                  Period: <span className="text-gray-200">{dateRange.startDate}</span> →{' '}
+                  <span className="text-gray-200">{dateRange.endDate}</span>
+                  <span className="text-gray-500"> ({timezone})</span>.
+                </p>
+
+                <p className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-2">Include in email</p>
+                <div className="rounded-xl border border-white/10 bg-black/30 divide-y divide-white/10 mb-4">
+                  <label className="flex items-center gap-3 px-3 py-3 cursor-pointer hover:bg-white/[0.04]">
+                    <input
+                      type="checkbox"
+                      checked={emailIncludeOrder}
+                      onChange={(e) => setEmailIncludeOrder(e.target.checked)}
+                      disabled={emailBusy}
+                      className="rounded border-gray-600 text-pink-600 focus:ring-pink-500/40"
+                    />
+                    <div>
+                      <div className="text-sm font-medium text-white">Order-based summary</div>
+                      <div className="text-xs text-gray-500">Paid orders &amp; GMV from synced orders (server-calculated)</div>
+                    </div>
+                  </label>
+                  <label className="flex items-center gap-3 px-3 py-3 cursor-pointer hover:bg-white/[0.04]">
+                    <input
+                      type="checkbox"
+                      checked={emailIncludePl}
+                      onChange={(e) => setEmailIncludePl(e.target.checked)}
+                      disabled={emailBusy}
+                      className="rounded border-gray-600 text-pink-600 focus:ring-pink-500/40"
+                    />
+                    <div>
+                      <div className="text-sm font-medium text-white">P&amp;L-style summary</div>
+                      <div className="text-xs text-gray-500">GMV, revenue, net sales, gross/net profit, ad spend — matches this dashboard view</div>
+                    </div>
+                  </label>
+                </div>
+
+                <label className="block text-xs font-medium text-gray-500 uppercase tracking-wide mb-1">Recipient email</label>
+                <input
+                  type="email"
+                  value={emailTo}
+                  onChange={(e) => setEmailTo(e.target.value)}
+                  className="w-full rounded-xl bg-black/40 border border-white/10 px-3 py-2.5 text-sm text-white mb-4 focus:ring-2 focus:ring-pink-500/40 focus:border-pink-500/40 outline-none"
+                  placeholder="you@company.com"
+                  disabled={emailBusy}
+                />
+                {emailErr && <p className="text-sm text-red-400 mb-3">{emailErr}</p>}
+                <div className="flex flex-col gap-2">
+                  <button
+                    type="button"
+                    disabled={emailBusy || !emailTo.trim() || (!emailIncludeOrder && !emailIncludePl)}
+                    onClick={() => void handleSendDashboardEmail()}
+                    className="w-full py-2.5 rounded-xl bg-pink-600 hover:bg-pink-500 text-white text-sm font-semibold disabled:opacity-40"
+                  >
+                    {emailBusy ? 'Sending…' : 'Send email'}
+                  </button>
+                  <div className="border-t border-white/10 pt-4 mt-1">
+                    <p className="text-xs text-gray-500 mb-2">Daily automated digest (previous shop day)</p>
+                    <label className="block text-xs font-medium text-gray-500 uppercase tracking-wide mb-1">
+                      Send at (UTC hour 0–23)
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      max={23}
+                      value={digestHourUtc}
+                      onChange={(e) => setDigestHourUtc(Math.min(23, Math.max(0, parseInt(e.target.value, 10) || 0)))}
+                      className="w-full rounded-xl bg-black/40 border border-white/10 px-3 py-2 text-sm text-white mb-3 outline-none"
+                      disabled={emailBusy}
+                    />
+                    <button
+                      type="button"
+                      disabled={emailBusy || !emailTo.trim()}
+                      onClick={() => void handleCreateDigestSchedule()}
+                      className="w-full py-2.5 rounded-xl bg-gray-800 border border-gray-600 hover:bg-gray-700 text-gray-100 text-sm font-medium disabled:opacity-40"
+                    >
+                      Enable daily digest
+                    </button>
+                    <p className="text-[11px] text-gray-600 mt-2">
+                      Vercel <strong className="text-gray-500">Hobby</strong> only allows <strong className="text-gray-500">once-per-day</strong>{' '}
+                      crons — digests run on that schedule (see <code className="text-gray-500">server/vercel.json</code>). Set{' '}
+                      <code className="text-gray-500">CRON_SECRET</code> in the project. The UTC hour field is optional metadata unless you use an
+                      external scheduler or Vercel Pro with a more frequent cron.
+                    </p>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* iOS Wiggle Animation */}
       <style>{`
@@ -1502,7 +1954,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
                                 : 'bg-red-500/10 text-red-400'
                                 }`}>
                                 <TrendingUp className={`w-3 h-3 ${metric.trendChange! < 0 ? 'rotate-180' : ''}`} />
-                                {Math.abs(metric.trendChange!).toFixed(1)}%
+                                {formatKeyMetricTrendPercent(metric.trendChange!)}%
                               </div>
                             )}
                           </div>
@@ -1554,7 +2006,10 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
         {/* Affiliate Commission Card (Placed here as requested: 3rd section, before Quick Stats) */}
         <div className="w-full">
           <AffiliateCommissionCard
-            autoCommission={autoAffiliateCommission}
+            autoCommission={autoAffiliateCommissionDetail.total}
+            autoOtherAffiliateCogs={autoAffiliateCommissionDetail.autoOtherAffiliateCogsCombined}
+            autoCommissionLines={autoAffiliateCommissionDetail.lines}
+            autoCommissionNetSigned={autoAffiliateCommissionDetail.netSigned}
             manualRetainers={affiliateSettlements}
             dateRangeLabel={dateRangeSubtitle}
           />
@@ -1608,24 +2063,26 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       </div>
 
       {/* Danger Zone */}
-      <div className="bg-red-900/10 border border-red-500/30 rounded-xl p-6">
-        <h3 className="text-lg font-semibold text-red-400 mb-2">Danger Zone</h3>
-        <p className="text-gray-400 text-sm mb-4">
-          Clear all shop data and start fresh. This will delete all orders, products, and financial data from the database.
-        </p>
-        <button
-          onClick={() => setShowClearDataConfirm(true)}
-          disabled={isClearing}
-          className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          <Trash2 className="w-4 h-4" />
-          {isClearing ? 'Clearing...' : 'Clear All Shop Data'}
-        </button>
-      </div>
+      {canMutateShop && (
+        <div className="bg-red-900/10 border border-red-500/30 rounded-xl p-6">
+          <h3 className="text-lg font-semibold text-red-400 mb-2">Danger Zone</h3>
+          <p className="text-gray-400 text-sm mb-4">
+            Clear all shop data and start fresh. This will delete all orders, products, and financial data from the database.
+          </p>
+          <button
+            onClick={() => setShowClearDataConfirm(true)}
+            disabled={isClearing}
+            className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <Trash2 className="w-4 h-4" />
+            {isClearing ? 'Clearing...' : 'Clear All Shop Data'}
+          </button>
+        </div>
+      )}
 
       {/* Confirmation Dialog */}
       {
-        showClearDataConfirm && (
+        canMutateShop && showClearDataConfirm && (
           <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
             <div className="bg-gray-800 border border-red-500/30 rounded-2xl p-8 max-w-md w-full">
               <div className="flex items-center gap-3 mb-4">
@@ -1681,19 +2138,18 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       {/* Load Days Toast */}
       {loadDaysToast && (
         <div
-          className={`fixed bottom-6 right-6 z-50 flex items-center gap-3 rounded-xl bg-gray-900 px-4 py-3 shadow-xl border border-gray-700 transition-all duration-300 ${
-            loadDaysToast.visible ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-2 pointer-events-none'
-          }`}
+          className={`fixed bottom-6 right-6 z-50 flex items-center gap-3 rounded-xl bg-gray-900 px-4 py-3 shadow-xl border border-gray-700 transition-all duration-300 ${loadDaysToast.visible ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-2 pointer-events-none'
+            }`}
         >
           <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-amber-500/20">
             <Zap className="h-4 w-4 text-amber-400" />
           </div>
           <div className="flex flex-col">
             <span className="text-sm font-semibold text-white">
-              {loadDaysToast.days} days set as your default load
+              {loadDaysToast.days === 1 ? '1 day' : `${loadDaysToast.days} days`} set as your default load
             </span>
             <span className="text-xs text-gray-400">
-              On your next reload, {loadDaysToast.days} days of data will be loaded initially
+              On your next reload, {loadDaysToast.days === 1 ? '1 day' : `${loadDaysToast.days} days`} of data will be loaded initially
             </span>
           </div>
         </div>

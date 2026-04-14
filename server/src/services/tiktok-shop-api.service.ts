@@ -1,11 +1,7 @@
 import crypto from 'crypto';
 import axios from 'axios';
 import dotenv from 'dotenv';
-
-// Load environment variables FIRST
 dotenv.config();
-
-
 interface TikTokShopConfig {
     appKey: string;
     appSecret: string;
@@ -13,7 +9,6 @@ interface TikTokShopConfig {
     authBase: string;
     serviceId?: string;
 }
-
 interface TokenResponse {
     access_token: string;
     access_token_expire_in: number;
@@ -22,15 +17,13 @@ interface TokenResponse {
     open_id: string;
     seller_name: string;
     seller_base_region: string;
-    seller_id?: string; // Partner ID in Partner flow
-    [key: string]: any; // Allow other fields
+    seller_id?: string;
+    [key: string]: any;
 }
-
 export class TikTokShopError extends Error {
     code: number;
     requestId?: string;
     detail?: string;
-
     constructor(message: string, code: number, requestId?: string, detail?: string) {
         super(message);
         this.name = 'TikTokShopError';
@@ -39,99 +32,67 @@ export class TikTokShopError extends Error {
         this.detail = detail;
     }
 }
-
 export class TikTokShopApiService {
     private config: TikTokShopConfig;
-
     constructor() {
         this.config = {
             appKey: process.env.TIKTOK_SHOP_APP_KEY || '',
-            // TRIM whitespace to prevent signature errors from copy-pasting .env values
             appSecret: (process.env.TIKTOK_SHOP_APP_SECRET || '').trim(),
             apiBase: process.env.TIKTOK_SHOP_API_BASE || 'https://open-api.tiktokglobalshop.com',
             authBase: process.env.TIKTOK_AUTH_BASE || 'https://auth.tiktok-shops.com',
             serviceId: process.env.TIKTOK_SHOP_SERVICE_ID,
         };
-
-        // Debug logging
         console.log('TikTok Shop API Service initialized with:');
         console.log('  Environment: PRODUCTION');
         console.log('  APP_KEY:', this.config.appKey ? `${this.config.appKey.substring(0, 5)}...` : 'MISSING');
         console.log('  API_BASE:', this.config.apiBase);
         console.log('  AUTH_BASE:', this.config.authBase);
     }
-
-    /**
-     * Validate that credentials are configured
-     */
     private validateCredentials(): void {
         if (!this.config.appKey || !this.config.appSecret) {
             throw new Error('TikTok Shop API credentials not configured');
         }
     }
-
-    /**
-     * Generate OAuth authorization URL
-     */
     generateAuthUrl(state: string): string {
         this.validateCredentials();
         const redirectUri = process.env.TIKTOK_SHOP_REDIRECT_URI || '';
-
         const params = new URLSearchParams({
             app_key: this.config.appKey,
             state: state,
             redirect_uri: redirectUri,
         });
-
         return `${this.config.authBase}/api/v2/authorize?${params.toString()}`;
     }
-
-    /**
-     * Generate Service (Partner) OAuth authorization URL
-     */
     generateServiceAuthUrl(state: string): string {
         if (!this.config.serviceId) {
             throw new Error('TikTok Shop Service ID not configured');
         }
-
-        // Service Auth URL is different for US vs Global
-        // User provided: https://partner.us.tiktokshop.com/open/authorize
         const serviceAuthBase = 'https://partner.us.tiktokshop.com/open/authorize';
-
         const params = new URLSearchParams({
             service_id: this.config.serviceId,
             state: state,
         });
-
         return `${serviceAuthBase}?${params.toString()}`;
     }
-
-    /**
-     * Exchange authorization code for access and refresh tokens
-     */
     async exchangeCodeForTokens(authCode: string): Promise<TokenResponse> {
         try {
             const url = `${this.config.authBase}/api/v2/token/get`;
-
             const params = {
                 app_key: this.config.appKey,
                 app_secret: this.config.appSecret,
                 auth_code: authCode,
                 grant_type: 'authorized_code',
             };
-
             const response = await axios.get(url, { params });
-
             if (response.data.code !== 0) {
                 throw new Error(`Token exchange failed: ${response.data.message}`);
             }
-
             const tokenData = response.data.data;
             console.log('Token exchange successful. Granted scopes:', tokenData.granted_scopes || 'No scopes returned');
             console.log('Access Token (first 10 chars):', tokenData.access_token ? `${tokenData.access_token.substring(0, 10)}...` : 'MISSING');
-
             return tokenData;
-        } catch (error: any) {
+        }
+        catch (error: any) {
             console.error('Error exchanging code for tokens:', error);
             if (error.response) {
                 console.error('Response data:', error.response.data);
@@ -139,181 +100,111 @@ export class TikTokShopApiService {
             throw new Error(`Failed to exchange authorization code: ${error.message}`);
         }
     }
-
-    /**
-     * Refresh access token using refresh token
-     */
     async refreshAccessToken(refreshToken: string): Promise<TokenResponse> {
         try {
             const url = `${this.config.authBase}/api/v2/token/refresh`;
-
             const params = {
                 app_key: this.config.appKey,
                 app_secret: this.config.appSecret,
                 refresh_token: refreshToken,
                 grant_type: 'refresh_token',
             };
-
             const response = await axios.get(url, { params });
-
             if (response.data.code !== 0) {
                 throw new Error(`Token refresh failed: ${response.data.message}`);
             }
-
             return response.data.data;
-        } catch (error: any) {
+        }
+        catch (error: any) {
             console.error('Error refreshing token:', error);
             throw new Error(`Failed to refresh access token: ${error.message}`);
         }
     }
-
-    /**
-     * Generate signature for API requests (Fixed Logic)
-     */
-    /**
-     * Generate signature for API requests (Fixed Logic)
-     */
     private generateSignature(path: string, params: Record<string, any>, body?: any): string {
-        // 1. Filter out keys that should not be signed
         const excludeKeys = ['access_token', 'sign'];
-
-        // 2. Sort keys alphabetically and filter out undefined/null/empty values
         const sortedKeys = Object.keys(params)
-            .filter(key =>
-                !excludeKeys.includes(key) &&
-                params[key] !== undefined &&
-                params[key] !== null &&
-                params[key] !== ''
-            )
+            .filter(key => !excludeKeys.includes(key) &&
+            params[key] !== undefined &&
+            params[key] !== null &&
+            params[key] !== '')
             .sort();
-
-        // 3. Concatenate KeyValue pairs
         let paramString = '';
         sortedKeys.forEach(key => {
-            // Ensure value is converted to string exactly as it will be sent
             paramString += `${key}${String(params[key])}`;
         });
-
-        // 4. Prepend Path
         let stringToSign = `${path}${paramString}`;
-
-        // 5. Append Body if present (Step 4 in documentation)
         if (body && Object.keys(body).length > 0) {
             stringToSign += JSON.stringify(body);
         }
-
-        // 6. Wrap with App Secret
         stringToSign = `${this.config.appSecret}${stringToSign}${this.config.appSecret}`;
-
-        // 7. HMAC-SHA256
         const hmac = crypto.createHmac('sha256', this.config.appSecret);
         hmac.update(stringToSign);
         return hmac.digest('hex');
     }
-
-    /**
-     * Make authenticated API request to TikTok Shop
-     */
-    async makeApiRequest(
-        endpoint: string,
-        accessToken: string,
-        shopCipher: string,
-        params: Record<string, any> = {},
-        method: 'GET' | 'POST' = 'GET',
-        excludeShopCipher: boolean = false,
-        axiosConfig: any = {}
-    ): Promise<any> {
+    async makeApiRequest(endpoint: string, accessToken: string, shopCipher: string, params: Record<string, any> = {}, method: 'GET' | 'POST' = 'GET', excludeShopCipher: boolean = false, axiosConfig: any = {}, returnFullEnvelope: boolean = false): Promise<any> {
         try {
             const timestamp = Math.floor(Date.now() / 1000);
             const path = endpoint;
-
-            // System params that go into every request
             const systemParams: any = {
                 app_key: this.config.appKey,
                 timestamp: timestamp.toString(),
             };
-
-            // Only add shop_cipher if it's explicitly provided and not null, AND not excluded
             if (shopCipher && !excludeShopCipher) {
                 systemParams.shop_cipher = shopCipher;
             }
-
             let signatureParams: any = { ...systemParams };
             let queryParams: any = { ...systemParams };
             let bodyParams: any = {};
-
             if (method === 'GET') {
-                // For GET, all params are signed
                 signatureParams = { ...signatureParams, ...params };
                 queryParams = { ...queryParams, ...params };
-            } else {
-                // For POST (JSON), body is NOT signed in V2
+            }
+            else {
                 const { version, shop_id, shop_cipher: paramShopCipher, page_size, page_number, ...rest } = params;
-
-                // Handle common special parameters that might be passed in params but belong in query
                 if (version) {
                     signatureParams.version = version;
                     queryParams.version = version;
                 }
-
-                // If shop_id is provided, use it in both signature and query
                 if (shop_id) {
                     signatureParams.shop_id = shop_id;
                     queryParams.shop_id = shop_id;
-
-                    // If shop_id is present, we definitely don't need shop_cipher
                     delete signatureParams.shop_cipher;
                     delete queryParams.shop_cipher;
                 }
-                // ELSE: Keep shop_cipher in queryParams (it was added from systemParams)
-
-                // Construct body params
                 bodyParams = { ...rest };
-
-                // For POST requests, pagination usually belongs ONLY in the body
-                // BUT for some endpoints (like Orders), it seems to require them in Query or strict format
-                // Let's add them to BOTH Query and Body to be safe, or prioritize Query if Body fails
                 if (page_size) {
                     bodyParams.page_size = page_size;
-                    queryParams.page_size = page_size; // Add to Query
-                    signatureParams.page_size = page_size; // Add to Signature
+                    queryParams.page_size = page_size;
+                    signatureParams.page_size = page_size;
                 }
                 if (page_number) {
                     bodyParams.page_number = page_number;
-                    queryParams.page_number = page_number; // Add to Query
-                    signatureParams.page_number = page_number; // Add to Signature
+                    queryParams.page_number = page_number;
+                    signatureParams.page_number = page_number;
                 }
                 if (rest.page_token) {
-                    queryParams.page_token = rest.page_token; // Add to Query
-                    signatureParams.page_token = rest.page_token; // Add to Signature
+                    queryParams.page_token = rest.page_token;
+                    signatureParams.page_token = rest.page_token;
                 }
                 if (rest.cursor) {
-                    queryParams.cursor = rest.cursor; // Add to Query
-                    signatureParams.cursor = rest.cursor; // Add to Signature
+                    queryParams.cursor = rest.cursor;
+                    signatureParams.cursor = rest.cursor;
                 }
             }
-
-            // Generate signature
             const signature = this.generateSignature(path, signatureParams, bodyParams);
             queryParams.sign = signature;
-
             const url = `${this.config.apiBase}${path}`;
-
             const headers = {
                 'x-tts-access-token': accessToken,
                 'Content-Type': 'application/json',
             };
-
-            // DEBUG: Log final request details
             console.log(`[TikTokApi] ${method} ${url}`);
             console.log('[TikTokApi] Query Params:', JSON.stringify(queryParams, null, 2));
             console.log('[TikTokApi] Body Params:', JSON.stringify(bodyParams, null, 2));
-            console.log('[TikTokApi] Headers:', JSON.stringify(headers, null, 2));
-
+            console.log('[TikTokApi] Headers:', JSON.stringify({ ...headers, 'x-tts-access-token': '[REDACTED]' }, null, 2));
             let attempt = 0;
             const maxRetries = 3;
             const baseDelay = 1000;
-
             while (attempt < maxRetries) {
                 try {
                     let response;
@@ -323,57 +214,40 @@ export class TikTokShopApiService {
                             headers,
                             ...axiosConfig
                         });
-                    } else {
-                        response = await axios.post(
-                            url,
-                            bodyParams,
-                            {
-                                params: queryParams,
-                                headers,
-                                ...axiosConfig
-                            }
-                        );
                     }
-
+                    else {
+                        response = await axios.post(url, bodyParams, {
+                            params: queryParams,
+                            headers,
+                            ...axiosConfig
+                        });
+                    }
                     if (response.data.code !== 0) {
-                        // Check if it's a rate limit error code from TikTok body (if applicable)
-                        // TikTok docs usually say HTTP 429, but sometimes code implies limit.
-                        // For now, we trust HTTP status for rate limits, but log these codes.
-
-                        // Enhanced error logging
                         console.error(`TikTok API Error [${response.data.code}]: ${response.data.message}`);
                         console.error(`Req ID: ${response.data.request_id}`);
-                        throw new TikTokShopError(
-                            response.data.message,
-                            response.data.code,
-                            response.data.request_id,
-                            response.data.detail
-                        );
+                        throw new TikTokShopError(response.data.message, response.data.code, response.data.request_id, response.data.detail);
                     }
-
+                    if (returnFullEnvelope) {
+                        return response.data;
+                    }
                     return response.data.data;
-
-                } catch (error: any) {
-                    const isRetryable =
-                        (error.response && [429, 500, 502, 503, 504].includes(error.response.status)) ||
+                }
+                catch (error: any) {
+                    const isRetryable = (error.response && [429, 500, 502, 503, 504].includes(error.response.status)) ||
                         (error.code === 'ECONNABORTED') ||
                         (error.code === 'ETIMEDOUT');
-
                     if (isRetryable && attempt < maxRetries - 1) {
                         attempt++;
-                        const delay = baseDelay * Math.pow(2, attempt - 1); // 1s, 2s, 4s
+                        const delay = baseDelay * Math.pow(2, attempt - 1);
                         console.warn(`[TikTokApi] Request failed with ${error.response?.status || error.code}. Retrying in ${delay}ms... (Attempt ${attempt}/${maxRetries})`);
                         await new Promise(resolve => setTimeout(resolve, delay));
                         continue;
                     }
-
-                    // Detailed error reporting for debugging signatures
                     if (error instanceof TikTokShopError) {
                         throw error;
                     }
                     if (error.response?.data) {
                         console.error('API Error Response:', JSON.stringify(error.response.data, null, 2));
-                        // Try to extract code from error response if available
                         const code = error.response.data.code || 500;
                         const message = error.response.data.message || 'TikTok API request failed';
                         const requestId = error.response.data.request_id;
@@ -382,28 +256,21 @@ export class TikTokShopApiService {
                     throw error;
                 }
             }
-        } catch (error) {
+        }
+        catch (error) {
             throw error;
         }
     }
-
-    /**
-     * Get authorized shops for the access token
-     */
     async getAuthorizedShops(accessToken: string): Promise<any[]> {
         try {
             const timestamp = Math.floor(Date.now() / 1000);
             const path = '/authorization/202309/shops';
-
             const params = {
                 app_key: this.config.appKey,
                 timestamp: timestamp.toString(),
             };
-
             const signature = this.generateSignature(path, params);
-
             const url = `${this.config.apiBase}${path}`;
-
             const response = await axios.get(url, {
                 params: { ...params, sign: signature },
                 headers: {
@@ -411,13 +278,12 @@ export class TikTokShopApiService {
                     'Content-Type': 'application/json',
                 },
             });
-
             if (response.data.code !== 0) {
                 throw new Error(`Failed to get shops: ${response.data.message}`);
             }
-
             return response.data.data.shops || [];
-        } catch (error: any) {
+        }
+        catch (error: any) {
             console.error('Error getting authorized shops:', error);
             if (error.response) {
                 console.error('Response status:', error.response.status);
@@ -426,261 +292,149 @@ export class TikTokShopApiService {
             throw new Error(`Failed to get authorized shops: ${error.message}`);
         }
     }
-
-    /**
-     * Get Shop Information
-     * GET /shop/get
-     */
     async getShopInfo(accessToken: string, shopCipher: string): Promise<any> {
         return this.makeApiRequest('/seller/202309/shops', accessToken, shopCipher, {}, 'GET', true);
     }
-
-    /**
-     * Get Seller Performance Metrics
-     * GET /seller/performance
-     */
     async getSellerPerformance(accessToken: string, shopCipher: string): Promise<any> {
         return this.makeApiRequest('/seller/202309/performance', accessToken, shopCipher);
     }
-
-    /**
-     * Search Orders
-     * POST /order/202309/orders/search
-     * 
-     * Query params: page_size, sort_order, sort_field, page_token
-     * Body params: order_status, create_time_ge, create_time_lt, update_time_ge, update_time_lt
-     */
     async searchOrders(accessToken: string, shopCipher: string, params: any): Promise<any> {
         const timestamp = Math.floor(Date.now() / 1000);
         const path = '/order/202309/orders/search';
-
-        // Map legacy param names to correct API names
         const create_time_ge = params.create_time_ge ?? params.create_time_from;
         const create_time_lt = params.create_time_lt ?? params.create_time_to;
-
-        // === QUERY PARAMETERS ===
-        // These go in the URL as query params
         const queryParams: Record<string, any> = {
             app_key: this.config.appKey,
             timestamp: timestamp.toString(),
             shop_cipher: shopCipher,
         };
-
-        // Add optional query params per TikTok docs
-        if (params.page_size) queryParams.page_size = String(params.page_size);
-        if (params.sort_order) queryParams.sort_order = params.sort_order;
-        if (params.sort_field) queryParams.sort_field = params.sort_field;
-        if (params.page_token) queryParams.page_token = params.page_token;
-        // page_number is for initial requests without page_token
-        if (params.page_number && !params.page_token) queryParams.page_number = String(params.page_number);
-
-        // === BODY PARAMETERS ===
-        // These go in the POST body as JSON
+        if (params.page_size)
+            queryParams.page_size = String(params.page_size);
+        if (params.sort_order)
+            queryParams.sort_order = params.sort_order;
+        if (params.sort_field)
+            queryParams.sort_field = params.sort_field;
+        if (params.page_token)
+            queryParams.page_token = params.page_token;
+        if (params.page_number && !params.page_token)
+            queryParams.page_number = String(params.page_number);
         const bodyParams: Record<string, any> = {};
-
-        if (create_time_ge) bodyParams.create_time_ge = Number(create_time_ge);
-        if (create_time_lt) bodyParams.create_time_lt = Number(create_time_lt);
-        if (params.update_time_ge) bodyParams.update_time_ge = Number(params.update_time_ge);
-        if (params.update_time_lt) bodyParams.update_time_lt = Number(params.update_time_lt);
-        if (params.order_status) bodyParams.order_status = params.order_status;
-
-        // Generate signature using query params + body
+        if (create_time_ge)
+            bodyParams.create_time_ge = Number(create_time_ge);
+        if (create_time_lt)
+            bodyParams.create_time_lt = Number(create_time_lt);
+        if (params.update_time_ge)
+            bodyParams.update_time_ge = Number(params.update_time_ge);
+        if (params.update_time_lt)
+            bodyParams.update_time_lt = Number(params.update_time_lt);
+        if (params.order_status)
+            bodyParams.order_status = params.order_status;
         const signature = this.generateSignature(path, queryParams, bodyParams);
         queryParams.sign = signature;
-
         const url = `${this.config.apiBase}${path}`;
-
         const headers = {
             'x-tts-access-token': accessToken,
             'Content-Type': 'application/json',
         };
-
         console.log(`[TikTokApi] POST ${url}`);
         console.log('[TikTokApi] Query Params:', JSON.stringify(queryParams, null, 2));
         console.log('[TikTokApi] Body Params:', JSON.stringify(bodyParams, null, 2));
-
         try {
             const response = await axios.post(url, bodyParams, {
                 params: queryParams,
                 headers,
             });
-
             if (response.data.code !== 0) {
                 console.error(`TikTok API Error [${response.data.code}]: ${response.data.message}`);
-                throw new TikTokShopError(
-                    response.data.message,
-                    response.data.code,
-                    response.data.request_id,
-                    response.data.detail
-                );
+                throw new TikTokShopError(response.data.message, response.data.code, response.data.request_id, response.data.detail);
             }
-
             return response.data.data;
-        } catch (error: any) {
-            if (error instanceof TikTokShopError) throw error;
+        }
+        catch (error: any) {
+            if (error instanceof TikTokShopError)
+                throw error;
             if (error.response?.data) {
                 console.error('API Error Response:', JSON.stringify(error.response.data, null, 2));
-                throw new TikTokShopError(
-                    error.response.data.message || 'TikTok API request failed',
-                    error.response.data.code || 500,
-                    error.response.data.request_id
-                );
+                throw new TikTokShopError(error.response.data.message || 'TikTok API request failed', error.response.data.code || 500, error.response.data.request_id);
             }
             throw error;
         }
     }
-
-    /**
-     * Get Order Detail
-     * GET /orders/{order_id}
-     * Note: TikTok API might use a different path for single order, usually it's a list query with IDs
-     * Using /order/202309/orders to get details
-     */
     async getOrderDetails(accessToken: string, shopCipher: string, orderIds: string[]): Promise<any> {
-        return this.makeApiRequest('/order/202309/orders', accessToken, shopCipher, { order_ids: orderIds }, 'GET');
+        return this.makeApiRequest('/order/202309/orders', accessToken, shopCipher, { ids: orderIds.join(',') }, 'GET');
     }
-
-    /**
-     * Get Order Price Detail
-     * GET /order/202407/orders/{order_id}/price_detail
-     * Note: This endpoint requires BOTH shop_id and shop_cipher
-     */
     async getOrderPriceDetail(accessToken: string, shopCipher: string, orderId: string, shopId?: string): Promise<any> {
         if (!shopId) {
             throw new Error('shop_id is required for getOrderPriceDetail endpoint');
         }
-
         console.log('[getOrderPriceDetail] Called with:', {
             orderId,
             shopId,
             shopCipher: shopCipher ? 'provided' : 'missing',
             endpoint: `/order/202407/orders/${orderId}/price_detail`
         });
-
-        // This endpoint requires BOTH shop_id and shop_cipher
-        return this.makeApiRequest(
-            `/order/202407/orders/${orderId}/price_detail`,
-            accessToken,
-            shopCipher,
-            { shop_id: shopId },
-            'GET',
-            false // Keep shop_cipher, and also include shop_id
-        );
+        return this.makeApiRequest(`/order/202407/orders/${orderId}/price_detail`, accessToken, shopCipher, { shop_id: shopId }, 'GET', false);
     }
-
-    /**
-     * Search Products
-     * POST /product/202502/products/search
-     */
     async searchProducts(accessToken: string, shopCipher: string, params: any): Promise<any> {
-        // Remove 'version' param if it exists, as it is now in the path
         const { version, ...rest } = params;
         return this.makeApiRequest('/product/202502/products/search', accessToken, shopCipher, rest, 'POST');
     }
-
-    /**
-     * Get Settlements (Statements)
-     * GET /finance/202309/statements
-     */
     async getStatements(accessToken: string, shopCipher: string, params: any): Promise<any> {
         return this.makeApiRequest('/finance/202309/statements', accessToken, shopCipher, params, 'GET');
     }
-
-    /**
-     * Get Payments
-     * GET /finance/202309/payments
-     */
     async getPayments(accessToken: string, shopCipher: string, params: any): Promise<any> {
         return this.makeApiRequest('/finance/202309/payments', accessToken, shopCipher, params, 'GET');
     }
-
-    /**
-     * Get Payouts (Withdrawals)
-     * GET /finance/202309/withdrawals
-     */
     async getWithdrawals(accessToken: string, shopCipher: string, params: any): Promise<any> {
         return this.makeApiRequest('/finance/202309/withdrawals', accessToken, shopCipher, params, 'GET');
     }
-
-    /**
-     * Get Statement Transactions
-     * GET /finance/202501/statements/{statement_id}/statement_transactions
-     */
     async getStatementTransactions(accessToken: string, shopCipher: string, statementId: string, params: any): Promise<any> {
-        return this.makeApiRequest(`/finance/202501/statements/${statementId}/statement_transactions`, accessToken, shopCipher, params, 'GET');
+        // TikTok requires sort_field / sort_order (error 36009004 if omitted); sync/debug already pass them.
+        const merged = {
+            sort_field: 'order_create_time',
+            sort_order: 'DESC',
+            ...(params || {}),
+        };
+        return this.makeApiRequest(`/finance/202501/statements/${statementId}/statement_transactions`, accessToken, shopCipher, merged, 'GET');
     }
-
-    /**
-     * Get Order Transactions
-     * GET /finance/202501/orders/{order_id}/statement_transactions
-     */
+    /** Full TikTok response: { code, message, data, request_id } for Finance Debug. */
+    async getStatementTransactionsEnvelope(accessToken: string, shopCipher: string, statementId: string, params: any): Promise<any> {
+        const merged = {
+            sort_field: 'order_create_time',
+            sort_order: 'DESC',
+            ...(params || {}),
+        };
+        return this.makeApiRequest(`/finance/202501/statements/${statementId}/statement_transactions`, accessToken, shopCipher, merged, 'GET', false, {}, true);
+    }
     async getOrderTransactions(accessToken: string, shopCipher: string, orderId: string, params: any): Promise<any> {
-        return this.makeApiRequest(`/finance/202501/orders/${orderId}/statement_transactions`, accessToken, shopCipher, params, 'GET');
+        const merged = {
+            sort_field: 'order_create_time',
+            sort_order: 'DESC',
+            ...(params || {}),
+        };
+        return this.makeApiRequest(`/finance/202501/orders/${orderId}/statement_transactions`, accessToken, shopCipher, merged, 'GET');
     }
-
-    /**
-     * Get Unsettled Orders
-     * GET /finance/202507/orders/unsettled
-     */
     async getUnsettledOrders(accessToken: string, shopCipher: string, params: any): Promise<any> {
         return this.makeApiRequest('/finance/202507/orders/unsettled', accessToken, shopCipher, params, 'GET');
     }
-
-    // ==================== PRODUCT MANAGEMENT APIs ====================
-
-    /**
-     * Get Product Details
-     * GET /product/202309/products/{product_id}
-     */
     async getProductDetails(accessToken: string, shopCipher: string, productId: string): Promise<any> {
         return this.makeApiRequest(`/product/202309/products/${productId}`, accessToken, shopCipher, {}, 'GET');
     }
-
-    /**
-     * Edit/Update Product
-     * PUT /product/202509/products/{product_id}
-     * 
-     * Body can contain:
-     * - title: string
-     * - description: string
-     * - main_images: array of image objects
-     * - skus: array with price/inventory updates
-     * - category_id: string
-     * - package_dimensions: object
-     * - package_weight: object
-     * - is_cod_allowed: boolean
-     * - delivery_options: array
-     * etc.
-     */
     async editProduct(accessToken: string, shopCipher: string, productId: string, updates: any): Promise<any> {
         return this.makeApiRequest(`/product/202509/products/${productId}`, accessToken, shopCipher, updates, 'POST');
     }
-
-    /**
-     * Delete Products
-     * DELETE /product/202309/products
-     * 
-     * Body: { product_ids: string[] }
-     */
     async deleteProducts(accessToken: string, shopCipher: string, productIds: string[]): Promise<any> {
-        // For DELETE with body, we need special handling
         const timestamp = Math.floor(Date.now() / 1000);
         const path = '/product/202309/products';
-
         const queryParams: any = {
             app_key: this.config.appKey,
             timestamp: timestamp.toString(),
             shop_cipher: shopCipher
         };
-
         const bodyParams = { product_ids: productIds };
-
-        // Generate signature
         const signature = this.generateSignature(path, queryParams, bodyParams);
         queryParams.sign = signature;
-
         const url = `${this.config.apiBase}${path}`;
-
         const response = await axios.delete(url, {
             params: queryParams,
             headers: {
@@ -689,180 +443,80 @@ export class TikTokShopApiService {
             },
             data: bodyParams
         });
-
         if (response.data.code !== 0) {
-            throw new TikTokShopError(
-                response.data.message,
-                response.data.code,
-                response.data.request_id
-            );
+            throw new TikTokShopError(response.data.message, response.data.code, response.data.request_id);
         }
-
         return response.data.data;
     }
-
-    /**
-     * Activate Products
-     * POST /product/202309/products/activate
-     * 
-     * Body: { product_ids: string[] }
-     */
     async activateProducts(accessToken: string, shopCipher: string, productIds: string[]): Promise<any> {
         return this.makeApiRequest('/product/202309/products/activate', accessToken, shopCipher, {
             product_ids: productIds
         }, 'POST');
     }
-
-    /**
-     * Deactivate Products
-     * POST /product/202309/products/deactivate
-     * 
-     * Body: { product_ids: string[] }
-     */
     async deactivateProducts(accessToken: string, shopCipher: string, productIds: string[]): Promise<any> {
         return this.makeApiRequest('/product/202309/products/deactivate', accessToken, shopCipher, {
             product_ids: productIds
         }, 'POST');
     }
-
-    /**
-     * Update Product SKU Price
-     * PUT /product/202309/products/{product_id}/skus/{sku_id}/price
-     */
-    async updateSkuPrice(
-        accessToken: string,
-        shopCipher: string,
-        productId: string,
-        skuId: string,
-        price: { currency: string; sale_price: string }
-    ): Promise<any> {
-        return this.makeApiRequest(
-            `/product/202309/products/${productId}/skus/${skuId}/price`,
-            accessToken,
-            shopCipher,
-            price,
-            'POST'
-        );
+    async updateSkuPrice(accessToken: string, shopCipher: string, productId: string, skuId: string, price: {
+        currency: string;
+        sale_price: string;
+    }): Promise<any> {
+        return this.makeApiRequest(`/product/202309/products/${productId}/skus/${skuId}/price`, accessToken, shopCipher, price, 'POST');
     }
-
-    /**
-     * Update Product Inventory
-     * POST /product/202309/products/{product_id}/inventory/update
-     */
-    async updateProductInventory(
-        accessToken: string,
-        shopCipher: string,
-        productId: string,
-        skus: Array<{
-            id: string;
-            inventory: Array<{
-                warehouse_id: string;
-                quantity: number;
-            }>;
-        }>
-    ): Promise<any> {
-        return this.makeApiRequest(
-            `/product/202309/products/${productId}/inventory/update`,
-            accessToken,
-            shopCipher,
-            { skus },
-            'POST'
-        );
+    async updateProductInventory(accessToken: string, shopCipher: string, productId: string, skus: Array<{
+        id: string;
+        inventory: Array<{
+            warehouse_id: string;
+            quantity: number;
+        }>;
+    }>): Promise<any> {
+        return this.makeApiRequest(`/product/202309/products/${productId}/inventory/update`, accessToken, shopCipher, { skus }, 'POST');
     }
-
-    /**
-     * Update Product Prices
-     * POST /product/202309/products/{product_id}/prices/update
-     */
-    async updateProductPrices(
-        accessToken: string,
-        shopCipher: string,
-        productId: string,
-        skus: Array<{
+    async updateProductPrices(accessToken: string, shopCipher: string, productId: string, skus: Array<{
+        id: string;
+        original_price?: string;
+        sale_price?: string;
+    }>): Promise<any> {
+        return this.makeApiRequest(`/product/202309/products/${productId}/prices/update`, accessToken, shopCipher, { skus }, 'POST');
+    }
+    async partialEditProduct(accessToken: string, shopCipher: string, productId: string, updates: {
+        title?: string;
+        description?: string;
+        main_images?: Array<{
+            uri: string;
+        }>;
+        skus?: Array<{
             id: string;
+            seller_sku?: string;
             original_price?: string;
-            sale_price?: string;
-        }>
-    ): Promise<any> {
-        return this.makeApiRequest(
-            `/product/202309/products/${productId}/prices/update`,
-            accessToken,
-            shopCipher,
-            { skus },
-            'POST'
-        );
-    }
-
-    /**
-     * Partial Edit Product
-     * POST /product/202309/products/{product_id}/partial_edit
-     * Use this for updating title, description, images without full product audit
-     */
-    async partialEditProduct(
-        accessToken: string,
-        shopCipher: string,
-        productId: string,
-        updates: {
-            title?: string;
-            description?: string;
-            main_images?: Array<{ uri: string }>;
-            skus?: Array<{
+            sales_attributes?: Array<{
                 id: string;
-                seller_sku?: string;
-                original_price?: string;
-                sales_attributes?: Array<{
-                    id: string;
-                    value_id?: string;
-                    value_name?: string;
-                }>;
+                value_id?: string;
+                value_name?: string;
             }>;
-        }
-    ): Promise<any> {
-        return this.makeApiRequest(
-            `/product/202309/products/${productId}/partial_edit`,
-            accessToken,
-            shopCipher,
-            updates,
-            'POST'
-        );
+        }>;
+    }): Promise<any> {
+        return this.makeApiRequest(`/product/202309/products/${productId}/partial_edit`, accessToken, shopCipher, updates, 'POST');
     }
-
-    /**
-     * Upload Product Image
-     * POST /product/202309/images/upload
-     * Note: This requires multipart/form-data handling
-     */
-    async uploadProductImage(
-        accessToken: string,
-        shopCipher: string,
-        imageData: Buffer,
-        fileName: string,
-        useCase: 'MAIN_IMAGE' | 'SKU_IMAGE' | 'DESCRIPTION_IMAGE' | 'SIZE_CHART' = 'MAIN_IMAGE'
-    ): Promise<any> {
+    async uploadProductImage(accessToken: string, shopCipher: string, imageData: Buffer, fileName: string, useCase: 'MAIN_IMAGE' | 'SKU_IMAGE' | 'DESCRIPTION_IMAGE' | 'SIZE_CHART' = 'MAIN_IMAGE'): Promise<any> {
         const timestamp = Math.floor(Date.now() / 1000);
         const path = '/product/202309/images/upload';
-
         const queryParams: Record<string, any> = {
             app_key: this.config.appKey,
             timestamp: timestamp.toString(),
             shop_cipher: shopCipher,
             use_case: useCase
         };
-
-        // Generate signature (no body for multipart)
         const signature = this.generateSignature(path, queryParams);
         queryParams.sign = signature;
-
         const url = `${this.config.apiBase}${path}`;
-
-        // Create form data
         const FormData = require('form-data');
         const form = new FormData();
         form.append('data', imageData, {
             filename: fileName,
             contentType: 'image/jpeg'
         });
-
         const response = await axios.post(url, form, {
             params: queryParams,
             headers: {
@@ -870,87 +524,39 @@ export class TikTokShopApiService {
                 ...form.getHeaders()
             }
         });
-
         if (response.data.code !== 0) {
-            throw new TikTokShopError(
-                response.data.message,
-                response.data.code,
-                response.data.request_id
-            );
+            throw new TikTokShopError(response.data.message, response.data.code, response.data.request_id);
         }
-
         return response.data.data;
     }
-
-    /**
-     * Get Warehouses
-     * GET /logistics/202309/warehouses
-     * Required for inventory updates
-     */
     async getWarehouses(accessToken: string, shopCipher: string): Promise<any> {
-        return this.makeApiRequest(
-            '/logistics/202309/warehouses',
-            accessToken,
-            shopCipher,
-            {},
-            'GET'
-        );
+        return this.makeApiRequest('/logistics/202309/warehouses', accessToken, shopCipher, {}, 'GET');
     }
-
-    /**
-     * Get Product Categories
-     * GET /product/202309/categories
-     */
     async getCategories(accessToken: string, shopCipher: string): Promise<any> {
-        return this.makeApiRequest(
-            '/product/202309/categories',
-            accessToken,
-            shopCipher,
-            {},
-            'GET'
-        );
+        return this.makeApiRequest('/product/202309/categories', accessToken, shopCipher, {}, 'GET');
     }
-
-    /**
-     * Get Category Attributes
-     * GET /product/202309/categories/{category_id}/attributes
-     */
     async getCategoryAttributes(accessToken: string, shopCipher: string, categoryId: string): Promise<any> {
-        return this.makeApiRequest(
-            `/product/202309/categories/${categoryId}/attributes`,
-            accessToken,
-            shopCipher,
-            {},
-            'GET'
-        );
+        return this.makeApiRequest(`/product/202309/categories/${categoryId}/attributes`, accessToken, shopCipher, {}, 'GET');
     }
-
-    /**
-     * Cancel a shop's partner authorization at TikTok's side.
-     * Uses POST /authorization/202309/shops/cancel on the API base (properly signed).
-     * This frees up the authorized-shop slot in the partner app quota.
-     * Failures are non-fatal: caller should still proceed with local cleanup.
-     */
-    async cancelShopAuthorization(accessToken: string, shopCipher: string): Promise<{ success: boolean; message: string; rawResponse?: any }> {
+    async cancelShopAuthorization(accessToken: string, shopCipher: string): Promise<{
+        success: boolean;
+        message: string;
+        rawResponse?: any;
+    }> {
         try {
             this.validateCredentials();
             const timestamp = Math.floor(Date.now() / 1000);
             const path = '/authorization/202309/shops/cancel';
-
             const queryParams: Record<string, any> = {
                 app_key: this.config.appKey,
                 timestamp: timestamp.toString(),
                 shop_cipher: shopCipher,
             };
-
             const signature = this.generateSignature(path, queryParams);
             queryParams.sign = signature;
-
             const url = `${this.config.apiBase}${path}`;
-
             console.log(`[TikTok Cancel Auth] Sending POST to: ${url}`);
             console.log('[TikTok Cancel Auth] Query Params:', JSON.stringify({ ...queryParams, sign: '***' }, null, 2));
-
             const response = await axios.post(url, {}, {
                 params: queryParams,
                 headers: {
@@ -958,25 +564,23 @@ export class TikTokShopApiService {
                     'Content-Type': 'application/json',
                 },
             });
-
             console.log('[TikTok Cancel Auth] Raw response:', JSON.stringify(response.data, null, 2));
-
             if (response.data.code !== 0) {
                 const msg = response.data.message || 'Authorization cancellation failed';
                 console.warn(`[TikTok Cancel Auth] ❌ Failed — code ${response.data.code}: ${msg}`);
                 return { success: false, message: msg, rawResponse: response.data };
             }
-
             console.log('[TikTok Cancel Auth] ✅ Authorization successfully cancelled on TikTok');
             return { success: true, message: 'Authorization cancelled on TikTok', rawResponse: response.data };
-        } catch (error: any) {
+        }
+        catch (error: any) {
             const rawResponse = error.response?.data;
             const msg = rawResponse?.message || error.message || 'Unknown error';
             console.warn('[TikTok Cancel Auth] ❌ Request error:', msg);
-            if (rawResponse) console.warn('[TikTok Cancel Auth] Raw error response:', JSON.stringify(rawResponse, null, 2));
+            if (rawResponse)
+                console.warn('[TikTok Cancel Auth] Raw error response:', JSON.stringify(rawResponse, null, 2));
             return { success: false, message: msg, rawResponse };
         }
     }
 }
-
 export const tiktokShopApi = new TikTokShopApiService();

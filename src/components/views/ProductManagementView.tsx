@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import {
     Search, RefreshCw, Download, Save, X, Check, ChevronDown,
     ChevronUp, Package, DollarSign, TrendingUp, Video, MoreVertical, Trash2,
@@ -8,15 +8,7 @@ import { ProductCostsModal } from '../ProductCostsModal';
 import { useShopStore, Product, Order } from '../../store/useShopStore';
 import { Account } from '../../lib/supabase';
 import { calculateOrderGMV } from '../../utils/gmvCalculations';
-
-// Helper function to detect cancelled or refunded orders
-const isCancelledOrRefunded = (order: Order): boolean => {
-    return (
-        order.order_status === 'CANCELLED' ||
-        !!order.cancel_reason ||
-        !!order.cancellation_initiator
-    );
-};
+import { isCancelledOrRefunded } from '../../utils/orderFinancials';
 import { ProductEditModal } from '../ProductEditModal';
 import { ProductPerformanceCharts } from '../ProductPerformanceCharts';
 import { CalculationTooltip } from '../CalculationTooltip';
@@ -26,6 +18,8 @@ interface ProductManagementViewProps {
     account: Account;
     shopId?: string;
     onBack?: () => void;
+    /** When true, no sync, bulk actions, cost edits, or TikTok product mutations. */
+    readOnly?: boolean;
 }
 
 interface EditingProduct {
@@ -34,8 +28,18 @@ interface EditingProduct {
     shipping_cost: number | null;
 }
 
-export function ProductManagementView({ account, shopId, onBack }: ProductManagementViewProps) {
+export function ProductManagementView({ account, shopId, onBack, readOnly = false }: ProductManagementViewProps) {
     const { products, orders, isLoading, syncData, cacheMetadata, updateProductCosts, activateProducts, deactivateProducts, deleteProducts, dataVersion } = useShopStore();
+
+    useEffect(() => {
+        if (!readOnly) return;
+        setBulkEditMode(false);
+        setSelectedProducts(new Set());
+        setEditingProducts(new Map());
+        setActiveMenu(null);
+        setEditingProduct(null);
+        setEditingCostsProduct(null);
+    }, [readOnly]);
 
     // State
     const [searchTerm, setSearchTerm] = useState('');
@@ -59,7 +63,7 @@ export function ProductManagementView({ account, shopId, onBack }: ProductManage
     const itemsPerPage = 25;
 
     const handleSync = async () => {
-        if (!shopId) return;
+        if (!shopId || readOnly) return;
         await syncData(account.id, shopId, 'products');
     };
 
@@ -368,8 +372,10 @@ export function ProductManagementView({ account, shopId, onBack }: ProductManage
                         Export CSV
                     </button>
                     <button
+                        type="button"
                         onClick={handleSync}
-                        disabled={cacheMetadata.isSyncing || isLoading}
+                        disabled={readOnly || cacheMetadata.isSyncing || isLoading}
+                        title={readOnly ? 'Read-only for your role' : undefined}
                         className="flex items-center gap-2 px-4 py-2 bg-pink-600 hover:bg-pink-700 text-white rounded-lg transition-colors disabled:opacity-50"
                     >
                         <RefreshCw size={18} className={cacheMetadata.isSyncing ? "animate-spin" : ""} />
@@ -571,11 +577,14 @@ export function ProductManagementView({ account, shopId, onBack }: ProductManage
 
                     {/* Bulk Edit Toggle */}
                     <button
-                        onClick={() => setBulkEditMode(!bulkEditMode)}
+                        type="button"
+                        onClick={() => !readOnly && setBulkEditMode(!bulkEditMode)}
+                        disabled={readOnly}
+                        title={readOnly ? 'Read-only for your role' : undefined}
                         className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors ${bulkEditMode
                             ? 'bg-pink-600 text-white'
                             : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
-                            }`}
+                            } disabled:opacity-40 disabled:pointer-events-none`}
                     >
                         <Layers size={18} />
                         Bulk Edit {selectedProducts.size > 0 && `(${selectedProducts.size})`}
@@ -891,9 +900,12 @@ export function ProductManagementView({ account, shopId, onBack }: ProductManage
                                             </span>
                                         </td>
                                         <td className="px-3 py-3">
-                                            {isEditing ? (
+                                            {readOnly ? (
+                                                <span className="text-xs text-gray-600">—</span>
+                                            ) : isEditing ? (
                                                 <div className="flex items-center gap-2">
                                                     <button
+                                                        type="button"
                                                         onClick={() => saveProduct(product.product_id)}
                                                         disabled={isSaving}
                                                         className="p-1 bg-green-600 hover:bg-green-700 rounded text-white"
@@ -901,6 +913,7 @@ export function ProductManagementView({ account, shopId, onBack }: ProductManage
                                                         <Check size={14} />
                                                     </button>
                                                     <button
+                                                        type="button"
                                                         onClick={() => cancelEditing(product.product_id)}
                                                         className="p-1 bg-gray-600 hover:bg-gray-500 rounded text-white"
                                                     >
@@ -910,6 +923,7 @@ export function ProductManagementView({ account, shopId, onBack }: ProductManage
                                             ) : (
                                                 <div className="relative">
                                                     <button
+                                                        type="button"
                                                         onClick={() => setActiveMenu(activeMenu === product.product_id ? null : product.product_id)}
                                                         className="p-1 hover:bg-gray-700 rounded text-gray-400 hover:text-white transition-colors"
                                                     >
@@ -1089,7 +1103,7 @@ export function ProductManagementView({ account, shopId, onBack }: ProductManage
             )}
 
             {/* Product Edit Modal */}
-            {editingProduct && (
+            {!readOnly && editingProduct && (
                 <ProductEditModal
                     product={editingProduct}
                     accountId={account.id}
@@ -1102,7 +1116,7 @@ export function ProductManagementView({ account, shopId, onBack }: ProductManage
             )}
 
             {/* Product Costs Modal (Backdating) */}
-            {editingCostsProduct && (
+            {!readOnly && editingCostsProduct && (
                 <ProductCostsModal
                     product={editingCostsProduct}
                     accountId={account.id}

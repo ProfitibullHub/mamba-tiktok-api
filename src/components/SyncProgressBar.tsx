@@ -1,16 +1,15 @@
 import { useShopStore } from '../store/useShopStore';
-import { Loader2, CheckCircle2, Package, ShoppingCart, DollarSign, XCircle, AlertTriangle, RefreshCw } from 'lucide-react';
+import { Loader2, CheckCircle2, Package, ShoppingCart, DollarSign, XCircle } from 'lucide-react';
 
 export function SyncProgressBar() {
-    const { syncProgress, cancelSync, dataLoadIncomplete, fetchShopData, lastFetchShopId, cacheMetadata } = useShopStore();
+    const { syncProgress, cancelSync } = useShopStore();
 
     const showProgress = syncProgress.isActive || !!syncProgress.message;
 
-    // Nothing at all to show
-    if (!dataLoadIncomplete && !showProgress) return null;
+    if (!showProgress) return null;
 
-    // Extract days count from the loading message (e.g. "Loading 3 days of data...")
-    const daysMatch = syncProgress.message?.match(/Loading (\d+) days/);
+    // Extract days count from the loading message (e.g. "Loading 3 days of data..." or "Loading 1 day of data...")
+    const daysMatch = syncProgress.message?.match(/Loading (\d+) days? of data/);
     const loadingDays = daysMatch ? parseInt(daysMatch[1], 10) : null;
 
     const getStepIcon = (step: string, isComplete: boolean, isCurrent: boolean) => {
@@ -31,33 +30,8 @@ export function SyncProgressBar() {
     return (
         <div className="fixed top-4 right-4 z-50 flex flex-col gap-3 animate-in slide-in-from-right-2 duration-300">
 
-            {/* ── Incomplete-data warning (shows immediately, even during sync) ── */}
-            {dataLoadIncomplete && (
-                <div className="bg-gray-900/95 backdrop-blur-xl border border-yellow-500/50 rounded-2xl shadow-2xl p-4 min-w-[320px]">
-                    <div className="flex items-center gap-3 mb-3">
-                        <AlertTriangle className="w-5 h-5 text-yellow-400 shrink-0" />
-                        <span className="text-white font-medium">Data Not Fully Loaded</span>
-                    </div>
-                    <p className="text-sm text-gray-300 mb-4">
-                        Only part of your orders loaded. The dashboard may show incomplete data for this date range.
-                    </p>
-                    <button
-                        onClick={() => {
-                            if (cacheMetadata.accountId && lastFetchShopId) {
-                                fetchShopData(cacheMetadata.accountId, lastFetchShopId, { forceRefresh: true });
-                            }
-                        }}
-                        className="w-full flex items-center justify-center gap-2 bg-yellow-500 hover:bg-yellow-400 text-black font-semibold text-sm px-4 py-2 rounded-xl transition-colors"
-                    >
-                        <RefreshCw className="w-4 h-4" />
-                        Reload Data
-                    </button>
-                </div>
-            )}
-
             {/* ── Sync / loading progress bar ── */}
-            {showProgress && (
-                <div className="bg-gray-900/95 backdrop-blur-xl border border-gray-700 rounded-2xl shadow-2xl p-4 min-w-[320px]">
+            <div className="bg-gray-900/95 backdrop-blur-xl border border-gray-700 rounded-2xl shadow-2xl p-4 min-w-[320px]">
                     {/* Header */}
                     <div className="flex items-center gap-3 mb-4">
                         {syncProgress.currentStep !== 'complete' ? (
@@ -70,7 +44,9 @@ export function SyncProgressBar() {
                                 {syncProgress.isFirstSync ? 'First Time Sync' : 'Loading Data'}
                             </span>
                             {loadingDays && syncProgress.currentStep !== 'complete' && (
-                                <span className="text-xs text-gray-400">{loadingDays} days</span>
+                                <span className="text-xs text-gray-400">
+                                    {loadingDays === 1 ? '1 day' : `${loadingDays} days`}
+                                </span>
                             )}
                         </div>
 
@@ -136,7 +112,6 @@ export function SyncProgressBar() {
                         </p>
                     )}
                 </div>
-            )}
         </div>
     );
 }

@@ -2,9 +2,46 @@ import { create } from 'zustand';
 import { calculateOrderGMV } from '../utils/gmvCalculations';
 import { DEFAULT_SYNC_DAYS, getInitialLoadDaysWithBuffer, DEFAULT_LOAD_DAYS } from '../config/dataRetention';
 import { supabase, AffiliateSettlement, AgencyFee } from '../lib/supabase';
-import { getShopDayStartTimestamp } from '../utils/dateUtils';
+import { getAccessTokenForApi } from '../lib/apiClient';
+import { getUtcCalendarRangeExclusiveUnix, nextCalendarDayISO, previousCalendarDayISO } from '../utils/dateUtils';
+import { mapDbOrderToStore } from '../utils/mapDbOrderToStore';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001';
+
+/** If fetchShopData runs while another fetch is in flight, keep the latest args and run after the current completes (avoids dropped Overview requests). */
+let pendingShopDataRequest: {
+    accountId: string;
+    shopId?: string;
+    options: Record<string, unknown>;
+    startDate?: string;
+    endDate?: string;
+} | null = null;
+
+/** Civil calendar add for YYYY-MM-DD (avoids UTC/local drift from `new Date('YYYY-MM-DD')` in gap-fetch math). */
+function addDaysToISODate(iso: string, deltaDays: number): string {
+    const parts = iso.split('-').map(Number);
+    if (parts.length !== 3 || parts.some(Number.isNaN)) return iso;
+    const [y, m, d] = parts;
+    const utc = Date.UTC(y, m - 1, d + deltaDays);
+    const dt = new Date(utc);
+    return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}-${String(dt.getUTCDate()).padStart(2, '0')}`;
+}
+
+/** Calendar span for Performance Comparison (phase-2 fetch) — same logic as the `previousChunk` block in fetchShopData. */
+function getTrendsPreviousChunk(startISO: string, endISO: string, timezone: string): { start: string; end: string } {
+    let span = 1;
+    let d = startISO;
+    while (d !== endISO) {
+        d = nextCalendarDayISO(d, timezone);
+        span++;
+    }
+    let expandedStart = startISO;
+    for (let i = 0; i < span; i++) {
+        expandedStart = previousCalendarDayISO(expandedStart, timezone);
+    }
+    const prevEndStr = previousCalendarDayISO(startISO, timezone);
+    return { start: expandedStart, end: prevEndStr };
+}
 
 export interface ProductSKU {
     id: string;
@@ -273,7 +310,7 @@ interface ShopState {
     dataVersion: number; // Increments on every data update to force UI re-renders
 
     // Actions
-    fetchShopData: (accountId: string, shopId?: string, options?: { forceRefresh?: boolean; showCached?: boolean; skipSyncCheck?: boolean; includePreviousPeriod?: boolean; initialLoadDays?: number; timezone?: string }, startDate?: string, endDate?: string) => Promise<void>;
+    fetchShopData: (accountId: string, shopId?: string, options?: { forceRefresh?: boolean; showCached?: boolean; skipSyncCheck?: boolean; includePreviousPeriod?: boolean; initialLoadDays?: number; timezone?: string; silentRefresh?: boolean; /** @internal second phase of split trend load */ _skipPreviousChunk?: boolean; /** @internal allow nested call while outer fetch is in progress (trends previous period) */ _trendsNestedFetch?: boolean }, startDate?: string, endDate?: string) => Promise<void>;
     setProducts: (products: Product[]) => void;
     setOrders: (orders: Order[]) => void;
     setMetrics: (metrics: Partial<ShopMetrics>) => void;
@@ -290,6 +327,7 @@ interface ShopState {
     mergeSyncedSettlementsIntoStore: (syncedSettlements: any[], shopId: string) => void;
     mergeAfterSync: (accountId: string, shopId: string, sinceTimestamp: string, types?: string) => Promise<void>;
     mergeHistoricalOrders: (orders: Order[]) => void;
+    mergeRealtimeOrder: (dbRow: any) => void;
     updateProductCosts: (productId: string, costs: {
         cogs?: number | null;
         shipping_cost?: number | null;
@@ -349,15 +387,102 @@ interface ShopState {
     dataLoadIncomplete: boolean; // True when batch loading stopped early due to errors
 }
 
+/** Attaches Supabase JWT for server-side tenant/account access checks. */
+async function shopApi(url: string, init?: RequestInit): Promise<Response> {
+    const accessToken = await getAccessTokenForApi();
+    const headers = new Headers(init?.headers);
+    if (accessToken) {
+        headers.set('Authorization', `Bearer ${accessToken}`);
+    }
+    if (init?.body != null && typeof init.body === 'string' && !headers.has('Content-Type')) {
+        headers.set('Content-Type', 'application/json');
+    }
+    return fetch(url, { ...init, headers });
+}
+
 /** Fetch with a hard timeout. Rejects with AbortError if timeoutMs elapses. */
 async function fetchWithTimeout(url: string, timeoutMs = 30000): Promise<Response> {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
-        return await fetch(url, { signal: ctrl.signal });
+        return await shopApi(url, { signal: ctrl.signal });
     } finally {
         clearTimeout(timer);
     }
+}
+
+/** True if HTTP status is worth retrying (transient server/gateway issues). */
+function isRetryableHttpStatus(status: number): boolean {
+    return status === 408 || status === 429 || status === 502 || status === 503 || status === 504 || status === 520 || status === 521 || status === 522 || status === 524 || status >= 500;
+}
+
+/**
+ * Fetches one orders batch page with robust retries (same cursor).
+ * Handles non-OK responses and invalid JSON that plain fetch+parse missed before.
+ */
+async function fetchOrdersBatchPage(
+    url: string,
+    options?: { maxAttempts?: number; timeoutMs?: number }
+): Promise<{ ok: true; data: { orders: any[]; hasMore: boolean; nextCursor: string | null } } | { ok: false }> {
+    const maxAttempts = options?.maxAttempts ?? 12;
+    const timeoutMs = options?.timeoutMs ?? 58000;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        if (attempt > 0) {
+            const base = Math.min(2000 * Math.pow(2, attempt - 2), 45000);
+            const jitter = Math.random() * 2000;
+            const delay = base + jitter;
+            console.log(`[Store] Batch retry ${attempt + 1}/${maxAttempts} after ${Math.round(delay)}ms...`);
+            await new Promise((r) => setTimeout(r, delay));
+        }
+        try {
+            const response = await fetchWithTimeout(url, timeoutMs);
+            const text = await response.text();
+            let parsed: { success?: boolean; data?: any; error?: string } = {};
+            try {
+                parsed = text ? JSON.parse(text) : {};
+            } catch {
+                console.warn(`[Store] Batch non-JSON body (HTTP ${response.status}), will retry`);
+                if (!isRetryableHttpStatus(response.status) && response.status !== 0) {
+                    if (response.status >= 400 && response.status < 500) {
+                        return { ok: false };
+                    }
+                }
+                continue;
+            }
+
+            if (!response.ok) {
+                console.warn(
+                    `[Store] Batch HTTP ${response.status} (attempt ${attempt + 1}/${maxAttempts})${parsed.error ? `: ${parsed.error}` : ''}`
+                );
+                if (response.status === 401 || response.status === 403 || response.status === 404) {
+                    return { ok: false };
+                }
+                if (!isRetryableHttpStatus(response.status)) {
+                    return { ok: false };
+                }
+                continue;
+            }
+
+            if (!parsed.success || !parsed.data) {
+                console.warn(`[Store] Batch API success=false (attempt ${attempt + 1}/${maxAttempts})`, parsed.error);
+                continue;
+            }
+
+            const data = parsed.data;
+            return {
+                ok: true,
+                data: {
+                    orders: data.orders || [],
+                    hasMore: Boolean(data.hasMore),
+                    nextCursor: data.nextCursor ?? null,
+                },
+            };
+        } catch (err) {
+            console.error(`[Store] Batch attempt ${attempt + 1}/${maxAttempts} failed:`, err);
+        }
+    }
+    return { ok: false };
 }
 
 export const useShopStore = create<ShopState>((set, get) => ({
@@ -441,28 +566,61 @@ export const useShopStore = create<ShopState>((set, get) => ({
 
 
     fetchShopData: async (accountId: string, shopId?: string, options = {}, startDate?: string, endDate?: string) => {
-        const { forceRefresh = false, showCached = true, skipSyncCheck = false, includePreviousPeriod = false, initialLoadDays } = options;
+        const { forceRefresh = false, showCached = true, skipSyncCheck = false, includePreviousPeriod = false, initialLoadDays, silentRefresh = false, _skipPreviousChunk = false, _trendsNestedFetch = false } = options as {
+            forceRefresh?: boolean;
+            showCached?: boolean;
+            skipSyncCheck?: boolean;
+            includePreviousPeriod?: boolean;
+            initialLoadDays?: number;
+            timezone?: string;
+            silentRefresh?: boolean;
+            _skipPreviousChunk?: boolean;
+            _trendsNestedFetch?: boolean;
+        };
         const state = get();
 
-        // CRITICAL: Prevent duplicate concurrent fetches
-        if (state.fetchInProgress && !forceRefresh) {
-            console.log('[Store] Fetch already in progress, skipping duplicate request.');
+        // CRITICAL: Prevent duplicate concurrent fetches — queue the latest request so it runs when the current fetch finishes
+        // Exception: nested "previous period" load for the same user action must run now; otherwise await queues no-op and trends stay empty.
+        if (state.fetchInProgress && !forceRefresh && !_trendsNestedFetch) {
+            pendingShopDataRequest = { accountId, shopId, options: options as Record<string, unknown>, startDate, endDate };
+            console.log('[Store] Fetch already in progress — queued latest request (will run when current completes).');
             return;
         }
 
-        // CRITICAL OPTIMIZATION: Prevent unnecessary re-fetches if data for this date range is already loaded
-        // This handles the case where user switches views (Overview -> Orders) and back
-        // NOTE: If includePreviousPeriod is true, we might need to fetch even if current range matches,
-        // so we skipping this check if we suspect we need expanded data.
-        // For now, simpler to just skip this check if includePreviousPeriod is true to be safe,
-        // or rely on the effectiveStartDate logic below to verify coverage. 
-        // But to be "professional", let's trust the Caller knows what they want.
-        if (shopId && shopId === state.lastFetchShopId &&
+        // Fast path: same calendar selection as last fetch — skip network if loadedDateRange already covers
+        // the selected days plus the trends comparison window (when includePreviousPeriod is on).
+        if (
+            shopId &&
+            shopId === state.lastFetchShopId &&
+            showCached &&
+            !forceRefresh &&
+            startDate != null &&
+            endDate != null &&
             startDate === state.currentDateRange.startDate &&
-            endDate === state.currentDateRange.endDate &&
-            showCached && !forceRefresh && !includePreviousPeriod) {
-            console.log('[Store] Data for this date range already loaded, skipping fetch.');
-            return;
+            endDate === state.currentDateRange.endDate
+        ) {
+            const loadedFast = get().loadedDateRange;
+            const incompleteFast = get().dataLoadIncomplete;
+            if (
+                !incompleteFast &&
+                loadedFast.startDate &&
+                loadedFast.endDate &&
+                startDate >= loadedFast.startDate &&
+                endDate <= loadedFast.endDate
+            ) {
+                const tzFast = options.timezone || 'America/Los_Angeles';
+                const trendsCoveredFast =
+                    !includePreviousPeriod ||
+                    (() => {
+                        const pc = getTrendsPreviousChunk(startDate, endDate, tzFast);
+                        return pc.start >= loadedFast.startDate! && pc.end <= loadedFast.endDate!;
+                    })();
+                if (trendsCoveredFast) {
+                    console.log('[Store] Selection already fully loaded (incl. trends window when needed) — skipping fetch.');
+                    set({ error: null, fetchInProgress: false });
+                    return;
+                }
+            }
         }
 
         // If switching shops, save current data to cache and clear (or load from cache)
@@ -507,7 +665,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
                     loadedDateRange: cached.loadedDateRange || { startDate: null, endDate: null },
                     lastFetchShopId: shopId,
                     isLoading: false,
-                    error: null
+                    error: null,
+                    fetchInProgress: false,
                 });
 
                 if (isFresh) {
@@ -583,24 +742,30 @@ export const useShopStore = create<ShopState>((set, get) => ({
             set({
                 isLoading: false,
                 error: null,
-                fetchInProgress: true, // Mark fetch as in progress
+                fetchInProgress: silentRefresh ? false : true, // Mark fetch as in progress unless silent
                 ...(skipSyncCheck ? {} : { loadedDateRange: { startDate: null, endDate: null } }),
-                syncProgress: {
-                    isActive: true,
-                    isFirstSync: false,
-                    currentStep: 'orders',
-                    message: 'Refreshing data...',
-                    ordersComplete: false,
-                    productsComplete: false,
-                    settlementsComplete: false,
-                    ordersFetched: 0,
-                    productsFetched: 0,
-                    settlementsFetched: 0
-                }
+                ...(silentRefresh ? {} : {
+                    syncProgress: {
+                        isActive: true,
+                        isFirstSync: false,
+                        currentStep: 'orders',
+                        message: 'Refreshing data...',
+                        ordersComplete: false,
+                        productsComplete: false,
+                        settlementsComplete: false,
+                        ordersFetched: 0,
+                        productsFetched: 0,
+                        settlementsFetched: 0
+                    }
+                })
             });
         }
 
         try {
+            if (!shopId) {
+                throw new Error('Missing shop ID — open the shop from the console again.');
+            }
+
             // ============================================================
             // OPTIMIZED: Single request loads everything
             // Previously: 4 separate requests (cache-status + orders + products + settlements)
@@ -608,6 +773,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
             // ============================================================
 
             let shouldSync = false;
+            /** When includePreviousPeriod, phase 2 loads this range after phase 1 (user range) completes — avoids one huge query + fewer 520s. */
+            let previousChunk: { start: string; end: string } | null = null;
 
             // Helper to map raw order from API to store Order type
             const mapRawOrder = (o: any): Order => ({
@@ -704,26 +871,14 @@ export const useShopStore = create<ShopState>((set, get) => ({
                 console.log(`[Store] Using default ${defaultDays}-day range (${shopTimezone}): ${effectiveStartDate} to ${effectiveEndDate}`);
             }
 
-            // EXPAND RANGE FOR TRENDS if requested
-            if (includePreviousPeriod && effectiveStartDate && effectiveEndDate) {
-                const startD = new Date(effectiveStartDate);
-                const endD = new Date(effectiveEndDate);
-                const diffTime = Math.abs(endD.getTime() - startD.getTime());
-                const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1; // Inclusive days
-
-                // Previous period start = Start Date - diffDays
-                const expandedStartD = new Date(startD);
-                expandedStartD.setDate(expandedStartD.getDate() - diffDays);
-
-                // Format as YYYY-MM-DD
-                // We use the same formatter approach or simple ISO since we calculated Date object
-                const y = expandedStartD.getFullYear();
-                const m = String(expandedStartD.getMonth() + 1).padStart(2, '0');
-                const d = String(expandedStartD.getDate()).padStart(2, '0');
-                const expandedStart = `${y}-${m}-${d}`;
-
-                console.log(`[Store] Expanding date range for trends: ${expandedStart} to ${effectiveEndDate} (adding ${diffDays} days)`);
-                effectiveStartDate = expandedStart;
+            // Trends: need previous period for charts, but loading [prev+current] in one request doubles rows and often hits API timeouts (520).
+            // Phase 1 = user's range only; phase 2 = previous period (merged as a gap fetch after phase 1 completes).
+            if (includePreviousPeriod && effectiveStartDate && effectiveEndDate && !_skipPreviousChunk) {
+                const shopTz = options.timezone || 'America/Los_Angeles';
+                previousChunk = getTrendsPreviousChunk(effectiveStartDate, effectiveEndDate, shopTz);
+                console.log(
+                    `[Store] Trends: phase 1 = selected range ${effectiveStartDate}..${effectiveEndDate}; phase 2 will load previous ${previousChunk.start}..${previousChunk.end} (${shopTz})`
+                );
             }
 
             // ============================================================
@@ -732,18 +887,37 @@ export const useShopStore = create<ShopState>((set, get) => ({
             // and just update currentDateRange — the UI filters client-side via useMemo
             // ============================================================
             const loaded = get().loadedDateRange;
+            const incomplete = get().dataLoadIncomplete;
+
+            // Overview "Yesterday" uses includePreviousPeriod so Performance Comparison has Mar 24 vs Mar 25.
+            // Do NOT cache-hit if loadedDateRange never included the previous calendar window — otherwise we
+            // skip the network entirely and prev period stays 0 until the user manually picks that day.
+            const trendsPreviousPeriodCovered =
+                !includePreviousPeriod ||
+                !previousChunk ||
+                !loaded.startDate ||
+                !loaded.endDate ||
+                (previousChunk.start >= loaded.startDate && previousChunk.end <= loaded.endDate);
+
+            // `dataLoadIncomplete` + deferred loadedDateRange ensure we only cache-hit when pagination
+            // finished; switching back to a range that is already in memory should hit cache (no
+            // `dateRangeUnchanged` guard — that blocked re-selecting e.g. Mar 15 after Mar 14).
+
             if (!forceRefresh && showCached && shopId && shopId === state.lastFetchShopId &&
+                !incomplete &&
                 loaded.startDate && loaded.endDate &&
                 effectiveStartDate && effectiveEndDate &&
                 effectiveStartDate >= loaded.startDate &&
-                effectiveEndDate <= loaded.endDate) {
+                effectiveEndDate <= loaded.endDate &&
+                trendsPreviousPeriodCovered) {
                 console.log(`[Store] ✅ Date range cache HIT: requested ${effectiveStartDate}..${effectiveEndDate} is within loaded ${loaded.startDate}..${loaded.endDate}. Skipping fetch.`);
                 set({
                     currentDateRange: {
                         startDate: startDate || effectiveStartDate,
                         endDate: endDate || effectiveEndDate
                     },
-                    fetchInProgress: false
+                    fetchInProgress: false,
+                    error: null,
                 });
                 return;
             }
@@ -757,34 +931,44 @@ export const useShopStore = create<ShopState>((set, get) => ({
                 loaded.startDate && loaded.endDate &&
                 effectiveStartDate && effectiveEndDate) {
                 // Case 1: Need earlier data (requested start is before loaded start)
-                if (effectiveStartDate < loaded.startDate && effectiveEndDate >= loaded.startDate) {
-                    gapStartDate = effectiveStartDate;
-                    // Fetch up to the day before our loaded start to avoid overlap
-                    const gapEnd = new Date(loaded.startDate);
-                    gapEnd.setDate(gapEnd.getDate() - 1);
-                    const gy = gapEnd.getFullYear();
-                    const gm = String(gapEnd.getMonth() + 1).padStart(2, '0');
-                    const gd = String(gapEnd.getDate()).padStart(2, '0');
-                    gapEndDate = `${gy}-${gm}-${gd}`;
-                    isGapFetch = true;
-                    console.log(`[Store] 🔄 Date range cache PARTIAL HIT: need earlier data ${gapStartDate}..${gapEndDate}`);
+                if (effectiveStartDate < loaded.startDate) {
+                    if (effectiveEndDate >= loaded.startDate) {
+                        gapStartDate = effectiveStartDate;
+                        gapEndDate = addDaysToISODate(loaded.startDate, -1);
+                        isGapFetch = true;
+                        console.log(`[Store] 🔄 Date range cache PARTIAL HIT: need earlier data ${gapStartDate}..${gapEndDate}`);
+                    } else {
+                        // Wholly before loaded range (trends phase 2: previous period ends the day before current period starts)
+                        gapStartDate = effectiveStartDate;
+                        gapEndDate = effectiveEndDate;
+                        isGapFetch = true;
+                        console.log(
+                            `[Store] 🔄 Date range cache PARTIAL HIT: need earlier data (non-overlapping) ${gapStartDate}..${gapEndDate}`
+                        );
+                    }
                 }
                 // Case 2: Need later data (requested end is after loaded end)
-                else if (effectiveEndDate > loaded.endDate && effectiveStartDate <= loaded.endDate) {
-                    // Fetch from the day after our loaded end to avoid overlap
-                    const gapStart = new Date(loaded.endDate);
-                    gapStart.setDate(gapStart.getDate() + 1);
-                    const gy = gapStart.getFullYear();
-                    const gm = String(gapStart.getMonth() + 1).padStart(2, '0');
-                    const gd = String(gapStart.getDate()).padStart(2, '0');
-                    gapStartDate = `${gy}-${gm}-${gd}`;
-                    gapEndDate = effectiveEndDate;
-                    isGapFetch = true;
-                    console.log(`[Store] 🔄 Date range cache PARTIAL HIT: need later data ${gapStartDate}..${gapEndDate}`);
+                else if (effectiveEndDate > loaded.endDate) {
+                    if (effectiveStartDate <= loaded.endDate) {
+                        // Overlap: fetch from day after loaded end through requested end
+                        gapStartDate = addDaysToISODate(loaded.endDate, 1);
+                        gapEndDate = effectiveEndDate;
+                        isGapFetch = true;
+                        console.log(`[Store] 🔄 Date range cache PARTIAL HIT: need later data ${gapStartDate}..${gapEndDate}`);
+                    } else {
+                        // Entire selection is after the loaded window (e.g. loaded through Mar 15, user picks Mar 16 only).
+                        // Without this branch, isGapFetch stayed false → full fetch replaced all orders and trends phase-2 could desync.
+                        gapStartDate = effectiveStartDate;
+                        gapEndDate = effectiveEndDate;
+                        isGapFetch = true;
+                        console.log(
+                            `[Store] 🔄 Date range cache PARTIAL HIT: need later data (after loaded window) ${gapStartDate}..${gapEndDate}`
+                        );
+                    }
                 }
-                // Case 3: Completely outside loaded range — full fetch
+                // Fallback: no gap rule matched — full fetch for this range (e.g. edge overlap with incomplete cache)
                 else {
-                    console.log(`[Store] ❌ Date range cache MISS: requested ${effectiveStartDate}..${effectiveEndDate} outside loaded ${loaded.startDate}..${loaded.endDate}`);
+                    console.log(`[Store] ❌ Date range cache MISS: requested ${effectiveStartDate}..${effectiveEndDate} vs loaded ${loaded.startDate}..${loaded.endDate}`);
                 }
             }
 
@@ -804,16 +988,19 @@ export const useShopStore = create<ShopState>((set, get) => ({
                     const userDays = startDate && endDate
                         ? Math.ceil((new Date(endDate).getTime() - new Date(startDate).getTime()) / 86400000) + 1
                         : (initialLoadDays || DEFAULT_LOAD_DAYS);
+                    const dayPhrase = userDays === 1 ? '1 day' : `${userDays} days`;
                     return {
                         isFetchingDateRange: true,
-                        fetchInProgress: true,
+                        fetchInProgress: silentRefresh ? false : true,
                         dataLoadIncomplete: false,
                         fetchDateRange: { startDate: effectiveStartDate, endDate: effectiveEndDate },
-                        syncProgress: {
-                            ...s.syncProgress,
-                            isActive: true,
-                            message: `Loading ${userDays} days of data...`
-                        }
+                        ...(silentRefresh ? {} : {
+                            syncProgress: {
+                                ...s.syncProgress,
+                                isActive: true,
+                                message: `Loading ${dayPhrase} of data...`
+                            }
+                        })
                     };
                 });
 
@@ -826,13 +1013,20 @@ export const useShopStore = create<ShopState>((set, get) => ({
                 let shopDataUrl = `${API_BASE_URL}/api/tiktok-shop/shop-data/${accountId}?shopId=${shopId}`;
                 shopDataUrl += `&startDate=${fetchStartDate}&endDate=${fetchEndDate}`;
                 console.log(`[Store] Fetching shop data: ${fetchStartDate} to ${fetchEndDate}${isGapFetch ? ' (GAP FETCH)' : ''}`);
-                const result = await fetch(shopDataUrl).then(r => r.json());
+                const shopDataResponse = await shopApi(shopDataUrl);
+                const result = await shopDataResponse.json().catch(() => ({} as { success?: boolean; error?: string }));
 
+                if (!shopDataResponse.ok) {
+                    throw new Error(result.error || `Could not load shop data (HTTP ${shopDataResponse.status})`);
+                }
                 if (!result.success) {
                     throw new Error(result.error || 'Failed to load shop data');
                 }
 
                 const { orders: rawOrders, products: rawProducts, settlements: rawSettlements, metrics: serverMetrics, cache_status: cacheStatus, hasMoreOrders, totalOrders: totalOrderCount, nextCursor: serverNextCursor } = result.data;
+
+                /** Set true when we must finish cursor pagination before claiming loadedDateRange for this request. */
+                let deferLoadedRangeUntilPagination = false;
 
                 shouldSync = (cacheStatus?.should_prompt_user || forceRefresh) && !skipSyncCheck;
 
@@ -879,21 +1073,22 @@ export const useShopStore = create<ShopState>((set, get) => ({
                         console.log(`[Store] Gap fetch returned 0 orders for ${fetchStartDate}..${fetchEndDate} (beyond ${DEFAULT_SYNC_DAYS}-day window). Triggering on-demand TikTok sync...`);
 
                         // Show syncing indicator
-                        set(s => ({
-                            syncProgress: {
-                                ...s.syncProgress,
-                                isActive: true,
-                                currentStep: 'orders',
-                                message: `Fetching historical data (${fetchStartDate} to ${fetchEndDate})...`,
-                                ordersComplete: false
-                            }
-                        }));
+                        if (!silentRefresh) {
+                            set(s => ({
+                                syncProgress: {
+                                    ...s.syncProgress,
+                                    isActive: true,
+                                    currentStep: 'orders',
+                                    message: `Fetching historical data (${fetchStartDate} to ${fetchEndDate})...`,
+                                    ordersComplete: false
+                                }
+                            }));
+                        }
 
                         try {
                             // Sync from TikTok for this specific date range
-                            const syncResp = await fetch(`${API_BASE_URL}/api/tiktok-shop/sync/${accountId}`, {
+                            const syncResp = await shopApi(`${API_BASE_URL}/api/tiktok-shop/sync/${accountId}`, {
                                 method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
                                 body: JSON.stringify({ shopId, syncType: 'orders', startDate: fetchStartDate, endDate: fetchEndDate })
                             });
                             const syncResult = await syncResp.json();
@@ -902,7 +1097,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
 
                             // Re-read from Supabase now that data is there
                             if (fetched > 0) {
-                                const retryResult = await fetch(shopDataUrl).then(r => r.json());
+                                const retryResult = await shopApi(shopDataUrl).then(r => r.json());
                                 if (retryResult.success) {
                                     orders = (retryResult.data.orders || []).map(mapRawOrder);
                                     statements = (retryResult.data.settlements || []).map((s: any) => ({
@@ -953,13 +1148,38 @@ export const useShopStore = create<ShopState>((set, get) => ({
                     console.log(`[Store] Gap fetch merge: +${newUniqueOrders.length} orders, +${newUniqueStatements.length} statements, ${mergedProducts.length} products total`);
                 } else {
                     mergedProducts = products;
-                    mergedOrders = orders;
                     mergedStatements = statements;
+
+                    // PRESERVE RECENT REAL-TIME ORDERS:
+                    // If a realtime order was merged while this fetch was in-flight, it would be in get().orders
+                    // but possibly missing or older in the newly fetched `orders` array.
+                    const currentOrders = get().orders;
+                    const fetchedOrderMap = new Map(orders.map(o => [o.order_id, o]));
+                    
+                    for (const co of currentOrders) {
+                        const fetched = fetchedOrderMap.get(co.order_id);
+                        // Check if the currently displayed store order was updated recently (within last 10 mins)
+                        const isRecentlyUpdated = co.update_time && co.update_time > (Date.now() / 1000 - 600);
+                        
+                        if (isRecentlyUpdated) {
+                            if (!fetched || (co.update_time || 0) > (fetched.update_time || 0)) {
+                                fetchedOrderMap.set(co.order_id, co);
+                            }
+                        }
+                    }
+                    
+                    mergedOrders = Array.from(fetchedOrderMap.values()).sort((a, b) => {
+                        const aTime = a.paid_time || a.created_time || 0;
+                        const bTime = b.paid_time || b.created_time || 0;
+                        return bTime - aTime;
+                    });
                 }
 
+                const hasPreservedRealtimeOrders = !isGapFetch && mergedOrders.length !== orders.length;
+
                 const metrics: ShopMetrics = {
-                    totalOrders: isGapFetch ? mergedOrders.length : (serverMetrics?.totalOrders || orders.length),
-                    totalRevenue: isGapFetch
+                    totalOrders: (isGapFetch || hasPreservedRealtimeOrders) ? mergedOrders.length : (serverMetrics?.totalOrders || orders.length),
+                    totalRevenue: (isGapFetch || hasPreservedRealtimeOrders)
                         ? mergedOrders.reduce((sum: number, o: Order) => sum + calculateOrderGMV(o), 0)
                         : (serverMetrics?.totalRevenue || orders.reduce((sum: number, o: Order) => sum + calculateOrderGMV(o), 0)),
                     totalProducts: serverMetrics?.totalProducts || mergedProducts.length,
@@ -971,14 +1191,28 @@ export const useShopStore = create<ShopState>((set, get) => ({
                     shopRating: state.metrics.shopRating || 0
                 };
 
-                // Compute the new loaded date range (union of old and new)
+                // Full fetch: loaded range is exactly this request's effective range (replaces orders for that slice).
+                // Gap fetch: union with previous — only in that case may prev extend beyond effective.
+                // (Old bug: unioning prev.endDate forward kept e.g. Mar 26 after a Mar 14–15-only fetch → false cache HIT for Mar 16.)
                 const prevLoaded = get().loadedDateRange;
-                const newLoadedStart = prevLoaded.startDate && prevLoaded.startDate < (effectiveStartDate || '')
-                    ? prevLoaded.startDate
-                    : (effectiveStartDate || null);
-                const newLoadedEnd = prevLoaded.endDate && prevLoaded.endDate > (effectiveEndDate || '')
-                    ? prevLoaded.endDate
-                    : (effectiveEndDate || null);
+                let newLoadedStart: string | null;
+                let newLoadedEnd: string | null;
+                if (isGapFetch) {
+                    newLoadedStart =
+                        prevLoaded.startDate && prevLoaded.startDate < (effectiveStartDate || '')
+                            ? prevLoaded.startDate
+                            : effectiveStartDate || null;
+                    newLoadedEnd =
+                        prevLoaded.endDate && prevLoaded.endDate > (effectiveEndDate || '')
+                            ? prevLoaded.endDate
+                            : effectiveEndDate || null;
+                } else {
+                    newLoadedStart = effectiveStartDate || null;
+                    newLoadedEnd = effectiveEndDate || null;
+                }
+
+                /** Do not expand loadedDateRange until all paginated orders for this request are in memory — otherwise cache HIT skips fetches while charts still miss early days. */
+                deferLoadedRangeUntilPagination = Boolean(hasMoreOrders && totalOrderCount > orders.length);
 
                 // Show dashboard immediately with first batch
                 set({
@@ -1031,10 +1265,15 @@ export const useShopStore = create<ShopState>((set, get) => ({
                         startDate: startDate || effectiveStartDate || null,
                         endDate: endDate || effectiveEndDate || null
                     },
-                    loadedDateRange: {
-                        startDate: newLoadedStart,
-                        endDate: newLoadedEnd
-                    },
+                    ...(deferLoadedRangeUntilPagination
+                        ? { dataLoadIncomplete: true }
+                        : {
+                            loadedDateRange: {
+                                startDate: newLoadedStart,
+                                endDate: newLoadedEnd
+                            },
+                            dataLoadIncomplete: false
+                        }),
                     dataVersion: get().dataVersion + 1 // Increment to force UI re-render
 
                 });
@@ -1043,8 +1282,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
 
                 // STEP 2: If there are more orders, progressively load them in background batches
                 if (hasMoreOrders && totalOrderCount > orders.length) {
-                    const BATCH_SIZE = 1000;
-                    const MAX_BATCH_RETRIES = 5;   // 5 attempts with exponential backoff
+                    // Smaller batches = smaller JSON payloads; reduces Vercel/edge 520s on heavy shops
+                    const BATCH_SIZE = 500;
                     let hasMore = true;
                     // Initialize local accumulator with ALL orders (merged if gap-fetch, raw if full-fetch).
                     // CRITICAL: For gap-fetches, we must start from mergedOrders to preserve existing
@@ -1067,12 +1306,16 @@ export const useShopStore = create<ShopState>((set, get) => ({
 
                     console.log(`[Store] Progressive loading: ${totalOrderCount - accumulatedOrders.length} more orders to load (cursor: ${nextCursor})...`);
 
+                    /** True if we stopped pagination due to errors (not "no more orders") — avoid marking loadedDateRange complete. */
+                    let batchLoopExitedEarly = false;
+
                     while (hasMore) {
                         // Safety break: prevent truly runaway loops (e.g. if API always returns hasMore=true).
                         // We use a hardcoded high-water mark instead of totalOrderCount which may be a sentinel.
                         const RUNAWAY_LIMIT = Math.max(totalOrderCount * 2, 100000);
                         if (accumulatedOrders.length > RUNAWAY_LIMIT) {
                             console.warn(`[Store] Aborting fetch: Loaded ${accumulatedOrders.length} orders which exceeds safety limit of ${RUNAWAY_LIMIT}.`);
+                            batchLoopExitedEarly = true;
                             break;
                         }
 
@@ -1083,45 +1326,69 @@ export const useShopStore = create<ShopState>((set, get) => ({
                         }
                         console.log(`[Store] Fetching batch: cursor=${nextCursor}, limit=${BATCH_SIZE}`);
 
-                        // Retry loop with timeout per attempt
-                        let batchResult: any = null;
-                        let lastError: any = null;
-                        for (let attempt = 0; attempt < MAX_BATCH_RETRIES; attempt++) {
-                            if (attempt > 0) {
-                                const delay = Math.min(2000 * Math.pow(2, attempt - 1), 32000); // 2s, 4s, 8s, 16s, 32s
-                                console.log(`[Store] Retrying batch (attempt ${attempt + 1}/${MAX_BATCH_RETRIES}) after ${delay}ms...`);
-                                await new Promise(r => setTimeout(r, delay));
+                        // Inner: many retries per HTTP call. Outer: same cursor, fresh rounds after long pause (gateway cold / transient 520).
+                        const MAX_CURSOR_ROUNDS = 8;
+                        let page: { orders: any[]; hasMore: boolean; nextCursor: string | null } | null = null;
+                        for (let round = 0; round < MAX_CURSOR_ROUNDS; round++) {
+                            if (round > 0) {
+                                const pause = Math.min(8000 * round, 120000);
+                                console.warn(
+                                    `[Store] Re-fetching same batch cursor (round ${round + 1}/${MAX_CURSOR_ROUNDS}) after ${pause}ms pause...`
+                                );
+                                await new Promise((r) => setTimeout(r, pause));
                             }
-                            try {
-                                const response = await fetchWithTimeout(batchUrl, 55000); // 55s (under Vercel 60s limit)
-                                batchResult = await response.json();
-                                lastError = null;
-                                break; // success
-                            } catch (err) {
-                                lastError = err;
-                                console.error(`[Store] Batch attempt ${attempt + 1} failed:`, err);
+                            const outcome = await fetchOrdersBatchPage(batchUrl);
+                            if (outcome.ok) {
+                                page = outcome.data;
+                                break;
                             }
                         }
 
-                        if (lastError || !batchResult || !batchResult.success) {
-                            console.error('[Store] Batch load failed after retries, stopping.');
-                            break; // exit loop — incomplete check below will catch this
+                        if (!page) {
+                            console.error('[Store] Batch failed after all retry rounds — stopping pagination (will retry on next full refresh).');
+                            batchLoopExitedEarly = true;
+                            break;
                         }
 
-                        if (!batchResult.data?.orders?.length) {
+                        if (!page.orders.length) {
                             console.log(`[Store] No more orders in batch response`);
                             hasMore = false;
                             break;
                         }
 
-                        const newOrders: Order[] = batchResult.data.orders.map(mapRawOrder);
+                        const newOrders: Order[] = page.orders.map(mapRawOrder);
 
-                        // Push new orders tightly into local accumulator
-                        accumulatedOrders = [...accumulatedOrders, ...newOrders];
-                        hasMore = batchResult.data.hasMore;
+                        // Protect real-time orders that arrived via webhook during this batch fetch wait
+                        const currentStoreOrders = get().orders;
+                        const accumulatedMap = new Map(accumulatedOrders.map(o => [o.order_id, o]));
+                        
+                        // Add the newly downloaded batch
+                        for (const o of newOrders) {
+                            accumulatedMap.set(o.order_id, o);
+                        }
+
+                        // Reconcile out-of-band live orders
+                        for (const co of currentStoreOrders) {
+                            if (!accumulatedMap.has(co.order_id)) {
+                                accumulatedMap.set(co.order_id, co); // Net-new webhook!
+                            } else {
+                                const existing = accumulatedMap.get(co.order_id)!;
+                                if ((co.update_time || 0) > (existing.update_time || 0)) {
+                                    accumulatedMap.set(co.order_id, co); // Webhook state is newer!
+                                }
+                            }
+                        }
+
+                        // Re-sort tightly to preserve UI continuity
+                        accumulatedOrders = Array.from(accumulatedMap.values()).sort((a, b) => {
+                            const aTime = a.paid_time || a.created_time || 0;
+                            const bTime = b.paid_time || b.created_time || 0;
+                            return bTime - aTime;
+                        });
+                        hasMore = page.hasMore;
 
                         // Update cursor for next batch from server response
-                        nextCursor = batchResult.data.nextCursor || null;
+                        nextCursor = page.nextCursor;
 
                         console.log(`[Store] Batch loaded: ${newOrders.length} orders, hasMore=${hasMore}, total so far=${accumulatedOrders.length}/${totalOrderCount}, nextCursor=${nextCursor}`);
 
@@ -1138,16 +1405,18 @@ export const useShopStore = create<ShopState>((set, get) => ({
                                 totalRevenue: updatedRevenue,
                                 avgOrderValue: updatedAvg
                             },
-                            syncProgress: {
-                                ...s.syncProgress,
-                                ordersFetched: accumulatedOrders.length,
-                                message: hasMore
-                                    ? (totalOrderCount ? `Loading data: ${accumulatedOrders.length}/${totalOrderCount}...` : `Loading data: ${accumulatedOrders.length}...`)
-                                    : `Loaded all ${accumulatedOrders.length} orders`,
-                                currentStep: hasMore ? 'orders' : 'complete',
-                                ordersComplete: !hasMore,
-                                isActive: hasMore
-                            }
+                            ...(silentRefresh ? {} : {
+                                syncProgress: {
+                                    ...s.syncProgress,
+                                    ordersFetched: accumulatedOrders.length,
+                                    message: hasMore
+                                        ? (totalOrderCount ? `Loading data: ${accumulatedOrders.length}/${totalOrderCount}...` : `Loading data: ${accumulatedOrders.length}...`)
+                                        : `Loaded all ${accumulatedOrders.length} orders`,
+                                    currentStep: hasMore ? 'orders' : 'complete',
+                                    ordersComplete: !hasMore,
+                                    isActive: hasMore
+                                }
+                            })
                         }));
 
                         console.log(`[Store] Progressive load: ${accumulatedOrders.length}/${totalOrderCount} orders`);
@@ -1156,8 +1425,10 @@ export const useShopStore = create<ShopState>((set, get) => ({
                     // After the loop, check if we loaded fewer orders than the server reported.
                     // This covers BOTH network failures AND silent empty responses (e.g. Supabase range returning 0).
                     const finalLoaded = get().orders.length;
-                    if (finalLoaded < totalOrderCount) {
-                        console.warn(`[Store] Incomplete load: ${finalLoaded}/${totalOrderCount} orders. Flagging for user.`);
+                    if (finalLoaded < totalOrderCount || batchLoopExitedEarly) {
+                        console.warn(
+                            `[Store] Incomplete load: ${finalLoaded}/${totalOrderCount} orders.${batchLoopExitedEarly ? ' (stopped after batch errors)' : ''}`
+                        );
                         set(s => ({
                             dataLoadIncomplete: true,
                             syncProgress: {
@@ -1169,6 +1440,31 @@ export const useShopStore = create<ShopState>((set, get) => ({
                             }
                         }));
                     } else {
+                        // Pagination finished — now safe to extend loadedDateRange (cache HIT was deferred until this point)
+                        if (deferLoadedRangeUntilPagination) {
+                            let nls: string | null;
+                            let nle: string | null;
+                            if (isGapFetch) {
+                                const pl = get().loadedDateRange;
+                                nls =
+                                    pl.startDate && pl.startDate < (effectiveStartDate || '')
+                                        ? pl.startDate
+                                        : effectiveStartDate || null;
+                                nle =
+                                    pl.endDate && pl.endDate > (effectiveEndDate || '')
+                                        ? pl.endDate
+                                        : effectiveEndDate || null;
+                            } else {
+                                nls = effectiveStartDate || null;
+                                nle = effectiveEndDate || null;
+                            }
+                            console.log(`[Store] Pagination complete — updating loadedDateRange to ${nls}..${nle}`);
+                            set(s => ({
+                                loadedDateRange: { startDate: nls, endDate: nle },
+                                dataLoadIncomplete: false,
+                                dataVersion: s.dataVersion + 1
+                            }));
+                        }
                         // All orders loaded — dismiss progress bar
                         setTimeout(() => {
                             set(s => ({
@@ -1183,6 +1479,25 @@ export const useShopStore = create<ShopState>((set, get) => ({
                             syncProgress: { ...s.syncProgress, isActive: false, message: '' }
                         }));
                     }, 1500);
+                }
+
+                // Phase 2: previous calendar period for Performance Comparison — after phase-1 pagination so the
+                // selected range is fully merged before we load the comparison window (avoids 649 vs 661 style gaps).
+                // MUST use _trendsNestedFetch while outer fetch holds fetchInProgress.
+                if (previousChunk && !_skipPreviousChunk) {
+                    console.log('[Store] Phase 2: fetching previous period for trends (nested, after phase-1 pagination)...', previousChunk);
+                    await get().fetchShopData(
+                        accountId,
+                        shopId,
+                        {
+                            ...options,
+                            includePreviousPeriod: false,
+                            _skipPreviousChunk: true,
+                            _trendsNestedFetch: true,
+                        },
+                        previousChunk.start,
+                        previousChunk.end
+                    );
                 }
             }
 
@@ -1211,8 +1526,21 @@ export const useShopStore = create<ShopState>((set, get) => ({
                 syncProgress: { ...get().syncProgress, isActive: false, message: '' }
             });
         } finally {
-            // Always clear fetchInProgress flag
-            set({ fetchInProgress: false });
+            // Nested trends phase-2 must NOT clear fetchInProgress or drain the queue — outer fetch still holds the lock.
+            if (!_trendsNestedFetch) {
+                set({ fetchInProgress: false });
+                const pending = pendingShopDataRequest;
+                pendingShopDataRequest = null;
+                if (pending) {
+                    void get().fetchShopData(
+                        pending.accountId,
+                        pending.shopId,
+                        pending.options as Parameters<ShopState['fetchShopData']>[2],
+                        pending.startDate,
+                        pending.endDate
+                    );
+                }
+            }
         }
     },
 
@@ -1287,9 +1615,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
             console.log('[Sync] Starting parallel sync...');
 
             const syncFetch = (type: string) =>
-                fetch(`${API_BASE_URL}/api/tiktok-shop/sync/${accountId}`, {
+                shopApi(`${API_BASE_URL}/api/tiktok-shop/sync/${accountId}`, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ shopId, syncType: type, forceFullSync }),
                     signal
                 }).then(r => r.json());
@@ -1483,7 +1810,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
             const signal = controller.signal;
 
             const cacheStatusUrl = `${API_BASE_URL}/api/tiktok-shop/cache-status/${accountId}?shopId=${shopId}`;
-            const cacheResponse = await fetch(cacheStatusUrl, { signal });
+            const cacheResponse = await shopApi(cacheStatusUrl, { signal });
             const cacheResult = await cacheResponse.json();
 
             if (!cacheResult.success) {
@@ -1534,22 +1861,22 @@ export const useShopStore = create<ShopState>((set, get) => ({
             // Step 3: Sync each stale type sequentially and merge silently
             if (syncOrders && get().autoSyncInProgress.length > 0) {
                 try {
-                    const resp = await fetch(`${API_BASE_URL}/api/tiktok-shop/sync/${accountId}`, {
+                    const resp = await shopApi(`${API_BASE_URL}/api/tiktok-shop/sync/${accountId}`, {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ shopId, syncType: 'orders' }),
                         signal
                     });
                     const data = await resp.json();
                     const fetched = data.stats?.orders?.fetched || 0;
+                    const upserted = data.stats?.orders?.upserted || 0;
                     const syncedOrders = data.stats?.orders?.syncedOrders || [];
-                    console.log(`[AutoSync] Orders synced (${fetched} fetched, ${syncedOrders.length} returned for merge)`);
+                    console.log(`[AutoSync] Orders synced (${fetched} fetched, ${upserted} upserted, ${syncedOrders.length} returned for merge)`);
 
                     if (syncedOrders.length > 0) {
                         get().mergeSyncedOrdersIntoStore(syncedOrders, shopId);
                     }
-                    if (fetched > 0) {
-                        set({ newOrdersNotification: { count: fetched } });
+                    if (upserted > 0) {
+                        set({ newOrdersNotification: { count: upserted } });
                     }
                 } catch (e: any) {
                     console.error('[AutoSync] Orders failed:', e.message);
@@ -1558,9 +1885,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
 
             if (syncProducts && get().autoSyncInProgress.length > 0) {
                 try {
-                    const resp = await fetch(`${API_BASE_URL}/api/tiktok-shop/sync/${accountId}`, {
+                    const resp = await shopApi(`${API_BASE_URL}/api/tiktok-shop/sync/${accountId}`, {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ shopId, syncType: 'products' }),
                         signal
                     });
@@ -1578,9 +1904,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
 
             if (syncSettlements && get().autoSyncInProgress.length > 0) {
                 try {
-                    const resp = await fetch(`${API_BASE_URL}/api/tiktok-shop/sync/${accountId}`, {
+                    const resp = await shopApi(`${API_BASE_URL}/api/tiktok-shop/sync/${accountId}`, {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ shopId, syncType: 'settlements' }),
                         signal
                     });
@@ -1894,7 +2219,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
             let deltaUrl = `${API_BASE_URL}/api/tiktok-shop/shop-data-delta/${accountId}?shopId=${shopId}&since=${encodeURIComponent(sinceTimestamp)}`;
             if (types) deltaUrl += `&types=${encodeURIComponent(types)}`;
 
-            const result = await fetch(deltaUrl).then(r => r.json());
+            const result = await shopApi(deltaUrl).then(r => r.json());
 
             if (!result.success) {
                 console.warn('[MergeAfterSync] Delta fetch failed:', result.error);
@@ -2127,10 +2452,53 @@ export const useShopStore = create<ShopState>((set, get) => ({
                 totalOrders: mergedOrders.length,
                 totalRevenue,
                 avgOrderValue
-            }
+            },
+            dataVersion: get().dataVersion + 1
         });
 
         console.log(`[Store] Merged ${addedCount} historical orders. Total: ${mergedOrders.length} orders`);
+    },
+
+    /**
+     * mergeRealtimeOrder — Merge a single order from Supabase Realtime (INSERT or UPDATE)
+     * directly into the zustand store for instant UI updates.
+     */
+    mergeRealtimeOrder: (dbRow: any) => {
+        try {
+            const order = mapDbOrderToStore(dbRow);
+            console.log(`[RealtimeOrder] Merging order ${order.order_id} (status: ${order.order_status})`);
+
+            const currentOrders = get().orders;
+            const existingIdx = currentOrders.findIndex(o => o.order_id === order.order_id);
+
+            let mergedOrders: Order[];
+            if (existingIdx >= 0) {
+                // UPDATE: replace in-place
+                mergedOrders = [...currentOrders];
+                mergedOrders[existingIdx] = order;
+            } else {
+                // INSERT: prepend (newest first)
+                mergedOrders = [order, ...currentOrders];
+            }
+
+            const totalRevenue = mergedOrders.reduce((sum, o) => sum + calculateOrderGMV(o), 0);
+            const avgOrderValue = mergedOrders.length > 0 ? totalRevenue / mergedOrders.length : 0;
+
+            set(s => ({
+                orders: mergedOrders,
+                metrics: {
+                    ...s.metrics,
+                    totalOrders: mergedOrders.length,
+                    totalRevenue,
+                    avgOrderValue,
+                },
+                dataVersion: s.dataVersion + 1,
+            }));
+
+            console.log(`[RealtimeOrder] ✅ ${existingIdx >= 0 ? 'Updated' : 'Inserted'} order ${order.order_id}. Store total: ${mergedOrders.length}`);
+        } catch (error: any) {
+            console.error('[RealtimeOrder] Error merging order:', error.message);
+        }
     },
 
     updateProductCosts: async (productId: string, costs: {
@@ -2143,9 +2511,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
     }) => {
         try {
             // Use the more advanced PATCH endpoint that supports backdating
-            const response = await fetch(`${API_BASE_URL}/api/tiktok-shop/products/${productId}/costs`, {
+            const response = await shopApi(`${API_BASE_URL}/api/tiktok-shop/products/${productId}/costs`, {
                 method: 'PATCH',
-                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     accountId: costs.accountId, // Now passing accountId
                     cogs: costs.cogs,
@@ -2196,9 +2563,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
         effectiveDate?: string;
     }, accountId?: string) => {
         try {
-            const response = await fetch(`${API_BASE_URL}/api/tiktok-shop/products/${productId}/sku-costs`, {
+            const response = await shopApi(`${API_BASE_URL}/api/tiktok-shop/products/${productId}/sku-costs`, {
                 method: 'PATCH',
-                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     accountId,
                     skuId,
@@ -2247,9 +2613,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
 
     activateProducts: async (accountId: string, productIds: string[]) => {
         try {
-            const response = await fetch(`${API_BASE_URL}/api/tiktok-shop/products/tiktok-activate`, {
+            const response = await shopApi(`${API_BASE_URL}/api/tiktok-shop/products/tiktok-activate`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ accountId, productIds })
             });
 
@@ -2269,9 +2634,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
 
     deactivateProducts: async (accountId: string, productIds: string[]) => {
         try {
-            const response = await fetch(`${API_BASE_URL}/api/tiktok-shop/products/tiktok-deactivate`, {
+            const response = await shopApi(`${API_BASE_URL}/api/tiktok-shop/products/tiktok-deactivate`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ accountId, productIds })
             });
 
@@ -2291,9 +2655,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
 
     deleteProducts: async (accountId: string, productIds: string[]) => {
         try {
-            const response = await fetch(`${API_BASE_URL}/api/tiktok-shop/products/tiktok-delete`, {
+            const response = await shopApi(`${API_BASE_URL}/api/tiktok-shop/products/tiktok-delete`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ accountId, productIds })
             });
 
@@ -2313,9 +2676,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
 
     editProduct: async (accountId: string, productId: string, updates: ProductEditData) => {
         try {
-            const response = await fetch(`${API_BASE_URL}/api/tiktok-shop/products/${productId}/partial-edit`, {
+            const response = await shopApi(`${API_BASE_URL}/api/tiktok-shop/products/${productId}/partial-edit`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ accountId, ...updates })
             });
 
@@ -2345,9 +2707,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
 
     updateProductInventory: async (accountId: string, productId: string, skus: Array<{ id: string; inventory: Array<{ warehouse_id: string; quantity: number }> }>) => {
         try {
-            const response = await fetch(`${API_BASE_URL}/api/tiktok-shop/products/${productId}/inventory`, {
+            const response = await shopApi(`${API_BASE_URL}/api/tiktok-shop/products/${productId}/inventory`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ accountId, skus })
             });
 
@@ -2394,9 +2755,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
 
     updateProductPrices: async (accountId: string, productId: string, skus: Array<{ id: string; original_price?: string; sale_price?: string }>) => {
         try {
-            const response = await fetch(`${API_BASE_URL}/api/tiktok-shop/products/${productId}/prices`, {
+            const response = await shopApi(`${API_BASE_URL}/api/tiktok-shop/products/${productId}/prices`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ accountId, skus })
             });
 
@@ -2445,9 +2805,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
 
     uploadProductImage: async (accountId: string, imageData: string, fileName: string = 'image.jpg', useCase: 'MAIN_IMAGE' | 'SKU_IMAGE' = 'MAIN_IMAGE') => {
         try {
-            const response = await fetch(`${API_BASE_URL}/api/tiktok-shop/images/upload`, {
+            const response = await shopApi(`${API_BASE_URL}/api/tiktok-shop/images/upload`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ accountId, imageData, fileName, useCase })
             });
 
@@ -2465,7 +2824,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
 
     fetchWarehouses: async (accountId: string) => {
         try {
-            const response = await fetch(`${API_BASE_URL}/api/tiktok-shop/warehouses/${accountId}`);
+            const response = await shopApi(`${API_BASE_URL}/api/tiktok-shop/warehouses/${accountId}`);
             const data = await response.json();
 
             if (!data.success) {
@@ -2617,7 +2976,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
         }
     },
 
-    fetchPLData: async (accountId: string, shopId: string, startDate: string, endDate: string, forceRefresh: boolean = false, timezone: string = 'America/Los_Angeles') => {
+    fetchPLData: async (accountId: string, shopId: string, startDate: string, endDate: string, forceRefresh: boolean = false, _timezone: string = 'America/Los_Angeles') => {
         const key = `${accountId}:${shopId}:${startDate}:${endDate}`;
 
         // If we already have data for this exact key and not forcing refresh, skip
@@ -2633,12 +2992,14 @@ export const useShopStore = create<ShopState>((set, get) => ({
         set({ plError: null });
 
         try {
-            const shopTimezone = timezone;
-            const startUnix = getShopDayStartTimestamp(startDate, shopTimezone);
-            const endUnix = getShopDayStartTimestamp(endDate, shopTimezone) + 86400;
+            const range = getUtcCalendarRangeExclusiveUnix(startDate, endDate);
+            if (!range) {
+                set({ plError: 'Invalid date range for P&L', plLoading: false });
+                return;
+            }
 
-            const url = `${API_BASE_URL}/api/tiktok-shop/finance/pl-data/${accountId}?shopId=${shopId}&startDate=${startUnix}&endDate=${endUnix}`;
-            const response = await fetch(url);
+            const url = `${API_BASE_URL}/api/tiktok-shop/finance/pl-data/${accountId}?shopId=${shopId}&startDate=${range.start}&endDate=${range.endExclusive}`;
+            const response = await shopApi(url);
             const result = await response.json();
 
             if (result.success) {

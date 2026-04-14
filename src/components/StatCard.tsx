@@ -1,5 +1,5 @@
 import { LucideIcon, RefreshCw } from 'lucide-react';
-import { useState, memo, useCallback } from 'react';
+import { useState, useCallback } from 'react';
 
 interface StatCardProps {
   title: string;
@@ -51,7 +51,7 @@ export function StatCard({ title, value, subValue, change, icon: Icon, iconColor
         {showChange && (
           <div className={`flex items-center gap-1 px-2 py-1 rounded-lg text-sm font-semibold ${isPositive ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'
             }`}>
-            <span>{isPositive ? '+' : ''}{change.toFixed(1)}%</span>
+            <span>{isPositive ? '+' : ''}{change.toFixed(2)}%</span>
           </div>
         )}
       </div>

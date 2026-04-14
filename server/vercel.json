@@ -1,14 +1,12 @@
 {
     "version": 2,
-    "functions": {
-        "src/index.ts": {
-            "maxDuration": 60
-        }
-    },
     "builds": [
         {
             "src": "src/index.ts",
-            "use": "@vercel/node"
+            "use": "@vercel/node",
+            "config": {
+                "maxDuration": 300
+            }
         }
     ],
     "rewrites": [
@@ -19,12 +17,12 @@
     ],
     "crons": [
         {
-            "path": "/api/tiktok-shop/sync/cron",
-            "schedule": "0 0 * * *"
+            "path": "/api/tiktok-shop/sync/cron-settlements",
+            "schedule": "0 7 * * *"
         },
         {
-            "path": "/api/tiktok-shop/sync/refresh-tokens",
-            "schedule": "0 12 * * *"
+            "path": "/api/reports/cron-dashboard-digests",
+            "schedule": "45 8 * * *"
         }
     ]
 }

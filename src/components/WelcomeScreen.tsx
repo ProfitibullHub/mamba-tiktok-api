@@ -41,12 +41,13 @@ export default function WelcomeScreen({ onConnect, onConnectAgency, onSkip, isCo
     return (
         <div className="fixed inset-0 z-50 bg-gradient-to-br from-gray-900 via-purple-900 to-pink-900 flex items-center justify-center p-6 overflow-hidden">
             <div className="absolute top-6 right-6 z-10 flex gap-3">
-                {profile?.role === 'admin' && onSkip && (
+                {onSkip && (
                     <button
+                        type="button"
                         onClick={onSkip}
                         className="px-4 py-2 bg-white/10 hover:bg-white/20 text-white rounded-lg transition-all border border-white/20 backdrop-blur-sm text-sm font-medium"
                     >
-                        Skip to Dashboard
+                        Continue without connecting
                     </button>
                 )}
                 <button
@@ -64,9 +65,7 @@ export default function WelcomeScreen({ onConnect, onConnectAgency, onSkip, isCo
                     <div className="inline-flex items-center justify-center w-20 h-20 bg-gradient-to-r from-pink-500 to-red-500 rounded-2xl mb-4 shadow-lg shadow-pink-500/20">
                         <Store className="w-10 h-10 text-white" />
                     </div>
-                    <h1 className="text-5xl font-bold text-white mb-4 tracking-tight">
-                        Welcome to Mamba! 🎉
-                    </h1>
+                    <h1 className="text-5xl font-bold text-white mb-4 tracking-tight">Welcome to Mamba</h1>
                     <p className="text-xl text-gray-300">
                         Hi {profile?.full_name || 'there'}! Let's connect your TikTok Shop to get started.
                     </p>

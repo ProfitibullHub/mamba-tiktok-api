@@ -8,18 +8,21 @@
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit -p tsconfig.app.json"
+    "typecheck": "tsc --noEmit -p tsconfig.app.json",
+    "generate:sow-pdf": "node scripts/generate-sow-implementation-pdf.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.4",
     "@tanstack/react-query": "^5.90.12",
     "axios": "^1.13.2",
+    "date-fns": "^4.1.0",
     "file-saver": "^2.0.5",
     "jspdf": "^4.1.0",
     "jspdf-autotable": "^5.0.7",
     "lucide-react": "^0.344.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
+    "react-router-dom": "^7.13.2",
     "recharts": "^3.7.0",
     "xlsx": "^0.18.5",
     "zustand": "^5.0.9"

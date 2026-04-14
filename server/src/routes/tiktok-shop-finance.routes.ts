@@ -22,6 +22,26 @@ const handleApiError = (res: express.Response, error: any) => {
 };
 
 /**
+ * Statement-level settlement (matches TikTok Seller Center "Total settlement amount").
+ * `net_amount` on `shop_settlements` can be wrong if a legacy trigger overwrites it; the
+ * sync stores the API value on `settlement_data.settlement_amount`.
+ */
+function pickStatementSettlementAmount(s: any): number {
+    const raw = s.settlement_data?.settlement_amount;
+    if (raw !== undefined && raw !== null && raw !== '') {
+        const n = parseFloat(String(raw));
+        if (!Number.isNaN(n)) return n;
+    }
+    const ts = s.transaction_summary;
+    if (ts && ts.transaction_count > 0 && ts.total_settlement != null && ts.total_settlement !== '') {
+        const n = parseFloat(String(ts.total_settlement));
+        if (!Number.isNaN(n)) return n;
+    }
+    const fallback = parseFloat(String(s.net_amount ?? '0'));
+    return Number.isNaN(fallback) ? 0 : fallback;
+}
+
+/**
  * GET /api/tiktok-shop/finance/statements/:accountId
  */
 router.get('/statements/:accountId', async (req, res) => {
@@ -92,6 +112,31 @@ router.get('/withdrawals/:accountId', async (req, res) => {
         const data = await tiktokShopApi.getWithdrawals(shop.access_token, shop.shop_cipher, apiParams);
 
         res.json({ success: true, data });
+    } catch (error) {
+        handleApiError(res, error);
+    }
+});
+
+/**
+ * GET /api/tiktok-shop/finance/transactions/:accountId/:statementId/tiktok-envelope
+ *
+ * Same as TikTok GET /finance/202501/statements/{statement_id}/statement_transactions:
+ * returns the full envelope { code, message, data, request_id } (not only data).
+ */
+router.get('/transactions/:accountId/:statementId/tiktok-envelope', async (req, res) => {
+    try {
+        const { accountId, statementId } = req.params;
+        const { shopId, ...query } = req.query;
+
+        const shop = await getShopWithToken(accountId, shopId as string);
+        const envelope = await tiktokShopApi.getStatementTransactionsEnvelope(
+            shop.access_token,
+            shop.shop_cipher,
+            statementId,
+            query
+        );
+
+        res.json({ success: true, tiktok: envelope });
     } catch (error) {
         handleApiError(res, error);
     }
@@ -212,7 +257,7 @@ router.get('/transactions/order/:accountId/:orderId', async (req, res) => {
  * GET /api/tiktok-shop/finance/pl-data/:accountId
  *
  * Returns aggregated P&L data from synced statement transactions.
- * Query params: shopId, startDate (unix seconds), endDate (unix seconds)
+ * Query params: shopId, startDate (unix seconds, inclusive), endDate (unix seconds, exclusive upper bound)
  */
 router.get('/pl-data/:accountId', async (req, res) => {
     try {
@@ -245,7 +290,7 @@ router.get('/pl-data/:accountId', async (req, res) => {
             }
             if (endDate) {
                 const endISO = new Date(Number(endDate) * 1000).toISOString();
-                query = query.lte('settlement_time', endISO);
+                query = query.lt('settlement_time', endISO);
             }
             return query;
         };
@@ -257,7 +302,7 @@ router.get('/pl-data/:accountId', async (req, res) => {
         const fullQuery = applyDateFilters(
             supabase
                 .from('shop_settlements')
-                .select('settlement_id, settlement_time, net_amount, total_amount, fee_amount, adjustment_amount, shipping_fee, net_sales_amount, currency, transaction_summary, transactions_synced_at')
+                .select('settlement_id, settlement_time, net_amount, total_amount, fee_amount, adjustment_amount, shipping_fee, net_sales_amount, currency, transaction_summary, transactions_synced_at, settlement_data')
                 .in('shop_id', shopIds)
         );
 
@@ -272,7 +317,7 @@ router.get('/pl-data/:accountId', async (req, res) => {
             const basicQuery = applyDateFilters(
                 supabase
                     .from('shop_settlements')
-                    .select('settlement_id, settlement_time, net_amount, total_amount, fee_amount, adjustment_amount, shipping_fee, net_sales_amount, currency')
+                    .select('settlement_id, settlement_time, net_amount, total_amount, fee_amount, adjustment_amount, shipping_fee, net_sales_amount, currency, settlement_data')
                     .in('shop_id', shopIds)
             );
 
@@ -297,7 +342,7 @@ router.get('/pl-data/:accountId', async (req, res) => {
         // Statement-level totals for validation
         const statementTotals = {
             total_revenue: settlements.reduce((sum, s) => sum + parseFloat(s.total_amount || '0'), 0),
-            total_settlement: settlements.reduce((sum, s) => sum + parseFloat(s.net_amount || '0'), 0),
+            total_settlement: settlements.reduce((sum, s) => sum + pickStatementSettlementAmount(s), 0),
             total_fees: settlements.reduce((sum, s) => sum + parseFloat(s.fee_amount || '0'), 0),
             total_adjustments: settlements.reduce((sum, s) => sum + parseFloat(s.adjustment_amount || '0'), 0),
             total_shipping: settlements.reduce((sum, s) => sum + parseFloat(s.shipping_fee || '0'), 0),
@@ -413,7 +458,7 @@ function aggregateStatementSummaries(settlements: any[]) {
  *
  * Returns daily ad spend from settlement transaction_summary data.
  * Groups settlements by date, sums tap_shop_ads_commission and affiliate_ads_commission.
- * Query params: shopId, startDate (unix seconds), endDate (unix seconds)
+ * Query params: shopId, startDate (unix seconds, inclusive), endDate (unix seconds, exclusive)
  */
 router.get('/daily-ad-spend/:accountId', async (req, res) => {
     try {
@@ -447,7 +492,7 @@ router.get('/daily-ad-spend/:accountId', async (req, res) => {
             query = query.gte('settlement_time', new Date(Number(startDate) * 1000).toISOString());
         }
         if (endDate) {
-            query = query.lte('settlement_time', new Date(Number(endDate) * 1000).toISOString());
+            query = query.lt('settlement_time', new Date(Number(endDate) * 1000).toISOString());
         }
 
         const { data: settlements, error } = await query.order('settlement_time', { ascending: true });

@@ -53,6 +53,29 @@ export function formatShopDateTime(date: number | Date | string, timezone: strin
 }
 
 /**
+ * Live clock string (time only) in the shop timezone, e.g. "6:31:24 PM".
+ * Falls back to the browser's local timezone if `timezone` is invalid.
+ */
+export function formatShopTimeOnly(date: Date, timezone: string): string {
+  try {
+    return new Intl.DateTimeFormat('en-US', {
+      hour: 'numeric',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true,
+      timeZone: timezone,
+    }).format(date);
+  } catch {
+    return new Intl.DateTimeFormat('en-US', {
+      hour: 'numeric',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true,
+    }).format(date);
+  }
+}
+
+/**
  * Formats just the date part (MM/DD/YYYY) in specified timezone.
  * Useful for grouping or simple display.
  * 
@@ -181,6 +204,61 @@ export function getShopDayStartTimestamp(dateStr: string, timezone: string = 'Am
   return currentMs / 1000;
 }
 
+/** Previous calendar day (YYYY-MM-DD) in `timezone` for the given shop-local date. */
+export function previousCalendarDayISO(dateStr: string, timezone: string): string {
+  const startSec = getShopDayStartTimestamp(dateStr, timezone);
+  return formatShopDateISO((startSec - 1) * 1000, timezone);
+}
+
+/**
+ * Next calendar day in `timezone`. Steps forward until `formatShopDateISO` changes (DST-safe).
+ */
+export function nextCalendarDayISO(dateStr: string, timezone: string): string {
+  const startSec = getShopDayStartTimestamp(dateStr, timezone);
+  let probe = startSec + 1;
+  const maxProbe = startSec + 48 * 3600;
+  while (probe <= maxProbe && formatShopDateISO(probe * 1000, timezone) === dateStr) {
+    probe += 3600;
+  }
+  return formatShopDateISO(probe * 1000, timezone);
+}
+
+/** Unix seconds: start of the day *after* `dateStr` in the shop timezone (exclusive upper bound for range filters). */
+export function getShopDayEndExclusiveTimestamp(dateStr: string, timezone: string): number {
+  return getShopDayStartTimestamp(nextCalendarDayISO(dateStr, timezone), timezone);
+}
+
+/**
+ * Previous comparison window aligned to shop calendar days.
+ * `prevEndExclusive` matches server queries: paid_time < start of current period (no double-count at midnight).
+ */
+export function getPreviousPeriodRange(
+  startDateISO: string,
+  endDateISO: string,
+  timezone: string,
+  useHybrid: boolean = true
+): { prevStart: number; prevEndExclusive: number } {
+  const prevEndExclusive = getShopDayStartTimestamp(startDateISO, timezone);
+
+  let span = 1;
+  let d = startDateISO;
+  while (d !== endDateISO) {
+    d = nextCalendarDayISO(d, timezone);
+    span++;
+  }
+
+  let prevStartDate = startDateISO;
+  for (let i = 0; i < span; i++) {
+    prevStartDate = previousCalendarDayISO(prevStartDate, timezone);
+  }
+
+  let prevStart = getShopDayStartTimestamp(prevStartDate, timezone);
+  if (useHybrid && timezone === 'America/Los_Angeles') {
+    prevStart -= 8 * 3600;
+  }
+  return { prevStart, prevEndExclusive };
+}
+
 /**
  * ORIGINAL UTILS (Preserved for compatibility but deprecated for UI display)
  */
@@ -191,6 +269,41 @@ export function parseLocalDate(dateStr: string): Date {
 
 export function parseUTCDate(dateStr: string): Date {
   return new Date(dateStr + 'T00:00:00Z');
+}
+
+/**
+ * UTC calendar bounds for TikTok settlement `statement_time` / `settlement_time`.
+ * Those timestamps use UTC calendar midnights (e.g. 2026-02-28T00:00:00.000Z for the Feb 28 statement).
+ * P&L must filter by this calendar, not shop-local day boundaries, or the wrong statement id is included.
+ *
+ * @param startDateYmd - inclusive start (YYYY-MM-DD)
+ * @param endDateYmd - inclusive end (YYYY-MM-DD)
+ * @returns Unix seconds for `settlement_time >= start` and `settlement_time < endExclusive`, or null if invalid
+ */
+export function getUtcCalendarRangeExclusiveUnix(
+  startDateYmd: string,
+  endDateYmd: string
+): { start: number; endExclusive: number } | null {
+  if (!startDateYmd || !endDateYmd) return null;
+
+  const parse = (s: string) => {
+    const parts = s.split('-').map(Number);
+    const [y, m, d] = parts;
+    if (!y || !m || !d) return null;
+    return { y, m, d };
+  };
+
+  const pStart = parse(startDateYmd);
+  const pEnd = parse(endDateYmd);
+  if (!pStart || !pEnd) return null;
+
+  const start = Date.UTC(pStart.y, pStart.m - 1, pStart.d) / 1000;
+  const endDay = new Date(Date.UTC(pEnd.y, pEnd.m - 1, pEnd.d));
+  endDay.setUTCDate(endDay.getUTCDate() + 1);
+  const endExclusive = endDay.getTime() / 1000;
+
+  if (endExclusive <= start) return null;
+  return { start, endExclusive };
 }
 
 
@@ -245,20 +358,3 @@ export function toLocalDateString(date: Date): string {
   return `${year}-${month}-${day}`;
 }
 
-// Helper to align Previous Period calculation with Seller Center's hybrid logic.
-// Seller Center uses UTC-aligned days for historical comparisons even if the shop is in Local Time.
-// This manifests as an ~8-hour gap (UTC-8) for America/Los_Angeles shops.
-export const getPreviousPeriodRange = (currentStart: number, currentEnd: number, timezone: string, useHybrid: boolean = true) => {
-  const duration = currentEnd - currentStart;
-  let prevStart = currentStart - duration;
-  const prevEnd = currentStart; // Exclusive end of previous period is start of current
-
-  // HYBRID FIX: Seller Center uses UTC start for previous period in LA timezone.
-  // This captures an extra 8 hours of data (the gap).
-  if (useHybrid && timezone === 'America/Los_Angeles') {
-    const offsetSeconds = 8 * 3600; // 8 hours
-    prevStart = prevStart - offsetSeconds;
-  }
-
-  return { prevStart, prevEnd };
-};

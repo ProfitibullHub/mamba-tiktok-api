@@ -6,8 +6,25 @@
 import express from 'express';
 import { tiktokBusinessApi } from '../services/tiktok-business-api.service.js';
 import { supabase } from '../config/supabase.js';
+import { pollAllAdvertisers, type PollRange } from '../services/ads-polling.service.js';
+import {
+    enforceRequestAccountAccess,
+    verifyAccountIdParam,
+    enforceBodyAccountAccess,
+} from '../middleware/account-access.middleware.js';
 
 const router = express.Router();
+
+/** OAuth browser callback and cron poll have no Supabase user JWT. */
+function skipAccountAccessForPublicAdsRoutes(req: express.Request, res: express.Response, next: express.NextFunction) {
+    if (req.path === '/auth/callback' || req.path === '/poll-all') {
+        return next();
+    }
+    return enforceRequestAccountAccess(req, res, next);
+}
+
+router.use(skipAccountAccessForPublicAdsRoutes);
+router.param('accountId', verifyAccountIdParam);
 
 // Helper to handle API errors
 const handleApiError = (res: express.Response, error: any) => {
@@ -22,7 +39,7 @@ const handleApiError = (res: express.Response, error: any) => {
  * POST /api/tiktok-ads/auth/start
  * Generate authorization URL for user to connect TikTok Ads account
  */
-router.post('/auth/start', async (req, res) => {
+router.post('/auth/start', enforceBodyAccountAccess, async (req, res) => {
     try {
         const { accountId, returnUrl } = req.body;
 
@@ -1162,6 +1179,46 @@ router.get('/marketing-data/:accountId', async (req, res) => {
         });
     } catch (error) {
         handleApiError(res, error);
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CRON / POLL ENDPOINTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * POST /api/tiktok-ads/poll-all
+ *
+ * Called by Vercel Cron (and in dev by a setInterval in index.ts).
+ * Fetches today's (or last 7 days') metrics for ALL active advertisers and
+ * upserts the results into tiktok_ad_spend_daily, which triggers Supabase
+ * Realtime to notify connected frontend clients.
+ *
+ * Query param: ?range=today (default) | ?range=7d
+ *
+ * Authorization: Bearer <CRON_SECRET>  (set in environment variables)
+ */
+router.post('/poll-all', async (req, res) => {
+    // ── Auth guard ──────────────────────────────────────────────────────────
+    const cronSecret = process.env.CRON_SECRET;
+    if (cronSecret) {
+        const authHeader = req.headers.authorization || '';
+        const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+        if (token !== cronSecret) {
+            console.warn('[Ads Poll] Unauthorized poll-all request — invalid CRON_SECRET');
+            return res.status(401).json({ success: false, error: 'Unauthorized' });
+        }
+    }
+
+    const range = (req.query.range as PollRange) === '7d' ? '7d' : 'today';
+
+    try {
+        console.log(`[Ads Poll] /poll-all triggered — range=${range}`);
+        const summary = await pollAllAdvertisers(range);
+        return res.json({ success: true, ...summary });
+    } catch (err: any) {
+        console.error('[Ads Poll] /poll-all error:', err.message);
+        return res.status(500).json({ success: false, error: err.message });
     }
 });
 

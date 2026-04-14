@@ -1,0 +1,11 @@
+# ======================================
+# TIKTOK BUSINESS API (MARKETING API)
+# ======================================
+# Add these to Vercel Environment Variables
+
+TIKTOK_BUSINESS_APP_ID=7598356547388391440
+TIKTOK_BUSINESS_SECRET=67f5ed778669660c03779dfc5e292121b1ff57d3
+TIKTOK_BUSINESS_REDIRECT_URI=https://mamba-frontend.vercel.app/auth/tiktok-ads/callback
+
+# For local development, use:
+# TIKTOK_BUSINESS_REDIRECT_URI=http://localhost:5173/auth/tiktok-ads/callback

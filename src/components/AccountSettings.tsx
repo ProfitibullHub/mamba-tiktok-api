@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useAuth } from '../contexts/AuthContext';
+import { useTenantContext } from '../contexts/TenantContext';
 import { supabase } from '../lib/supabase';
 import TikTokConnect from './TikTokConnect';
 import TikTokAnalytics from './TikTokAnalytics';
@@ -12,6 +13,7 @@ interface Account {
 
 export default function AccountSettings() {
     const { user } = useAuth();
+    const { isPlatformSuperAdmin } = useTenantContext();
     const [accounts, setAccounts] = useState<Account[]>([]);
     const [selectedAccount, setSelectedAccount] = useState<string | null>(null);
     const [loading, setLoading] = useState(true);
@@ -26,17 +28,9 @@ export default function AccountSettings() {
         try {
             setLoading(true);
 
-            // Get user's profile to check role
-            const { data: profile } = await supabase
-                .from('profiles')
-                .select('role')
-                .eq('id', user?.id)
-                .single();
-
             let query = supabase.from('accounts').select('*');
 
-            // If not admin, filter by user's assigned accounts
-            if (profile?.role !== 'admin') {
+            if (!isPlatformSuperAdmin) {
                 const { data: userAccounts } = await supabase
                     .from('user_accounts')
                     .select('account_id')

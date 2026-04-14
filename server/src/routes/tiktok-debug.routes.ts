@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import { tiktokShopApi } from '../services/tiktok-shop-api.service.js';
 import { getShopWithToken } from './tiktok-shop-data.routes.js';
 import { getHistoricalStartTime } from '../config/dataRetention.js';
-import { getShopDayStartTimestamp } from '../utils/dateUtils.js';
+import { getShopDayStartTimestamp, getShopDayEndExclusiveTimestamp } from '../utils/dateUtils.js';
 
 const router = Router();
 
@@ -123,7 +123,7 @@ router.get('/raw-data/:accountId', async (req: Request, res: Response) => {
             ? getShopDayStartTimestamp(startDate, effectiveTimezone)
             : getHistoricalStartTime();
         const orderEndTime = endDate
-            ? getShopDayStartTimestamp(endDate, effectiveTimezone) + 86400
+            ? getShopDayEndExclusiveTimestamp(endDate, effectiveTimezone)
             : Math.floor(Date.now() / 1000);
 
         // ============================================================

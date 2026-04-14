@@ -4,8 +4,15 @@ import { tiktokShopApi, TikTokShopError } from '../services/tiktok-shop-api.serv
 import { supabase } from '../config/supabase.js';
 import { getTimezoneForRegion } from '../utils/timezoneMapping.js';
 import { MAX_HISTORICAL_DAYS, getHistoricalStartTime, getHistoricalStartDate, getHistoricalWindowLabel } from '../config/dataRetention.js';
+import {
+    enforceRequestAccountAccess,
+    verifyAccountIdParam,
+} from '../middleware/account-access.middleware.js';
 
 const router = Router();
+
+router.use(enforceRequestAccountAccess);
+router.param('accountId', verifyAccountIdParam);
 
 // In-memory cache for shop tokens during sync operations (prevents repeated DB queries)
 const shopTokenCache = new Map<string, { shop: any; timestamp: number }>();
@@ -707,9 +714,9 @@ router.get('/shop-data/:accountId', async (req: Request, res: Response) => {
 
         if (startDate && endDate) {
             // Convert YYYY-MM-DD dates to ISO timestamps using shop timezone
-            const { getShopDayStartTimestamp } = await import('../utils/dateUtils.js');
+            const { getShopDayStartTimestamp, getShopDayEndExclusiveTimestamp } = await import('../utils/dateUtils.js');
             const startUnix = getShopDayStartTimestamp(startDate as string, shopTimezone);
-            const endUnix = getShopDayStartTimestamp(endDate as string, shopTimezone) + 86400; // End of day
+            const endUnix = getShopDayEndExclusiveTimestamp(endDate as string, shopTimezone); // Exclusive end (next shop midnight)
 
             // Convert to ISO timestamp strings for PostgreSQL
             startTs = new Date(startUnix * 1000).toISOString();
@@ -974,9 +981,9 @@ router.get('/orders/synced/:accountId/batch', async (req: Request, res: Response
         let startTs: string;
         let endTs: string;
         if (startDate && endDate) {
-            const { getShopDayStartTimestamp } = await import('../utils/dateUtils.js');
+            const { getShopDayStartTimestamp, getShopDayEndExclusiveTimestamp } = await import('../utils/dateUtils.js');
             const startUnix = getShopDayStartTimestamp(startDate as string, shopTimezone);
-            const endUnix = getShopDayStartTimestamp(endDate as string, shopTimezone) + 86400; // End of day
+            const endUnix = getShopDayEndExclusiveTimestamp(endDate as string, shopTimezone);
             startTs = new Date(startUnix * 1000).toISOString();
             endTs = new Date(endUnix * 1000).toISOString();
         } else {
@@ -1300,9 +1307,9 @@ router.get('/orders/synced/:accountId', async (req: Request, res: Response) => {
 
         if (startDate && endDate) {
             // Convert YYYY-MM-DD dates to ISO timestamps using shop timezone
-            const { getShopDayStartTimestamp } = await import('../utils/dateUtils.js');
+            const { getShopDayStartTimestamp, getShopDayEndExclusiveTimestamp } = await import('../utils/dateUtils.js');
             const startUnix = getShopDayStartTimestamp(startDate as string, shopTimezone);
-            const endUnix = getShopDayStartTimestamp(endDate as string, shopTimezone) + 86400; // End of day
+            const endUnix = getShopDayEndExclusiveTimestamp(endDate as string, shopTimezone);
 
             // Convert to ISO timestamp strings for PostgreSQL
             startTs = new Date(startUnix * 1000).toISOString();
@@ -2996,6 +3003,115 @@ router.get('/sync/cron', async (req: Request, res: Response) => {
     }
 });
 
+/**
+ * GET /api/tiktok-shop/sync/cron-settlements
+ *
+ * Vercel Cron (Hobby: max once per day). Incremental settlement/statement sync only —
+ * pulls new statement IDs + transaction summaries without full orders/products sync.
+ *
+ * Security: set CRON_SECRET in Vercel env; Vercel sends Authorization: Bearer <CRON_SECRET>.
+ * Schedule: server/vercel.json (default 07:00 UTC — adjust for when TikTok posts daily statements).
+ */
+router.get('/sync/cron-settlements', async (req: Request, res: Response) => {
+    const authHeader = req.headers.authorization;
+    if (process.env.CRON_SECRET && authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
+        return res.status(401).json({ success: false, error: 'Unauthorized' });
+    }
+
+    try {
+        console.log('[Cron Settlements] Starting incremental statement sync for all shops...');
+
+        const { data: shops, error } = await supabase.from('tiktok_shops').select('*');
+        if (error) throw error;
+
+        if (!shops || shops.length === 0) {
+            return res.json({ success: true, message: 'No shops to sync', results: [] });
+        }
+
+        const cronNow = Date.now();
+        const ACCESS_BUFFER = 60 * 60 * 1000;
+        const REFRESH_BUFFER = 7 * 24 * 60 * 60 * 1000;
+
+        const results = await Promise.allSettled(
+            shops.map(async (shop) => {
+                try {
+                    const accessExpiry = shop.token_expires_at ? new Date(shop.token_expires_at).getTime() : 0;
+                    const refreshExpiry = shop.refresh_token_expires_at ? new Date(shop.refresh_token_expires_at).getTime() : 0;
+                    const isRefreshTokenDead = refreshExpiry > 0 && refreshExpiry < cronNow;
+                    const needsTokenRefresh =
+                        accessExpiry < cronNow ||
+                        accessExpiry - ACCESS_BUFFER < cronNow ||
+                        (refreshExpiry > 0 && refreshExpiry - REFRESH_BUFFER < cronNow && !isRefreshTokenDead);
+
+                    if (isRefreshTokenDead) {
+                        console.log(`[Cron Settlements] Shop ${shop.shop_name}: refresh token expired — skipping.`);
+                        const expiredTime = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+                        await supabase
+                            .from('tiktok_shops')
+                            .update({
+                                token_expires_at: expiredTime,
+                                refresh_token_expires_at: expiredTime,
+                                updated_at: new Date().toISOString(),
+                            })
+                            .eq('id', shop.id);
+                        return { shop_id: shop.shop_id, status: 'expired', error: 'Refresh token expired' };
+                    }
+
+                    if (needsTokenRefresh && shop.refresh_token) {
+                        console.log(`[Cron Settlements] Refreshing tokens for ${shop.shop_name}`);
+                        const tokenData = await tiktokShopApi.refreshAccessToken(shop.refresh_token);
+                        const refreshTime = new Date();
+                        await supabase
+                            .from('tiktok_shops')
+                            .update({
+                                access_token: tokenData.access_token,
+                                refresh_token: tokenData.refresh_token,
+                                token_expires_at: new Date(
+                                    refreshTime.getTime() + tokenData.access_token_expire_in * 1000
+                                ).toISOString(),
+                                refresh_token_expires_at: new Date(
+                                    refreshTime.getTime() + tokenData.refresh_token_expire_in * 1000
+                                ).toISOString(),
+                                updated_at: refreshTime.toISOString(),
+                            })
+                            .eq('id', shop.id);
+                        shop.access_token = tokenData.access_token;
+                    }
+
+                    const syncResult = await syncSettlements(shop, false);
+                    return {
+                        shop_id: shop.shop_id,
+                        status: 'success',
+                        fetched: syncResult.fetched,
+                        stoppedEarly: syncResult.stoppedEarly,
+                        partial: syncResult.partial,
+                    };
+                } catch (err: any) {
+                    console.error(`[Cron Settlements] Shop ${shop.shop_name}:`, err.message);
+                    if (err.code === 105002 || (err.message && err.message.includes('105002'))) {
+                        const expiredTime = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+                        await supabase
+                            .from('tiktok_shops')
+                            .update({
+                                token_expires_at: expiredTime,
+                                refresh_token_expires_at: expiredTime,
+                                updated_at: new Date().toISOString(),
+                            })
+                            .eq('id', shop.id);
+                    }
+                    return { shop_id: shop.shop_id, status: 'failed', error: err.message };
+                }
+            })
+        );
+
+        const payload = results.map((r) => (r.status === 'fulfilled' ? r.value : { status: 'failed', error: String(r.reason) }));
+        res.json({ success: true, results: payload });
+    } catch (error: any) {
+        console.error('[Cron Settlements] Fatal:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 // ============================================================
 // PROACTIVE TOKEN REFRESH CRON
 // ============================================================
@@ -3262,7 +3378,37 @@ async function upsertOrderBatch(
     return upsertedCount;
 }
 
-async function syncOrders(shop: any, isFirstSync: boolean = true, customStartDate?: string, customEndDate?: string): Promise<{ fetched: number; upserted: number; isIncremental: boolean; stoppedEarly?: boolean; partial?: boolean; syncedOrders?: any[] }> {
+/**
+ * Fetches a single order from TikTok by its orderId, and upserts it into the DB.
+ * Used primarily by webhooks to handle NEW orders without exhausting rate limits.
+ */
+export async function syncSingleOrder(shop: any, orderId: string): Promise<any> {
+    try {
+        console.log(`[SingleOrderSync] Fetching details for new order ${orderId}...`);
+        const response = await retryOperation(async () => {
+            return await tiktokShopApi.getOrderDetails(shop.access_token, shop.shop_cipher, [orderId]);
+        }, 3, 2000);
+        
+        const orders = response?.orders || response?.order_list || [];
+        if (orders.length > 0) {
+            const { data: allShops } = await supabase.from('tiktok_shops').select('id').eq('shop_id', shop.shop_id);
+            const shopIds = allShops?.map(s => s.id) || [shop.id];
+            
+            // Re-use the existing batch upsert helper for our single order
+            // Note: passing empty Map for productCogsMap is safe; COGS will just be null if missing
+            await upsertOrderBatch([orders[0]], shopIds, new Map());
+            console.log(`[SingleOrderSync] Successfully upserted order ${orderId}`);
+            return orders[0];
+        } else {
+            console.warn(`[SingleOrderSync] TikTok API returned no data for order ${orderId}`);
+        }
+    } catch (err: any) {
+        console.error(`[SingleOrderSync] Failed to sync order ${orderId}:`, err.message);
+    }
+    return null;
+}
+
+export async function syncOrders(shop: any, isFirstSync: boolean = true, customStartDate?: string, customEndDate?: string): Promise<{ fetched: number; upserted: number; isIncremental: boolean; stoppedEarly?: boolean; partial?: boolean; syncedOrders?: any[] }> {
     const isHistorical = !!(customStartDate && customEndDate);
     const syncMode = isHistorical ? 'HISTORICAL' : (isFirstSync ? 'FULL' : 'INCREMENTAL');
     console.log(`[${syncMode}] Syncing orders for shop ${shop.shop_name}...`);
@@ -3294,9 +3440,11 @@ async function syncOrders(shop: any, isFirstSync: boolean = true, customStartDat
                 .single();
 
             if (latestOrder?.create_time) {
-                // Use timestamp + 1 second to EXCLUDE the order we already have
-                // API uses create_time_ge (>=), so without +1 it returns the same order again
-                startTime = Math.floor(new Date(latestOrder.create_time).getTime() / 1000) + 1;
+                // Use a small overlap window to avoid missing orders created at the
+                // exact same second as the latest one we have.
+                // Upserts + smart stop prevent duplicates from growing unbounded.
+                const latestTs = Math.floor(new Date(latestOrder.create_time).getTime() / 1000);
+                startTime = Math.max(0, latestTs - 60); // 60s overlap
                 console.log(`[${syncMode}] Fetching orders CREATED after ${latestOrder.create_time}...`);
             } else {
                 // Fallback to 7 days if no data found
@@ -3518,8 +3666,19 @@ async function syncOrders(shop: any, isFirstSync: boolean = true, customStartDat
                 update_time: order.update_time ? Number(order.update_time) : undefined,
                 paid_time: order.paid_time && Number(order.paid_time) > 0 ? Number(order.paid_time) : undefined,
                 line_items: order.line_items || [],
-                buyer_info: order.buyer_info,
-                shipping_info: order.shipping_info,
+                buyer_info: order.buyer_info || {
+                    buyer_email: order.buyer_email,
+                    buyer_nickname: order.buyer_nickname,
+                    buyer_avatar: order.buyer_avatar,
+                    buyer_message: order.buyer_message
+                },
+                shipping_info: order.shipping_info || {
+                    ...order.recipient_address,
+                    tracking_number: order.tracking_number,
+                    shipping_provider: order.shipping_provider,
+                    shipping_provider_id: order.shipping_provider_id,
+                    delivery_option_name: order.delivery_option_name
+                },
                 payment_info: payment,
                 payment_method_name: order.payment_method_name,
                 shipping_type: order.shipping_type,
@@ -3709,7 +3868,7 @@ function detectFbtStatus(fullDetails: any, basicProduct: any, fbtWarehouseIds: S
 
 // Products are always fully refreshed since they can be updated anytime
 // But we accept isFirstSync for consistency with the API
-async function syncProducts(shop: any, isFirstSync: boolean = true): Promise<{ fetched: number; upserted: number; isIncremental: boolean; syncedProducts?: any[] }> {
+export async function syncProducts(shop: any, isFirstSync: boolean = true): Promise<{ fetched: number; upserted: number; isIncremental: boolean; syncedProducts?: any[] }> {
     // Products are always fully refreshed since they can be updated anytime
     // We accept isFirstSync for consistency but we always fetch all to update stock/price
     const syncMode = isFirstSync ? 'FULL' : 'REFRESH';
@@ -4006,7 +4165,7 @@ async function syncProducts(shop: any, isFirstSync: boolean = true): Promise<{ f
  * @param isFirstSync - If true, fetch all historical data; if false, use Smart Stop
  * @returns Sync statistics including fetched count, upserted count, and mode
  */
-async function syncSettlements(shop: any, isFirstSync: boolean = true): Promise<{ fetched: number; upserted: number; isIncremental: boolean; stoppedEarly?: boolean; partial?: boolean; syncedSettlements?: any[] }> {
+export async function syncSettlements(shop: any, isFirstSync: boolean = true): Promise<{ fetched: number; upserted: number; isIncremental: boolean; stoppedEarly?: boolean; partial?: boolean; syncedSettlements?: any[] }> {
     const syncMode = isFirstSync ? 'FULL' : 'INCREMENTAL';
     console.log(`[${syncMode}] Syncing settlements for shop ${shop.shop_name}...`);
     try {
@@ -4472,6 +4631,7 @@ function aggregateTransactions(transactions: any[]): any {
             credit_card_handling_fee: 0,
             affiliate_commission: 0,
             affiliate_partner_commission: 0,
+            affiliate_commission_amount_before_pit: 0,
             affiliate_ads_commission: 0,
             sfp_service_fee: 0,
             live_specials_fee: 0,
@@ -4580,8 +4740,15 @@ function aggregateTransactions(transactions: any[]): any {
         summary.fees.transaction_fee += parseAmount(fee.transaction_fee_amount);
         summary.fees.refund_administration_fee += parseAmount(fee.refund_administration_fee_amount);
         summary.fees.credit_card_handling_fee += parseAmount(fee.credit_card_handling_fee_amount);
-        summary.fees.affiliate_commission += parseAmount(fee.affiliate_commission_amount);
-        summary.fees.affiliate_partner_commission += parseAmount(fee.affiliate_partner_commission_amount);
+        summary.fees.affiliate_commission += parseAmount(
+            fee.affiliate_commission_amount ?? fee.affiliate_commission
+        );
+        summary.fees.affiliate_partner_commission += parseAmount(
+            fee.affiliate_partner_commission_amount ?? fee.affiliate_partner_commission
+        );
+        summary.fees.affiliate_commission_amount_before_pit += parseAmount(
+            fee.affiliate_commission_amount_before_pit
+        );
         summary.fees.affiliate_ads_commission += parseAmount(fee.affiliate_ads_commission_amount);
         summary.fees.sfp_service_fee += parseAmount(fee.sfp_service_fee_amount);
         summary.fees.live_specials_fee += parseAmount(fee.live_specials_fee_amount);
@@ -4596,10 +4763,14 @@ function aggregateTransactions(transactions: any[]): any {
         summary.fees.epr_pob_service_fee += parseAmount(fee.epr_pob_service_fee_amount);
         summary.fees.seller_paylater_handling_fee += parseAmount(fee.seller_paylater_handling_fee_amount);
         summary.fees.fee_per_item_sold += parseAmount(fee.fee_per_item_sold_amount);
-        summary.fees.cofunded_creator_bonus += parseAmount(fee.cofunded_creator_bonus_amount);
+        summary.fees.cofunded_creator_bonus += parseAmount(
+            fee.cofunded_creator_bonus_amount ?? fee.cofunded_creator_bonus
+        );
         summary.fees.dynamic_commission += parseAmount(fee.dynamic_commission_amount);
         summary.fees.external_affiliate_marketing_fee += parseAmount(fee.external_affiliate_marketing_fee_amount);
-        summary.fees.tap_shop_ads_commission += parseAmount(fee.tap_shop_ads_commission);
+        summary.fees.tap_shop_ads_commission += parseAmount(
+            fee.tap_shop_ads_commission_amount ?? fee.tap_shop_ads_commission
+        );
         summary.fees.shipping_fee_guarantee_service_fee += parseAmount(fee.shipping_fee_guarantee_service_fee);
         summary.fees.installation_service_fee += parseAmount(fee.installation_service_fee);
         summary.fees.campaign_resource_fee += parseAmount(fee.campaign_resource_fee);

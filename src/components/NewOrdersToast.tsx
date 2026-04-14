@@ -29,8 +29,8 @@ export function NewOrdersToast() {
 
     return (
         <div
-            className={`fixed bottom-6 right-6 z-50 flex items-center gap-3 rounded-xl bg-gray-900 px-4 py-3 shadow-xl border border-gray-700 transition-all duration-300 ${
-                visible ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-2 pointer-events-none'
+            className={`fixed top-8 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 rounded-2xl bg-gray-900/95 backdrop-blur-md px-5 py-3.5 shadow-2xl border border-gray-700/50 transition-all duration-400 ease-out ${
+                visible ? 'opacity-100 translate-y-0 scale-100' : 'opacity-0 -translate-y-4 scale-95 pointer-events-none'
             }`}
         >
             <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">

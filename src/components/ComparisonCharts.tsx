@@ -12,20 +12,11 @@ import {
 import { Order } from '../store/useShopStore';
 import { getShopDayStartTimestamp, formatShopDate, formatShopDateISO } from '../utils/dateUtils';
 import { calculateOrderGMV } from '../utils/gmvCalculations';
+import { isCancelledOrRefunded } from '../utils/orderFinancials';
 
 // Use paid_time for filtering/bucketing (matches backend which loads by paid_time)
 // Falls back to created_time for orders without paid_time
 const getOrderTs = (o: Order): number => Number(o.paid_time || o.created_time);
-
-// Helper function to detect cancelled or refunded orders
-const isCancelledOrRefunded = (order: Order): boolean => {
-    return (
-        order.order_status === 'CANCELLED' ||
-        !!order.cancel_reason ||
-        !!order.cancellation_initiator
-    );
-};
-
 
 interface ComparisonChartsProps {
     orders: Order[];
@@ -346,7 +337,8 @@ export function ComparisonCharts({
 
         if (chartType === 'pie') return `Distribution of ${metricName} across different statuses for the current period.`;
         if (percentChange === 0) return `Your ${metricName} is stable compared to the previous period.`;
-        return `Your ${metricName} shows a ${absChange}% ${trend} compared to the preceding ${daysToCompare} days(${chartData.periodLabel.previous}).`;
+        const dayWord = daysToCompare === 1 ? 'day' : 'days';
+        return `Your ${metricName} shows a ${absChange}% ${trend} compared to the preceding ${daysToCompare} ${dayWord} (${chartData.periodLabel.previous}).`;
     };
 
     // Chart Colors
@@ -411,7 +403,7 @@ export function ComparisonCharts({
                         <div className="group relative">
                             <Info size={14} className="text-gray-500 cursor-help" />
                             <div className="absolute left-0 bottom-full mb-2 w-64 bg-gray-900 border border-gray-700 p-3 rounded-lg text-xs text-gray-300 shadow-xl opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-50">
-                                Compares the last {daysToCompare} days with the preceding {daysToCompare} days.
+                                Compares the last {daysToCompare} {daysToCompare === 1 ? 'day' : 'days'} with the preceding {daysToCompare} {daysToCompare === 1 ? 'day' : 'days'}.
                                 {needsFetch && ' Historical data might be incomplete.'}
                             </div>
                         </div>

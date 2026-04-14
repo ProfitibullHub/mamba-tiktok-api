@@ -1,21 +1,21 @@
-import { useState, useMemo, useCallback } from 'react';
+import { useState, useMemo, useCallback, useEffect } from 'react';
 import { X, Package, BarChart2, Layers, Calendar, DollarSign, Check, Edit2, Loader2, Truck, Settings } from 'lucide-react';
 import { Product } from '../store/useShopStore';
 import { ProductEditModal } from './ProductEditModal';
 import { CalculationTooltip } from './CalculationTooltip';
-
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001';
+import { apiFetch } from '../lib/apiClient';
 
 interface ProductDetailsProps {
     product: Product;
     accountId: string;
     onClose: () => void;
     onCostsUpdate?: (productId: string, costs: { cogs?: number | null; shippingCost?: number | null; isFbt?: boolean; skuId?: string }) => void;
+    readOnly?: boolean;
 }
 
 type ApplyFromOption = 'today' | 'specific_date';
 
-export function ProductDetails({ product, accountId, onClose, onCostsUpdate }: ProductDetailsProps) {
+export function ProductDetails({ product, accountId, onClose, onCostsUpdate, readOnly = false }: ProductDetailsProps) {
     const [showFullDescription, setShowFullDescription] = useState(false);
     const [showEditModal, setShowEditModal] = useState(false);
 
@@ -53,6 +53,15 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate }: P
 
     // SKU-level Shipping state
     const [editingSkuShippingId, setEditingSkuShippingId] = useState<string | null>(null);
+
+    useEffect(() => {
+        if (!readOnly) return;
+        setShowEditModal(false);
+        setIsEditingCogs(false);
+        setIsEditingShipping(false);
+        setEditingSkuId(null);
+        setEditingSkuShippingId(null);
+    }, [readOnly]);
     const [skuShippingValues, setSkuShippingValues] = useState<Record<string, string>>(() => {
         const initial: Record<string, string> = {};
         product.skus?.forEach(sku => {
@@ -107,9 +116,8 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate }: P
 
         setIsSavingCogs(true);
         try {
-            const response = await fetch(`${API_BASE_URL}/api/tiktok-shop/products/${product.product_id}/costs`, {
+            const response = await apiFetch(`/api/tiktok-shop/products/${product.product_id}/costs`, {
                 method: 'PATCH',
-                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     accountId,
                     cogs: numValue,
@@ -119,7 +127,7 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate }: P
             });
 
             const data = await response.json();
-            if (!data.success) {
+            if (!response.ok || !data.success) {
                 throw new Error(data.error || 'Failed to update COGS');
             }
 
@@ -144,9 +152,8 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate }: P
 
         setIsSavingShipping(true);
         try {
-            const response = await fetch(`${API_BASE_URL}/api/tiktok-shop/products/${product.product_id}/costs`, {
+            const response = await apiFetch(`/api/tiktok-shop/products/${product.product_id}/costs`, {
                 method: 'PATCH',
-                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     accountId,
                     shipping_cost: numValue,
@@ -156,7 +163,7 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate }: P
             });
 
             const data = await response.json();
-            if (!data.success) {
+            if (!response.ok || !data.success) {
                 throw new Error(data.error || 'Failed to update shipping cost');
             }
 
@@ -182,9 +189,8 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate }: P
 
         setIsSavingSkuCogs(true);
         try {
-            const response = await fetch(`${API_BASE_URL}/api/tiktok-shop/products/${product.product_id}/sku-costs`, {
+            const response = await apiFetch(`/api/tiktok-shop/products/${product.product_id}/sku-costs`, {
                 method: 'PATCH',
-                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     accountId,
                     skuId,
@@ -193,7 +199,7 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate }: P
             });
 
             const data = await response.json();
-            if (!data.success) {
+            if (!response.ok || !data.success) {
                 throw new Error(data.error || 'Failed to update SKU COGS');
             }
 
@@ -219,9 +225,8 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate }: P
 
         setIsSavingSkuShipping(true);
         try {
-            const response = await fetch(`${API_BASE_URL}/api/tiktok-shop/products/${product.product_id}/sku-costs`, {
+            const response = await apiFetch(`/api/tiktok-shop/products/${product.product_id}/sku-costs`, {
                 method: 'PATCH',
-                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     accountId,
                     skuId,
@@ -230,7 +235,7 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate }: P
             });
 
             const data = await response.json();
-            if (!data.success) {
+            if (!response.ok || !data.success) {
                 throw new Error(data.error || 'Failed to update SKU shipping cost');
             }
 
@@ -245,23 +250,22 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate }: P
 
     // Handle fulfillment type change
     const handleFulfillmentChange = useCallback(async (type: 'fbt' | 'self') => {
+        if (readOnly) return;
         setFulfillmentType(type);
         setIsSavingFulfillment(true);
 
         try {
-            const response = await fetch(`${API_BASE_URL}/api/tiktok-shop/products/${product.product_id}/costs`, {
+            const response = await apiFetch(`/api/tiktok-shop/products/${product.product_id}/costs`, {
                 method: 'PATCH',
-                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     accountId,
-                    isFbt: type === 'fbt',
-                    // Clear shipping cost if switching to FBT (handled by TikTok)
-                    ...(type === 'fbt' ? { shippingCost: null } : {})
+                    is_fbt: type === 'fbt',
+                    ...(type === 'fbt' ? { shipping_cost: null } : {}),
                 })
             });
 
             const data = await response.json();
-            if (!data.success) {
+            if (!response.ok || !data.success) {
                 throw new Error(data.error || 'Failed to update fulfillment type');
             }
 
@@ -281,7 +285,7 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate }: P
         } finally {
             setIsSavingFulfillment(false);
         }
-    }, [product.product_id, accountId, onCostsUpdate]);
+    }, [product.product_id, accountId, onCostsUpdate, readOnly]);
 
     return (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
@@ -293,13 +297,16 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate }: P
                         <p className="text-gray-400 text-sm">ID: {product.product_id}</p>
                     </div>
                     <div className="flex items-center gap-2">
+                        {!readOnly && (
                         <button
+                            type="button"
                             onClick={() => setShowEditModal(true)}
                             className="flex items-center gap-2 px-4 py-2 bg-pink-600 hover:bg-pink-700 text-white rounded-lg transition-colors"
                         >
                             <Settings size={18} />
                             Edit Product
                         </button>
+                        )}
                         <button
                             onClick={onClose}
                             className="p-2 hover:bg-gray-800 rounded-full text-gray-400 hover:text-white transition-colors"
@@ -424,7 +431,28 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate }: P
                                 Cost of Goods Sold (COGS)
                             </h3>
                             <div className="bg-gray-800 rounded-xl p-4 border border-gray-700">
-                                {isEditingCogs ? (
+                                {readOnly ? (
+                                    <div className="flex items-center justify-between">
+                                        <div>
+                                            <p className="text-2xl font-bold text-white">
+                                                {product.cogs !== null && product.cogs !== undefined
+                                                    ? `${product.currency} ${product.cogs.toFixed(2)}`
+                                                    : <span className="text-gray-500 text-lg">Not set</span>
+                                                }
+                                            </p>
+                                            {product.cogs !== null && product.cogs !== undefined && product.price > 0 && (
+                                                <p className="text-sm text-gray-400 mt-1 flex items-center gap-1">
+                                                    Margin: {((1 - product.cogs / product.price) * 100).toFixed(1)}%
+                                                    <CalculationTooltip
+                                                        source="Calculated"
+                                                        calculation="(1 - COGS / Price) * 100"
+                                                        api="Calculated"
+                                                    />
+                                                </p>
+                                            )}
+                                        </div>
+                                    </div>
+                                ) : isEditingCogs ? (
                                     <div className="space-y-4">
                                         <div className="flex items-center gap-2">
                                             <span className="text-gray-400">{product.currency}</span>
@@ -529,6 +557,7 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate }: P
                                             )}
                                         </div>
                                         <button
+                                            type="button"
                                             onClick={() => setIsEditingCogs(true)}
                                             className="p-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg transition-colors flex items-center gap-2"
                                         >
@@ -552,12 +581,13 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate }: P
                                     <p className="text-sm text-gray-400">Fulfillment Method</p>
                                     <div className="grid grid-cols-2 gap-3">
                                         <button
+                                            type="button"
                                             onClick={() => handleFulfillmentChange('fbt')}
-                                            disabled={isSavingFulfillment}
+                                            disabled={readOnly || isSavingFulfillment}
                                             className={`p-3 rounded-lg border-2 transition-all flex flex-col items-center gap-1 ${fulfillmentType === 'fbt'
                                                 ? 'border-pink-500 bg-pink-500/10'
                                                 : 'border-gray-600 hover:border-gray-500 bg-gray-900'
-                                                }`}
+                                                } ${readOnly ? 'opacity-80 cursor-default' : ''}`}
                                         >
                                             <span className={`text-sm font-medium ${fulfillmentType === 'fbt' ? 'text-pink-400' : 'text-white'}`}>
                                                 FBT
@@ -568,12 +598,13 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate }: P
                                             )}
                                         </button>
                                         <button
+                                            type="button"
                                             onClick={() => handleFulfillmentChange('self')}
-                                            disabled={isSavingFulfillment}
+                                            disabled={readOnly || isSavingFulfillment}
                                             className={`p-3 rounded-lg border-2 transition-all flex flex-col items-center gap-1 ${fulfillmentType === 'self'
                                                 ? 'border-blue-500 bg-blue-500/10'
                                                 : 'border-gray-600 hover:border-gray-500 bg-gray-900'
-                                                }`}
+                                                } ${readOnly ? 'opacity-80 cursor-default' : ''}`}
                                         >
                                             <span className={`text-sm font-medium ${fulfillmentType === 'self' ? 'text-blue-400' : 'text-white'}`}>
                                                 Self-Fulfilled
@@ -601,7 +632,21 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate }: P
                                     </div>
                                 ) : (
                                     <>
-                                        {isEditingShipping ? (
+                                        {readOnly ? (
+                                            <div className="flex items-center justify-between">
+                                                <div>
+                                                    <p className="text-2xl font-bold text-white">
+                                                        {product.shipping_cost !== null && product.shipping_cost !== undefined
+                                                            ? `${product.currency} ${product.shipping_cost.toFixed(2)}`
+                                                            : <span className="text-gray-500 text-lg">Not set</span>
+                                                        }
+                                                    </p>
+                                                    <p className="text-xs text-gray-500 mt-1">
+                                                        Per unit cost to ship to customer
+                                                    </p>
+                                                </div>
+                                            </div>
+                                        ) : isEditingShipping ? (
                                             <div className="space-y-4">
                                                 <div className="flex items-center gap-2">
                                                     <span className="text-gray-400">{product.currency}</span>
@@ -786,7 +831,13 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate }: P
                                                             {/* COGS Display/Edit */}
                                                             <div className="flex items-center gap-2">
                                                                 <span className="text-gray-400">COGS: </span>
-                                                                {isEditingSku ? (
+                                                                {readOnly ? (
+                                                                    <span className={`font-semibold ${sku.cogs !== null && sku.cogs !== undefined ? 'text-orange-400' : 'text-gray-500'}`}>
+                                                                        {sku.cogs !== null && sku.cogs !== undefined
+                                                                            ? `${product.currency} ${sku.cogs.toFixed(2)}`
+                                                                            : 'Not set'}
+                                                                    </span>
+                                                                ) : isEditingSku ? (
                                                                     <div className="flex items-center gap-2">
                                                                         <input
                                                                             type="number"
@@ -842,7 +893,13 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate }: P
                                                             {/* Shipping Display/Edit */}
                                                             <div className="flex items-center gap-2">
                                                                 <span className="text-gray-400">Shipping: </span>
-                                                                {isEditingSkuShipping ? (
+                                                                {readOnly ? (
+                                                                    <span className={`font-semibold ${sku.shipping_cost != null ? 'text-blue-400' : 'text-gray-500'}`}>
+                                                                        {sku.shipping_cost != null
+                                                                            ? `${product.currency} ${sku.shipping_cost.toFixed(2)}`
+                                                                            : 'Not set'}
+                                                                    </span>
+                                                                ) : isEditingSkuShipping ? (
                                                                     <div className="flex items-center gap-2">
                                                                         <input
                                                                             type="number"
@@ -942,7 +999,7 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate }: P
             </div>
 
             {/* Edit Modal */}
-            {showEditModal && (
+            {!readOnly && showEditModal && (
                 <ProductEditModal
                     product={product}
                     accountId={accountId}

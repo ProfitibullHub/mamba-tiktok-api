@@ -11,18 +11,11 @@ import { ComparisonCharts } from '../ComparisonCharts';
 import { CalculationTooltip } from '../CalculationTooltip';
 import { DateRangePicker, DateRange } from '../DateRangePicker';
 import { toLocalDateString, getShopDayStartTimestamp, getDateRangeFromPreset } from '../../utils/dateUtils';
+import { useShopAccessFlags } from '../../hooks/useShopMutationAccess';
+import { isCancelledOrRefunded } from '../../utils/orderFinancials';
 
 // Use paid_time for filtering (matches backend which loads by paid_time)
 const getOrderTs = (o: Order): number => Number(o.paid_time || o.created_time);
-
-// Helper function to detect cancelled or refunded orders
-const isCancelledOrRefunded = (order: Order): boolean => {
-    return (
-        order.order_status === 'CANCELLED' ||
-        !!order.cancel_reason ||
-        !!order.cancellation_initiator
-    );
-};
 
 // Effective timestamp for date-range filtering:
 // Cancelled orders use update_time (when they were cancelled).
@@ -38,10 +31,13 @@ interface OrdersViewProps {
     account: Account;
     shopId?: string;
     timezone?: string; // Shop timezone for date calculations
+    preSelectedOrderId?: string; // Deep-link to a specific order
+    onClearSelection?: () => void;
 }
 
 
-export function OrdersView({ account, shopId, timezone = 'America/Los_Angeles' }: OrdersViewProps) {
+export function OrdersView({ account, shopId, timezone = 'America/Los_Angeles', preSelectedOrderId, onClearSelection }: OrdersViewProps) {
+    const { canSyncShop } = useShopAccessFlags(account);
     const { orders, isLoading, syncData, cacheMetadata, dataVersion, fetchShopData } = useShopStore();
     const [searchTerm, setSearchTerm] = useState('');
     const [statusFilter, setStatusFilter] = useState('all');
@@ -62,13 +58,25 @@ export function OrdersView({ account, shopId, timezone = 'America/Los_Angeles' }
     const [currentPage, setCurrentPage] = useState(1);
     const itemsPerPage = viewMode === 'list' ? 25 : 50;
 
+    // Deep-link logic: When a preSelectedOrderId arrives, find it and select it.
+    // If it's outside the current date range, adjust the range to include that day.
+    useEffect(() => {
+        if (preSelectedOrderId && orders.length > 0 && !selectedOrder) {
+            const orderToSelect = orders.find(o => o.order_id === preSelectedOrderId);
+            if (orderToSelect) {
+                setSelectedOrder(orderToSelect);
+            }
+        }
+    }, [preSelectedOrderId, orders, selectedOrder, dateRange, timezone]);
+
+
     // Load any missing data when the date range changes, including the previous period
     // so the comparison chart has data for both the current and preceding window.
     // fetchShopData's smart cache only fetches what isn't already in the store.
     useEffect(() => {
         if (!shopId) return;
-        fetchShopData(account.id, shopId, { skipSyncCheck: true, includePreviousPeriod: true }, dateRange.startDate, dateRange.endDate);
-    }, [account.id, shopId, dateRange.startDate, dateRange.endDate]);
+        fetchShopData(account.id, shopId, { skipSyncCheck: true, includePreviousPeriod: true, timezone }, dateRange.startDate, dateRange.endDate);
+    }, [account.id, shopId, dateRange.startDate, dateRange.endDate, timezone, fetchShopData]);
 
     // Shared toggles — synced with OverviewView via localStorage + custom events
     const [includeCancelledInTotal, setIncludeCancelledInTotal] = useState<boolean>(() => {
@@ -103,7 +111,7 @@ export function OrdersView({ account, shopId, timezone = 'America/Los_Angeles' }
     }, [shopId]);
 
     const handleSync = async () => {
-        if (!shopId) return;
+        if (!shopId || !canSyncShop) return;
         await syncData(account.id, shopId, 'orders');
     };
 
@@ -313,8 +321,10 @@ export function OrdersView({ account, shopId, timezone = 'America/Los_Angeles' }
                         showKanban={true}
                     />
                     <button
+                        type="button"
                         onClick={handleSync}
-                        disabled={cacheMetadata.isSyncing || isLoading}
+                        disabled={!canSyncShop || cacheMetadata.isSyncing || isLoading}
+                        title={!canSyncShop ? 'You do not have access to sync this shop' : undefined}
                         className="flex items-center space-x-2 px-4 py-2 bg-pink-600 hover:bg-pink-700 text-white rounded-lg transition-colors disabled:opacity-50"
                     >
                         <RefreshCw size={20} className={cacheMetadata.isSyncing ? "animate-spin" : ""} />
@@ -771,10 +781,19 @@ export function OrdersView({ account, shopId, timezone = 'America/Los_Angeles' }
             {/* Order Details Modal */}
             {
                 selectedOrder && (
-                    <OrderDetails
-                        order={selectedOrder}
-                        onClose={() => setSelectedOrder(null)}
-                    />
+                    <div className="fixed inset-0 z-50 flex justify-end">
+                        <div className="absolute inset-0 bg-gray-900/60 backdrop-blur-sm" onClick={() => {
+                            setSelectedOrder(null);
+                            if (onClearSelection) onClearSelection();
+                        }} />
+                        <OrderDetails
+                            order={selectedOrder}
+                            onClose={() => {
+                                setSelectedOrder(null);
+                                if (onClearSelection) onClearSelection();
+                            }}
+                        />
+                    </div>
                 )
             }
         </div >

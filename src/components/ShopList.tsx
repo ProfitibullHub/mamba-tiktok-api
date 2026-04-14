@@ -1,7 +1,6 @@
 import { Plus, ShoppingBag, MapPin, ExternalLink, RefreshCw, Trash2, User, AlertTriangle, Clock } from 'lucide-react';
 import { useState } from 'react';
-
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001';
+import { apiFetch } from '../lib/apiClient';
 
 interface TokenHealth {
     status: 'healthy' | 'warning' | 'critical' | 'expired';
@@ -32,6 +31,8 @@ interface AdminAccount {
 interface ShopListProps {
     shops: Shop[];
     adminAccounts?: AdminAccount[];
+    /** When false, never show the “All Platform Shops” admin grid (even if adminAccounts is populated). */
+    showPlatformShopExplorer?: boolean;
     currentUserId?: string;
     deletingShopId?: string | null;
     disconnectPrompt?: { shopName: string } | null;
@@ -260,16 +261,30 @@ function ShopCard({
     );
 }
 
-export function ShopList({ shops, adminAccounts, currentUserId, deletingShopId, disconnectPrompt, onDismissDisconnect, onSelectShop, onAddShop, onAddAgency, onSyncShops, onDeleteShop, isLoading, isSyncing }: ShopListProps) {
+export function ShopList({
+    shops,
+    adminAccounts,
+    showPlatformShopExplorer = false,
+    currentUserId,
+    deletingShopId,
+    disconnectPrompt,
+    onDismissDisconnect,
+    onSelectShop,
+    onAddShop,
+    onAddAgency,
+    onSyncShops,
+    onDeleteShop,
+    isLoading,
+    isSyncing,
+}: ShopListProps) {
     const [refreshingShopId, setRefreshingShopId] = useState<string | null>(null);
     const [reviveStatus, setReviveStatus] = useState<'idle' | 'refreshing' | 'reauthorizing'>('idle');
 
     const handleReauthorize = async (accountId: string) => {
         try {
             setReviveStatus('reauthorizing');
-            const response = await fetch(`${API_BASE_URL}/api/tiktok-shop/auth/start`, {
+            const response = await apiFetch(`/api/tiktok-shop/auth/start`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ accountId })
             });
             const data = await response.json();
@@ -290,9 +305,8 @@ export function ShopList({ shops, adminAccounts, currentUserId, deletingShopId, 
 
         try {
             // Step 1: Attempt to sync/refresh the shop data
-            const response = await fetch(`${API_BASE_URL}/api/tiktok-shop/sync/${shop.account_id}`, {
+            const response = await apiFetch(`/api/tiktok-shop/sync/${shop.account_id}`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ shopId: shop.shop_id, syncType: 'orders' })
             });
             const data = await response.json();
@@ -341,13 +355,14 @@ export function ShopList({ shops, adminAccounts, currentUserId, deletingShopId, 
         );
     }
 
-    const isAdmin = adminAccounts && adminAccounts.length > 0;
+    const isPlatformExplorer =
+        showPlatformShopExplorer && adminAccounts && adminAccounts.length > 0;
 
     return (
         <div className="space-y-8">
             <div className="flex justify-between items-center">
                 <h2 className="text-2xl font-bold text-white">
-                    {isAdmin ? 'All Platform Shops' : 'Your Shops'}
+                    {isPlatformExplorer ? 'All platform shops (internal admin)' : 'Shops you can access'}
                 </h2>
                 <div className="flex space-x-3">
                     <button
@@ -377,7 +392,7 @@ export function ShopList({ shops, adminAccounts, currentUserId, deletingShopId, 
                 </div>
             </div>
 
-            {isAdmin ? (
+            {isPlatformExplorer ? (
                 <div className="space-y-12">
                     {adminAccounts.filter(a => a.stores.length > 0).map((account) => (
                         <div key={account.id} className="space-y-6">

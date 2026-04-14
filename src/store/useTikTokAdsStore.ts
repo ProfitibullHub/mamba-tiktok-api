@@ -1,6 +1,12 @@
 import { create } from 'zustand';
+import { createClient } from '@supabase/supabase-js';
+import { apiFetch } from '../lib/apiClient';
+import { getUtcCalendarRangeExclusiveUnix } from '../utils/dateUtils';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001';
+// Supabase client for Realtime subscriptions (uses the same project as the main app)
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || '';
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
+const realtimeClient = createClient(supabaseUrl, supabaseAnonKey);
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -247,7 +253,9 @@ interface TikTokAdsState {
     marketingLoaded: boolean;
     marketingAccountId: string | null;
     marketingCampaigns: { active: number; total: number };
+    marketingLastPolled: number | null; // timestamp of last successful data refresh
     loadMarketingFromDB: (accountId: string) => Promise<void>;
+    subscribeToMarketingUpdates: (accountId: string) => () => void; // returns unsubscribe fn
 }
 
 // ─── Store ───────────────────────────────────────────────────────────────────
@@ -278,6 +286,7 @@ export const useTikTokAdsStore = create<TikTokAdsState>((set, get) => ({
     marketingLoaded: false,
     marketingAccountId: null,
     marketingCampaigns: { active: 0, total: 0 },
+    marketingLastPolled: null,
 
     checkConnection: async (accountId: string) => {
         try {
@@ -286,7 +295,7 @@ export const useTikTokAdsStore = create<TikTokAdsState>((set, get) => ({
                 return true;
             }
 
-            const response = await fetch(`${API_BASE_URL}/api/tiktok-ads/status/${accountId}`);
+            const response = await apiFetch(`/api/tiktok-ads/status/${accountId}`);
             const result = await response.json();
 
             if (result.success) {
@@ -320,10 +329,9 @@ export const useTikTokAdsStore = create<TikTokAdsState>((set, get) => ({
     connectTikTokAds: async (accountId: string) => {
         try {
             set({ isLoading: true, error: null });
-            const response = await fetch(`${API_BASE_URL}/api/tiktok-ads/auth/start`, {
+            const response = await apiFetch('/api/tiktok-ads/auth/start', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ accountId })
+                body: JSON.stringify({ accountId }),
             });
             const result = await response.json();
             if (result.success && result.authUrl) {
@@ -345,10 +353,9 @@ export const useTikTokAdsStore = create<TikTokAdsState>((set, get) => ({
             if (startDate) body.startDate = startDate;
             if (endDate) body.endDate = endDate;
 
-            const response = await fetch(`${API_BASE_URL}/api/tiktok-ads/sync/${accountId}`, {
+            const response = await apiFetch(`/api/tiktok-ads/sync/${accountId}`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body)
+                body: JSON.stringify(body),
             });
             const result = await response.json();
             if (!result.success) throw new Error(result.error || 'Sync failed');
@@ -372,8 +379,7 @@ export const useTikTokAdsStore = create<TikTokAdsState>((set, get) => ({
             if (startDate) params.append('startDate', startDate);
             if (endDate) params.append('endDate', endDate);
 
-            const url = `${API_BASE_URL}/api/tiktok-ads/dashboard/${accountId}?${params.toString()}`;
-            const response = await fetch(url);
+            const response = await apiFetch(`/api/tiktok-ads/dashboard/${accountId}?${params.toString()}`);
             const result = await response.json();
 
             if (result.success) {
@@ -407,7 +413,7 @@ export const useTikTokAdsStore = create<TikTokAdsState>((set, get) => ({
     loadMarketingFromDB: async (accountId: string) => {
         try {
             set({ isLoading: true, error: null });
-            const response = await fetch(`${API_BASE_URL}/api/tiktok-ads/marketing-data/${accountId}`);
+            const response = await apiFetch(`/api/tiktok-ads/marketing-data/${accountId}`);
             const result = await response.json();
 
             if (result.success) {
@@ -418,6 +424,7 @@ export const useTikTokAdsStore = create<TikTokAdsState>((set, get) => ({
                     marketingCampaigns: data.campaigns || { active: 0, total: 0 },
                     marketingLoaded: true,
                     marketingAccountId: accountId,
+                    marketingLastPolled: Date.now(),
                     isLoading: false,
                     error: null,
                 };
@@ -441,9 +448,38 @@ export const useTikTokAdsStore = create<TikTokAdsState>((set, get) => ({
         }
     },
 
+    subscribeToMarketingUpdates: (accountId: string) => {
+        console.log(`[TikTok Ads] Subscribing to Realtime updates for account ${accountId}`);
+
+        const channel = realtimeClient
+            .channel(`marketing-realtime-${accountId}`)
+            .on(
+                'postgres_changes',
+                {
+                    event: '*',
+                    schema: 'public',
+                    table: 'tiktok_ad_spend_daily',
+                    filter: `account_id=eq.${accountId}`,
+                },
+                () => {
+                    console.log(`[TikTok Ads Realtime] tiktok_ad_spend_daily changed — refreshing marketing data`);
+                    get().loadMarketingFromDB(accountId);
+                },
+            )
+            .subscribe((status) => {
+                console.log(`[TikTok Ads Realtime] Channel status:`, status);
+            });
+
+        // Return an unsubscribe function the caller can store in a useEffect cleanup
+        return () => {
+            console.log(`[TikTok Ads] Unsubscribing from Realtime for account ${accountId}`);
+            realtimeClient.removeChannel(channel);
+        };
+    },
+
     fetchGmvMaxSessions: async (accountId: string) => {
         try {
-            const response = await fetch(`${API_BASE_URL}/api/tiktok-ads/gmv-max/sessions/${accountId}`);
+            const response = await apiFetch(`/api/tiktok-ads/gmv-max/sessions/${accountId}`);
             const result = await response.json();
             if (result.success) {
                 set({ gmvMaxSessions: result.data });
@@ -459,7 +495,7 @@ export const useTikTokAdsStore = create<TikTokAdsState>((set, get) => ({
             if (startDate) params.append('startDate', startDate);
             if (endDate) params.append('endDate', endDate);
 
-            const response = await fetch(`${API_BASE_URL}/api/tiktok-ads/audience/${accountId}?${params.toString()}`);
+            const response = await apiFetch(`/api/tiktok-ads/audience/${accountId}?${params.toString()}`);
             const result = await response.json();
             if (result.success) {
                 set({ audienceData: result.data });
@@ -476,8 +512,7 @@ export const useTikTokAdsStore = create<TikTokAdsState>((set, get) => ({
             if (startDate) params.append('startDate', startDate);
             if (endDate) params.append('endDate', endDate);
 
-            const url = `${API_BASE_URL}/api/tiktok-ads/campaigns/${accountId}?${params.toString()}`;
-            const response = await fetch(url);
+            const response = await apiFetch(`/api/tiktok-ads/campaigns/${accountId}?${params.toString()}`);
             const result = await response.json();
 
             if (result.success) {
@@ -497,8 +532,7 @@ export const useTikTokAdsStore = create<TikTokAdsState>((set, get) => ({
             if (startDate) params.append('startDate', startDate);
             if (endDate) params.append('endDate', endDate);
 
-            const url = `${API_BASE_URL}/api/tiktok-ads/spend/${accountId}?${params.toString()}`;
-            const response = await fetch(url);
+            const response = await apiFetch(`/api/tiktok-ads/spend/${accountId}?${params.toString()}`);
             const result = await response.json();
 
             if (result.success) {
@@ -514,10 +548,11 @@ export const useTikTokAdsStore = create<TikTokAdsState>((set, get) => ({
 
     fetchDailySettlementSpend: async (accountId: string, shopId: string, startDate: string, endDate: string) => {
         try {
-            const startUnix = Math.floor(new Date(startDate).getTime() / 1000);
-            const endUnix = Math.floor(new Date(endDate).getTime() / 1000);
-            const url = `${API_BASE_URL}/api/tiktok-shop/finance/daily-ad-spend/${accountId}?shopId=${shopId}&startDate=${startUnix}&endDate=${endUnix}`;
-            const response = await fetch(url);
+            const range = getUtcCalendarRangeExclusiveUnix(startDate, endDate);
+            if (!range) return;
+            const response = await apiFetch(
+                `/api/tiktok-shop/finance/daily-ad-spend/${accountId}?shopId=${shopId}&startDate=${range.start}&endDate=${range.endExclusive}`,
+            );
             const result = await response.json();
 
             if (result.success) {
@@ -534,8 +569,7 @@ export const useTikTokAdsStore = create<TikTokAdsState>((set, get) => ({
             if (startDate) params.append('startDate', startDate);
             if (endDate) params.append('endDate', endDate);
 
-            const url = `${API_BASE_URL}/api/tiktok-ads/assets/${accountId}?${params.toString()}`;
-            const response = await fetch(url);
+            const response = await apiFetch(`/api/tiktok-ads/assets/${accountId}?${params.toString()}`);
             const result = await response.json();
 
             if (result.success) {
@@ -560,8 +594,7 @@ export const useTikTokAdsStore = create<TikTokAdsState>((set, get) => ({
             params.append('startDate', startDate);
             params.append('endDate', endDate);
 
-            const url = `${API_BASE_URL}/api/tiktok-ads/historical/${accountId}?${params.toString()}`;
-            const response = await fetch(url);
+            const response = await apiFetch(`/api/tiktok-ads/historical/${accountId}?${params.toString()}`);
             const result = await response.json();
 
             if (result.success) {
@@ -577,7 +610,7 @@ export const useTikTokAdsStore = create<TikTokAdsState>((set, get) => ({
 
     fetchAvailableAdvertisers: async (accountId: string) => {
         try {
-            const response = await fetch(`${API_BASE_URL}/api/tiktok-ads/advertisers/${accountId}`);
+            const response = await apiFetch(`/api/tiktok-ads/advertisers/${accountId}`);
             const result = await response.json();
             if (result.success) {
                 set({ availableAdvertisers: result.advertisers });
@@ -590,10 +623,9 @@ export const useTikTokAdsStore = create<TikTokAdsState>((set, get) => ({
     switchAdvertiser: async (accountId: string, advertiserId: string) => {
         try {
             set({ isSwitching: true, error: null });
-            const response = await fetch(`${API_BASE_URL}/api/tiktok-ads/switch-advertiser/${accountId}`, {
+            const response = await apiFetch(`/api/tiktok-ads/switch-advertiser/${accountId}`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ advertiserId })
+                body: JSON.stringify({ advertiserId }),
             });
             const result = await response.json();
             if (!result.success) throw new Error(result.error || 'Failed to switch advertiser');
@@ -613,7 +645,8 @@ export const useTikTokAdsStore = create<TikTokAdsState>((set, get) => ({
                 marketingMetrics: [],
                 marketingLoaded: false,
                 marketingAccountId: null,
-                marketingCampaigns: { active: 0, total: 0 }
+                marketingCampaigns: { active: 0, total: 0 },
+                marketingLastPolled: null,
             });
 
             await get().checkConnection(accountId);
@@ -628,7 +661,7 @@ export const useTikTokAdsStore = create<TikTokAdsState>((set, get) => ({
     disconnectTikTokAds: async (accountId: string) => {
         try {
             set({ isLoading: true, error: null });
-            const response = await fetch(`${API_BASE_URL}/api/tiktok-ads/disconnect/${accountId}`, {
+            const response = await apiFetch(`/api/tiktok-ads/disconnect/${accountId}`, {
                 method: 'DELETE',
             });
             const result = await response.json();
@@ -663,5 +696,6 @@ export const useTikTokAdsStore = create<TikTokAdsState>((set, get) => ({
         marketingLoaded: false,
         marketingAccountId: null,
         marketingCampaigns: { active: 0, total: 0 },
+        marketingLastPolled: null,
     }),
 }));

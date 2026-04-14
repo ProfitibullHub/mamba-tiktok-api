@@ -13,9 +13,11 @@ interface DateRangePickerProps {
   value: DateRange;
   onChange: (range: DateRange) => void;
   timezone?: string;
+  /** Shorter control for dense toolbars (single-row headers). */
+  compact?: boolean;
 }
 
-export function DateRangePicker({ value, onChange, timezone = 'America/Los_Angeles' }: DateRangePickerProps) {
+export function DateRangePicker({ value, onChange, timezone = 'America/Los_Angeles', compact = false }: DateRangePickerProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [tempRange, setTempRange] = useState<DateRange>(value);
   const dropdownRef = useRef<HTMLDivElement>(null);
@@ -171,17 +173,26 @@ export function DateRangePicker({ value, onChange, timezone = 'America/Los_Angel
   };
 
   return (
-    <div className="relative" ref={dropdownRef}>
+    <div className="relative shrink-0" ref={dropdownRef}>
       <button
         onClick={() => !isLoading && setIsOpen(!isOpen)}
         disabled={isLoading}
-        className={`flex items-center gap-3 px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg hover:border-pink-500/50 hover:bg-gray-700 transition-all duration-200 text-white group ${isLoading ? 'opacity-90 cursor-wait' : ''}`}
+        type="button"
+        className={`flex items-center bg-gray-800 border border-gray-700 rounded-lg hover:border-pink-500/50 hover:bg-gray-700 transition-all duration-200 text-white group shrink-0 ${isLoading ? 'opacity-90 cursor-wait' : ''} ${
+          compact
+            ? 'h-9 gap-2 px-2.5 sm:px-3'
+            : 'gap-3 px-4 py-2.5'
+        }`}
       >
-        <Calendar className={`w-4 h-4 ${isLoading ? 'text-pink-400/50' : 'text-pink-400 group-hover:text-pink-300'} transition-colors`} />
-        <span className="text-sm font-medium text-gray-100">
+        <Calendar className={`${compact ? 'w-3.5 h-3.5' : 'w-4 h-4'} ${isLoading ? 'text-pink-400/50' : 'text-pink-400 group-hover:text-pink-300'} transition-colors shrink-0`} />
+        <span className={`font-medium text-gray-100 whitespace-nowrap ${compact ? 'text-xs sm:text-sm max-w-[9rem] sm:max-w-none truncate sm:truncate-none' : 'text-sm'}`}>
           {getButtonLabel()}
         </span>
-        {!isLoading && <ChevronDown className={`w-4 h-4 text-gray-400 transition-transform duration-200 ${isOpen ? 'rotate-180' : ''}`} />}
+        {!isLoading && (
+          <ChevronDown
+            className={`${compact ? 'w-3.5 h-3.5' : 'w-4 h-4'} text-gray-400 transition-transform duration-200 shrink-0 ${isOpen ? 'rotate-180' : ''}`}
+          />
+        )}
 
         {/* Loading Indicator Overlay */}
         {isLoading && (

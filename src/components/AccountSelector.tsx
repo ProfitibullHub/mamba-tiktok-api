@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { ChevronDown, Store, CheckCircle2 } from 'lucide-react';
 import { Account, supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
+import { useTenantContext } from '../contexts/TenantContext';
 import { AddAccountModal } from './AddAccountModal';
 
 interface AccountSelectorProps {
@@ -13,6 +14,7 @@ export function AccountSelector({ selectedAccount, onSelectAccount }: AccountSel
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [isOpen, setIsOpen] = useState(false);
   const { profile } = useAuth();
+  const { isPlatformSuperAdmin } = useTenantContext();
 
   useEffect(() => {
     fetchAccounts();
@@ -20,38 +22,20 @@ export function AccountSelector({ selectedAccount, onSelectAccount }: AccountSel
 
   const fetchAccounts = async () => {
     try {
-      if (profile?.role === 'admin') {
-        const { data, error } = await supabase
-          .from('accounts')
-          .select('*')
-          .eq('status', 'active')
-          .order('is_agency_view', { ascending: false, nullsFirst: false })
-          .order('name');
+      const { data, error } = await supabase
+        .from('accounts')
+        .select('*')
+        .eq('status', 'active')
+        .order('is_agency_view', { ascending: false, nullsFirst: false })
+        .order('name');
 
-        if (error) throw error;
-        setAccounts(data || []);
+      if (error) throw error;
+      const list = (data || []) as Account[];
+      setAccounts(list);
 
-        if (data && data.length > 0 && !selectedAccount) {
-          const mambaAccount = data.find(acc => acc.is_agency_view);
-          onSelectAccount(mambaAccount || data[0]);
-        }
-      } else {
-        const { data: userAccounts, error } = await supabase
-          .from('user_accounts')
-          .select('account_id, accounts(*)')
-          .eq('user_id', profile?.id);
-
-        if (error) throw error;
-
-        const accountsData = userAccounts
-          ?.map((ua: any) => ua.accounts)
-          .filter((acc: Account) => acc.status === 'active') || [];
-
-        setAccounts(accountsData);
-
-        if (accountsData.length > 0 && !selectedAccount) {
-          onSelectAccount(accountsData[0]);
-        }
+      if (list.length > 0 && !selectedAccount) {
+        const mambaAccount = isPlatformSuperAdmin ? list.find((acc) => acc.is_agency_view) : undefined;
+        onSelectAccount(mambaAccount || list[0]);
       }
     } catch (error) {
       console.error('Error fetching accounts:', error);
@@ -67,7 +51,7 @@ export function AccountSelector({ selectedAccount, onSelectAccount }: AccountSel
     );
   }
 
-  if (accounts.length === 1 && profile?.role !== 'admin') {
+  if (accounts.length === 1 && !isPlatformSuperAdmin) {
     return (
       <div className="bg-gray-800 rounded-xl p-4 border border-gray-700">
         <div className="flex items-center gap-3">
@@ -97,7 +81,7 @@ export function AccountSelector({ selectedAccount, onSelectAccount }: AccountSel
             </div>
             <div className="text-left">
               <p className="text-sm text-gray-400">
-                {profile?.role === 'admin' ? 'Viewing Account' : 'Current Account'}
+                {isPlatformSuperAdmin ? 'Viewing Account' : 'Current Account'}
               </p>
               <p className="text-lg font-bold text-white">{selectedAccount?.name || 'Select Account'}</p>
               {selectedAccount && (

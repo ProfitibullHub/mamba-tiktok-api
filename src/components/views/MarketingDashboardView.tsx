@@ -16,16 +16,17 @@
  * 8. Ad Hierarchy — expandable campaign → ad group → ad tree
  */
 
-import { useState, useEffect, useMemo, useCallback } from 'react';
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
     DollarSign, TrendingUp, Eye, MousePointerClick, Target,
     Users, BarChart3, Video, Heart, MessageCircle, Share2, UserPlus,
     RefreshCw, Link2, ChevronDown, ChevronRight, Megaphone,
-    Zap, Globe, Calendar, LogOut, AlertTriangle
+    Zap, Globe, Calendar, LogOut, AlertTriangle, Wifi
 } from 'lucide-react';
 import { useTikTokAdsStore, CampaignAsset, AdGroupAsset, AdAsset } from '../../store/useTikTokAdsStore';
 import { DateRangePicker, DateRange } from '../DateRangePicker';
 import { Account } from '../../lib/supabase';
+import { useShopAccessFlags } from '../../hooks/useShopMutationAccess';
 import { formatShopDateISO } from '../../utils/dateUtils';
 import {
     AreaChart,
@@ -197,6 +198,7 @@ function AdRow({ ad }: { ad: AdAsset }) {
 
 export function MarketingDashboardView({ account, shopId: _shopId, timezone: shopTimezone = 'America/Los_Angeles' }: MarketingDashboardViewProps) {
     const accountId = account.id;
+    const { canMutateShop, canSyncShop } = useShopAccessFlags(account);
 
     const {
         connected,
@@ -226,6 +228,7 @@ export function MarketingDashboardView({ account, shopId: _shopId, timezone: sho
         marketingLoaded,
         marketingAccountId,
         marketingCampaigns,
+        marketingLastPolled,
         loadMarketingFromDB
     } = useTikTokAdsStore();
 
@@ -258,6 +261,24 @@ export function MarketingDashboardView({ account, shopId: _shopId, timezone: sho
     const [showDisconnectModal, setShowDisconnectModal] = useState(false);
     const [isDisconnecting, setIsDisconnecting] = useState(false);
     const [disconnectCountdown, setDisconnectCountdown] = useState<number | null>(null);
+
+    // Live "Updated X ago" ticker — re-renders every 15 seconds
+    const [nowMs, setNowMs] = useState(() => Date.now());
+    const tickRef = useRef<ReturnType<typeof setInterval> | null>(null);
+    useEffect(() => {
+        tickRef.current = setInterval(() => setNowMs(Date.now()), 15_000);
+        return () => { if (tickRef.current) clearInterval(tickRef.current); };
+    }, []);
+
+    const liveAgoText = (() => {
+        if (!marketingLastPolled) return null;
+        const secs = Math.floor((nowMs - marketingLastPolled) / 1000);
+        if (secs < 60) return 'Just updated';
+        const mins = Math.floor(secs / 60);
+        if (mins < 60) return `Updated ${mins}m ago`;
+        const hrs = Math.floor(mins / 60);
+        return `Updated ${hrs}h ago`;
+    })();
 
     // Check connection and load marketing data on mount (one-time per account)
     useEffect(() => {
@@ -472,21 +493,21 @@ export function MarketingDashboardView({ account, shopId: _shopId, timezone: sho
 
     // Handle sync
     const handleSync = useCallback(async () => {
-        if (!accountId) return;
+        if (!accountId || !canSyncShop) return;
         await syncAdsData(accountId); // No date override — backend uses 120-day default
         // State updates via syncAdsData
-    }, [accountId, syncAdsData]);
+    }, [accountId, syncAdsData, canSyncShop]);
 
     const handleSwitchAdvertiser = useCallback(async (advertiserId: string) => {
-        if (!accountId) return;
+        if (!accountId || !canMutateShop) return;
         setShowAdvertiserSwitcher(false);
         await switchAdvertiser(accountId, advertiserId);
         // Switch clears state, the component effect will reconnect
-    }, [accountId, switchAdvertiser]);
+    }, [accountId, switchAdvertiser, canMutateShop]);
 
     // Handle Disconnection
     const handleDisconnect = async () => {
-        if (!accountId || isDisconnecting) return;
+        if (!accountId || !canMutateShop || isDisconnecting) return;
         setIsDisconnecting(true);
 
         const success = await disconnectTikTokAds(accountId);
@@ -547,8 +568,11 @@ export function MarketingDashboardView({ account, shopId: _shopId, timezone: sho
                         Link your TikTok Ads account to track campaign performance, ad spend, ROAS, and GMV Max metrics all in one place.
                     </p>
                     <button
-                        onClick={() => connectTikTokAds(accountId)}
-                        className="px-6 py-3 bg-gradient-to-r from-pink-600 to-red-600 hover:from-pink-500 hover:to-red-500 text-white font-semibold rounded-xl transition-all duration-200 flex items-center gap-2 mx-auto"
+                        type="button"
+                        onClick={() => canMutateShop && connectTikTokAds(accountId)}
+                        disabled={!canMutateShop}
+                        title={!canMutateShop ? 'Read-only for your role' : undefined}
+                        className="px-6 py-3 bg-gradient-to-r from-pink-600 to-red-600 hover:from-pink-500 hover:to-red-500 text-white font-semibold rounded-xl transition-all duration-200 flex items-center gap-2 mx-auto disabled:opacity-40 disabled:pointer-events-none"
                     >
                         <Link2 size={18} />
                         Connect Account
@@ -565,14 +589,29 @@ export function MarketingDashboardView({ account, shopId: _shopId, timezone: sho
                 <div>
                     <h1 className="text-2xl font-bold text-white">Marketing</h1>
                     <div className="flex items-center gap-3 mt-1">
+                        {/* Live indicator */}
+                        {connected && (
+                            <span className="inline-flex items-center gap-1.5 text-xs text-emerald-400">
+                                <span className="relative flex h-2 w-2">
+                                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+                                    <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
+                                </span>
+                                <Wifi size={11} className="opacity-70" />
+                                {liveAgoText || 'Live'}
+                            </span>
+                        )}
                         {advertiserInfo && (
                             <div className="relative">
                                 <button
+                                    type="button"
                                     onClick={() => {
+                                        if (!canMutateShop) return;
                                         if (!availableAdvertisers) fetchAvailableAdvertisers(accountId);
                                         setShowAdvertiserSwitcher(!showAdvertiserSwitcher);
                                     }}
-                                    className="flex items-center gap-1.5 text-sm text-gray-400 hover:text-white transition-colors"
+                                    disabled={!canMutateShop}
+                                    title={!canMutateShop ? 'Read-only for your role' : undefined}
+                                    className="flex items-center gap-1.5 text-sm text-gray-400 hover:text-white transition-colors disabled:opacity-40 disabled:pointer-events-none"
                                 >
                                     <span>{advertiserInfo.name}</span>
                                     <ChevronDown size={14} />
@@ -581,9 +620,10 @@ export function MarketingDashboardView({ account, shopId: _shopId, timezone: sho
                                     <div className="absolute top-full left-0 mt-2 w-72 bg-gray-800 border border-gray-700 rounded-xl shadow-2xl z-50 overflow-hidden">
                                         {availableAdvertisers.map(adv => (
                                             <button
+                                                type="button"
                                                 key={adv.advertiser_id}
                                                 onClick={() => handleSwitchAdvertiser(adv.advertiser_id)}
-                                                disabled={isSwitching}
+                                                disabled={!canMutateShop || isSwitching}
                                                 className={`w-full text-left px-4 py-3 hover:bg-gray-700/50 transition-colors ${adv.is_current ? 'bg-indigo-500/10 border-l-2 border-indigo-500' : ''
                                                     }`}
                                             >
@@ -617,10 +657,11 @@ export function MarketingDashboardView({ account, shopId: _shopId, timezone: sho
                         onChange={(range: DateRange) => setDateRange(range)}
                     />
                     <button
+                        type="button"
                         onClick={handleSync}
-                        disabled={isSyncing}
+                        disabled={!canSyncShop || isSyncing}
                         className="p-2.5 bg-gray-700/50 hover:bg-gray-700 text-gray-300 hover:text-white rounded-xl transition-all duration-200 disabled:opacity-50"
-                        title="Sync ads data"
+                        title={!canSyncShop ? 'You do not have access to sync this shop' : 'Sync ads data'}
                     >
                         <RefreshCw size={18} className={isSyncing ? 'animate-spin' : ''} />
                     </button>
@@ -676,8 +717,11 @@ export function MarketingDashboardView({ account, shopId: _shopId, timezone: sho
                                 </p>
                             </div>
                             <button
-                                onClick={() => connectTikTokAds(accountId)}
-                                className="px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white text-sm font-medium rounded-lg transition-colors whitespace-nowrap"
+                                type="button"
+                                onClick={() => canMutateShop && connectTikTokAds(accountId)}
+                                disabled={!canMutateShop}
+                                title={!canMutateShop ? 'Read-only for your role' : undefined}
+                                className="px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white text-sm font-medium rounded-lg transition-colors whitespace-nowrap disabled:opacity-40 disabled:pointer-events-none"
                             >
                                 Re-authorize
                             </button>
@@ -710,8 +754,11 @@ export function MarketingDashboardView({ account, shopId: _shopId, timezone: sho
                             ))}
                             {missing.length > 0 && (
                                 <button
-                                    onClick={() => connectTikTokAds(accountId)}
-                                    className="ml-auto px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-white text-xs font-medium rounded-lg transition-colors"
+                                    type="button"
+                                    onClick={() => canMutateShop && connectTikTokAds(accountId)}
+                                    disabled={!canMutateShop}
+                                    title={!canMutateShop ? 'Read-only for your role' : undefined}
+                                    className="ml-auto px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-white text-xs font-medium rounded-lg transition-colors disabled:opacity-40 disabled:pointer-events-none"
                                 >
                                     Re-authorize
                                 </button>
@@ -1128,6 +1175,7 @@ export function MarketingDashboardView({ account, shopId: _shopId, timezone: sho
             )}
 
             {/* ─── DANGER ZONE ────────────────────────────────────────────── */}
+            {canMutateShop && (
             <div className="mt-12 pt-8 border-t border-red-900/30">
                 <div className="bg-red-500/5 border border-red-500/20 rounded-2xl p-6 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
                     <div>
@@ -1140,6 +1188,7 @@ export function MarketingDashboardView({ account, shopId: _shopId, timezone: sho
                         </p>
                     </div>
                     <button
+                        type="button"
                         onClick={() => setShowDisconnectModal(true)}
                         className="px-6 py-2.5 bg-red-600/20 hover:bg-red-600/40 text-red-400 hover:text-red-300 border border-red-500/30 rounded-xl font-medium transition-all duration-200 whitespace-nowrap flex items-center gap-2"
                     >
@@ -1148,9 +1197,10 @@ export function MarketingDashboardView({ account, shopId: _shopId, timezone: sho
                     </button>
                 </div>
             </div>
+            )}
 
             {/* ─── DISCONNECT MODAL ───────────────────────────────────────── */}
-            {showDisconnectModal && (
+            {canMutateShop && showDisconnectModal && (
                 <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
                     <div className="bg-gray-900 border border-gray-700 rounded-2xl p-6 max-w-md w-full shadow-2xl relative overflow-hidden">
                         {/* 5-second countdown mode active */}

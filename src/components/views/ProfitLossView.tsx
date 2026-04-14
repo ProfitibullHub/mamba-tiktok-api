@@ -1,10 +1,16 @@
-import { DollarSign, TrendingUp, TrendingDown, Wallet, PieChart, AlertTriangle, ChevronDown, ChevronUp, Package, Truck, Receipt, Users, Megaphone, Building2, Zap, SlidersHorizontal, RotateCcw, Download, Plus, Trash2, Calendar } from 'lucide-react';
+import { DollarSign, TrendingUp, TrendingDown, Wallet, PieChart, Percent, AlertTriangle, ChevronDown, ChevronUp, Package, Truck, Receipt, Users, Megaphone, Building2, SlidersHorizontal, RotateCcw, Download, Plus, Trash2, Calendar, Lock, CircleDollarSign } from 'lucide-react';
 // Note: LayoutGrid, Layers are used by the View Mode Toggle — re-add to import when uncommenting the toggle
 import { useState, useEffect, useMemo, useCallback } from 'react';
 import { useShopStore, Order } from '../../store/useShopStore';
 import { useTikTokAdsStore } from '../../store/useTikTokAdsStore';
 import { DateRangePicker, DateRange } from '../DateRangePicker';
-import { formatShopDateISO, getShopDayStartTimestamp, getDateRangeFromPreset } from '../../utils/dateUtils';
+import {
+  formatShopDateISO,
+  formatShopDateTime,
+  getShopDayStartTimestamp,
+  getDateRangeFromPreset,
+  previousCalendarDayISO,
+} from '../../utils/dateUtils';
 import { CalculationTooltip } from '../CalculationTooltip';
 import { RefreshCw } from 'lucide-react';
 import { Account } from '../../lib/supabase';
@@ -12,19 +18,24 @@ import { calculateOrderGMV } from '../../utils/gmvCalculations';
 import { exportToCSV, exportToExcel, exportToPDF, ExportData } from '../../utils/exportUtils';
 import { ManualAffiliateModal } from '../ManualAffiliateModal';
 import { ManualAgencyFeeModal } from '../ManualAgencyFeeModal';
+import { useShopAccessFlags } from '../../hooks/useShopMutationAccess';
+import { isCancelledOrRefunded } from '../../utils/orderFinancials';
+import {
+  platformFeeKeys,
+  affiliateFeeKeys,
+  adSpendFeeKeys,
+  netByKeys,
+  expenseFromNet,
+  shippingTotalForOperatingExpenses,
+  isPlatformFeeKey,
+  isAffiliateCogsFeeKey,
+  isAdSpendFeeKey,
+} from '../../utils/plFeeAggregation';
+import { computeAgencyFeesRollup } from '../../utils/agencyFeeProration';
+import { buildTiktokStatementExportRows } from '../../utils/tiktokStatementExportRows';
 
-// Helper function to detect cancelled or refunded orders
 // Use paid_time for filtering (matches backend which loads by paid_time)
 const getOrderTs = (o: Order): number => Number(o.paid_time || o.created_time);
-
-const isCancelledOrRefunded = (order: Order): boolean => {
-  return (
-    order.order_status === 'CANCELLED' ||
-    !!order.cancel_reason ||
-    !!order.cancellation_initiator
-  );
-};
-
 
 interface ProfitLossViewProps {
   account: Account;
@@ -234,10 +245,9 @@ const PLATFORM_LABELS: Record<string, string> = {
 const AFFILIATE_LABELS: Record<string, string> = {
   affiliate_commission: 'Affiliate Commission',
   affiliate_partner_commission: 'Affiliate Partner Commission',
+  cofunded_creator_bonus: 'Co-funded Creator Bonus',
   affiliate_ads_commission: 'Affiliate Ads Commission',
   external_affiliate_marketing_fee: 'External Affiliate Marketing Fee',
-  tap_shop_ads_commission: 'TapShop Ads Commission',
-  cofunded_creator_bonus: 'Co-funded Creator Bonus',
 };
 
 const SERVICE_LABELS: Record<string, string> = {
@@ -248,9 +258,76 @@ const SERVICE_LABELS: Record<string, string> = {
   customer_service_fee: 'Customer Service Fee',
 };
 
-const platformFeeKeys = ['platform_commission', 'referral_fee', 'transaction_fee', 'refund_administration_fee', 'credit_card_handling_fee'];
-const affiliateFeeKeys = ['affiliate_commission', 'affiliate_partner_commission', 'cofunded_creator_bonus'];
-const adSpendFeeKeys = ['tap_shop_ads_commission', 'affiliate_ads_commission'];
+/** Statement `revenue` rollup keys → labels (TikTok settlement transactions). */
+const STATEMENT_REVENUE_LABELS: Record<string, string> = {
+  subtotal_before_discount: 'Gross sales',
+  refund_subtotal_before_discount: 'Gross sales refund',
+  seller_discount: 'Seller discount',
+  seller_discount_refund: 'Seller discount refund',
+  cod_service_fee: 'COD service fee',
+  refund_cod_service_fee: 'Refund COD service fee',
+};
+
+const STATEMENT_REVENUE_KEY_ORDER = [
+  'subtotal_before_discount',
+  'refund_subtotal_before_discount',
+  'seller_discount',
+  'seller_discount_refund',
+  'cod_service_fee',
+  'refund_cod_service_fee',
+] as const;
+
+/** YYYY-MM-DD → DD-MM-YYYY for user-facing copy */
+function formatYmdAsDdMmYyyy(ymd: string): string {
+  const parts = ymd.split('-').map(Number);
+  const [y, m, d] = parts;
+  if (!y || !m || !d) return ymd;
+  return `${String(d).padStart(2, '0')}-${String(m).padStart(2, '0')}-${String(y)}`;
+}
+
+/** Single calendar day in shop TZ: "Today", "Yesterday", or DD-MM-YYYY */
+function labelShopCalendarDay(ymd: string, timezone: string): string {
+  const today = formatShopDateISO(Date.now(), timezone);
+  const yesterday = previousCalendarDayISO(today, timezone);
+  if (ymd === today) return 'Today';
+  if (ymd === yesterday) return 'Yesterday';
+  return formatYmdAsDdMmYyyy(ymd);
+}
+
+/** Range label for sync prompts (same shop timezone as the P&L picker) */
+function labelPlDateRangeForSyncPrompt(startDate: string, endDate: string, timezone: string): string {
+  if (startDate === endDate) {
+    return labelShopCalendarDay(startDate, timezone);
+  }
+  const a = labelShopCalendarDay(startDate, timezone);
+  const b = labelShopCalendarDay(endDate, timezone);
+  if (a === b) return a;
+  return `${a} – ${b}`;
+}
+
+function buildStatementRevenueRows(rev: Record<string, number> | undefined): { label: string; value: number }[] {
+  if (!rev) return [];
+  const rows: { label: string; value: number }[] = [];
+  const seen = new Set<string>();
+  for (const k of STATEMENT_REVENUE_KEY_ORDER) {
+    const v = rev[k];
+    if (v != null && Math.abs(v) >= 0.005) {
+      rows.push({
+        label: STATEMENT_REVENUE_LABELS[k] || k.replace(/_/g, ' '),
+        value: v,
+      });
+      seen.add(k);
+    }
+  }
+  for (const k of Object.keys(rev).sort()) {
+    if (seen.has(k) || Math.abs(rev[k] ?? 0) < 0.005) continue;
+    rows.push({
+      label: STATEMENT_REVENUE_LABELS[k] || k.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
+      value: rev[k] ?? 0,
+    });
+  }
+  return rows;
+}
 
 export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angeles' }: ProfitLossViewProps) {
   const [dateRange, setDateRange] = useState<DateRange>(() => {
@@ -261,7 +338,22 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
       return getDateRangeFromPreset('today', timezone);
     }
   });
+
+  const applyDateRange = useCallback((r: DateRange) => {
+    setDateRange(r);
+  }, []);
+
+  // P&L date range is not persisted across refresh (unlike Finance Debug). Reset when shop or timezone changes.
+  useEffect(() => {
+    try {
+      const preset = localStorage.getItem(`mamba:default_date_preset:${shopId || 'default'}`) || 'today';
+      setDateRange(getDateRangeFromPreset(preset, timezone));
+    } catch {
+      setDateRange(getDateRangeFromPreset('today', timezone));
+    }
+  }, [shopId, timezone]);
   const [showExportMenu, setShowExportMenu] = useState(false);
+  const [expandedHero, setExpandedHero] = useState<'gmv' | 'netSales' | 'netProfit' | null>(null);
   // Shared toggle:  include cancelled orders in financials (synced with OverviewView via localStorage + custom event)
   const [includeCancelledFinancials, setIncludeCancelledFinancials] = useState<boolean>(() => {
     try {
@@ -308,6 +400,8 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
   const deleteAgencyFee = useShopStore(state => state.deleteAgencyFee);
   const [isAgencyModalOpen, setIsAgencyModalOpen] = useState(false);
 
+  const { canMutateShop, canSyncShop } = useShopAccessFlags(account);
+
   // TikTok Ads store
   const {
     connected: adsConnected,
@@ -318,7 +412,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
   } = useTikTokAdsStore();
 
   const handleSync = async () => {
-    if (!shopId) return;
+    if (!shopId || !canSyncShop) return;
     await syncData(account.id, shopId, 'finance');
     // Force refetch after sync
     fetchPLData(account.id, shopId, dateRange.startDate, dateRange.endDate, true, timezone);
@@ -327,7 +421,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
   };
 
   const handleFullSync = async () => {
-    if (!shopId) return;
+    if (!shopId || !canSyncShop) return;
     await syncData(account.id, shopId, 'finance', true); // forceFullSync = true
     // Force refetch after sync
     fetchPLData(account.id, shopId, dateRange.startDate, dateRange.endDate, true, timezone);
@@ -618,12 +712,14 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
     const totalCogs = cogsStats.totalCogs;
     const totalProductShippingCost = cogsStats.totalProductShippingCost;
 
-    // Calculate TikTok Commission (Platform Fees) as baseline, or use actual platform fees if available
-    const platformFeesSum = platformFeeKeys.reduce((sum, k) => sum + Math.abs(plData?.fees?.[k] || 0), 0);
+    // Calculate TikTok Commission (Platform Fees) as baseline, or use actual platform fee net if available
+    const platformFeesNet = netByKeys(plData?.fees, platformFeeKeys);
+    const platformFeesSum = expenseFromNet(platformFeesNet);
     const tiktokCommission = platformFeesSum > 0 ? platformFeesSum : netRevenue * 0.06;
 
-    // Calculate Automatic Affiliate Commissions (from settlements)
-    const autoAffiliateCommission = affiliateFeeKeys.reduce((sum, k) => sum + Math.abs(plData?.fees?.[k] || 0), 0);
+    // Calculate Automatic Affiliate Commissions (from settlements, netted to handle reversals/refunds)
+    const autoAffiliateNet = netByKeys(plData?.fees, affiliateFeeKeys);
+    const autoAffiliateCommission = expenseFromNet(autoAffiliateNet);
 
     // Calculate Manual Affiliate Retainers
     const manualAffiliateRetainers = affiliateSettlements.reduce((sum, s) => sum + Number(s.amount), 0);
@@ -634,14 +730,18 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
     // Gross Profit = Net Revenue - COGS - Affiliate Commissions (affiliate treated as cost of goods)
     const grossProfit = netRevenue - totalCogs - totalProductShippingCost - totalAffiliateCost;
 
-    // Calculate Shipping Costs from orders (shipping_fee_seller_discount)
-    const shippingCosts = allOrdersInRange.reduce((sum, o) => {
+    // Shipping Costs: prefer settlement transaction shipping net when available (more accurate than order-level estimate)
+    const shippingCostsFallbackFromOrders = allOrdersInRange.reduce((sum, o) => {
       const shippingFeeDiscount = parseFloat(o.payment_info?.shipping_fee_seller_discount || '0');
       return sum + Math.abs(shippingFeeDiscount);
     }, 0);
+    const shippingCosts = plData?.shipping
+      ? shippingTotalForOperatingExpenses(plData.shipping)
+      : shippingCostsFallbackFromOrders;
 
     // Get Ad Spend — use ONLY the synced marketing data (same source as the Marketing Dashboard)
-    const shopAdsFees = adSpendFeeKeys.reduce((sum, key) => sum + Math.abs(plData?.fees?.[key] || 0), 0);
+    const shopAdsNet = netByKeys(plData?.fees, adSpendFeeKeys);
+    const shopAdsFees = expenseFromNet(shopAdsNet);
 
     // Marketing Ad Spend (Synced) — from tiktok_ad_spend_daily table, filtered by P&L date range
     // This matches exactly what the Marketing Dashboard shows as "Cost"
@@ -659,68 +759,18 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
     const adConversionValue = syncedMarketingConversionValue;
     const adROAS = adSpend > 0 ? adConversionValue / adSpend : 0;
 
-    // ── Recurring agency fee calculation ──────────────────────────────────────
-    // ── Prorated agency fee calculation ──────────────────────────────────────
-    const rangeStart = new Date(dateRange.startDate);
-    rangeStart.setHours(0, 0, 0, 0);
-    const rangeEnd = new Date(dateRange.endDate);
-    rangeEnd.setHours(23, 59, 59, 999);
-
-    const totalAgencyFees = agencyFees.reduce((sum, fee) => {
-      const feeType = fee.fee_type || 'retainer';
-      const recurrence = fee.recurrence || 'monthly';
-      
-      const feeStart = new Date(fee.date);
-      feeStart.setHours(0, 0, 0, 0);
-
-      let retainerPart = 0;
-      let commissionPart = 0;
-
-      if (feeStart <= rangeEnd) {
-        const effectiveStart = feeStart > rangeStart ? feeStart : rangeStart;
-        
-        // --- 1. Retainer Calculation (Prorated daily) ---
-        if (feeType === 'retainer' || feeType === 'both') {
-          const amount = Number(fee.retainer_amount ?? fee.amount ?? 0);
-          let curr = new Date(effectiveStart);
-          
-          while (curr <= rangeEnd) {
-            const y = curr.getFullYear();
-            const m = curr.getMonth();
-            const daysInMonth = new Date(y, m + 1, 0).getDate();
-            
-            let dailyRate = 0;
-            if (recurrence === 'monthly')       dailyRate = amount / daysInMonth;
-            else if (recurrence === 'quarterly') dailyRate = (amount / 3) / daysInMonth;
-            else if (recurrence === 'biannual')  dailyRate = (amount / 6) / daysInMonth;
-            else if (recurrence === 'annual')    dailyRate = (amount / 12) / daysInMonth;
-            else                                dailyRate = amount / daysInMonth;
-            
-            retainerPart += dailyRate;
-            curr.setDate(curr.getDate() + 1);
-          }
-        }
-        
-        // --- 2. Commission Calculation (Proportional to active lifespan) ---
-        if (feeType === 'commission' || feeType === 'both') {
-          const rate = Number(fee.commission_rate || 0) / 100;
-          const base = fee.commission_base || 'gmv';
-          const baseValue =
-            base === 'gross_profit' ? grossProfit :
-              base === 'net_revenue' ? netRevenue :
-                grossSalesGMV;
-          
-          // Calculate the proportion of the date range where the fee was active
-          const totalRangeDays = Math.max(1, Math.round((rangeEnd.getTime() - rangeStart.getTime()) / 86400000));
-          const activeDays = Math.max(0, Math.round((rangeEnd.getTime() - effectiveStart.getTime()) / 86400000) + 1);
-          const activeRatio = Math.min(1, activeDays / totalRangeDays);
-          
-          commissionPart = rate * baseValue * activeRatio;
-        }
-      }
-
-      return sum + retainerPart + commissionPart;
-    }, 0);
+    // Manual agency fees: shop-calendar proration (same timezone as P&L date picker)
+    const {
+      total: totalAgencyFees,
+      lines: agencyFeeLines,
+      summaryNotes: agencyFeeSummaryNotes,
+    } = computeAgencyFeesRollup(
+      agencyFees,
+      dateRange.startDate,
+      dateRange.endDate,
+      timezone,
+      { grossSalesGMV, netRevenue, grossProfit }
+    );
 
     // FBT Fulfillment Fees — calculated here so they can be included in shipping for opex
     const totalFbtFees = allOrdersInRange.reduce((sum: number, o: any) => sum + Math.abs(o.fbt_fulfillment_fee || 0), 0);
@@ -729,21 +779,35 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
     // If we have P&L data from backend (Statements), use that as it's the source of truth for all fees
     // Otherwise fall back to estimates
     let realOperatingExpenses = 0;
+    let feesBase = 0;
+    let shippingBase = 0;
 
     if (plData && plData.statement_totals) {
       // Use total_fee_tax (from individual transaction data) instead of statement_totals.total_fees
       // (settlement.fee_amount) because both the individual fee breakdown AND total_fee_tax come from
       // the same transaction-level source — so they will be internally consistent.
       // statement_totals.total_fees is a different TikTok API field and can diverge from the transaction sum.
-      const feesBase = plData.total_fee_tax != null
+      feesBase = plData.total_fee_tax != null
         ? Math.abs(plData.total_fee_tax)
         : Math.abs(plData.statement_totals.total_fees);
+      shippingBase = plData.shipping
+        ? shippingTotalForOperatingExpenses(plData.shipping)
+        : Math.abs(plData.statement_totals.total_shipping);
       // FBT fulfillment fees are excluded from operating expenses (shown as informational only in dropdown)
-      realOperatingExpenses = feesBase + Math.abs(plData.statement_totals.total_shipping) - shopAdsFees - autoAffiliateCommission + totalAgencyFees;
+      realOperatingExpenses = feesBase + shippingBase - shopAdsFees - autoAffiliateCommission + totalAgencyFees;
     } else {
       // Fallback: Estimates if no statement data
       realOperatingExpenses = tiktokCommission + shippingCosts + totalAgencyFees;
     }
+
+    const heroGmvLines: { label: string; value: number }[] = [
+      { label: 'Product price (before discounts)', value: gmvComponents.originalProductPrice },
+      { label: 'Shipping fees', value: gmvComponents.shippingFees },
+      { label: 'Seller discounts', value: -gmvComponents.sellerDiscounts },
+      { label: 'Platform discounts', value: -gmvComponents.platformDiscounts },
+    ];
+
+    const heroNetSalesLines = buildStatementRevenueRows(plData?.revenue);
 
     // Packaging/Supplies (manual input - not available yet, set to 0)
     const packagingSupplies = 0;
@@ -756,6 +820,35 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
 
     // Operating Income = Gross Profit - Operating Expenses
     const netProfit = grossProfit - totalExpenses;
+
+    const heroNetProfitLines: { label: string; value: number; emphasis?: 'subtotal' | 'total' }[] = [
+      { label: 'Net revenue (orders, after refunds)', value: netRevenue },
+      { label: 'Product COGS', value: -totalCogs },
+      { label: 'Product shipping cost', value: -totalProductShippingCost },
+      { label: 'Affiliate commissions (auto + manual)', value: -totalAffiliateCost },
+      { label: 'Gross profit', value: grossProfit, emphasis: 'subtotal' },
+    ];
+
+    if (plData && plData.statement_totals) {
+      heroNetProfitLines.push(
+        { label: 'Fees (statement transactions)', value: -feesBase },
+        { label: 'Shipping (operating)', value: -shippingBase },
+        { label: 'Add back: TAP / shop ads in fee rollup', value: shopAdsFees },
+        { label: 'Add back: Affiliate in fee rollup', value: autoAffiliateCommission },
+        { label: 'Agency fees', value: -totalAgencyFees },
+      );
+    } else {
+      heroNetProfitLines.push(
+        { label: 'TikTok commission (estimate)', value: -tiktokCommission },
+        { label: 'Shipping (estimate)', value: -shippingCosts },
+        { label: 'Agency fees', value: -totalAgencyFees },
+      );
+    }
+
+    heroNetProfitLines.push(
+      { label: 'Marketing ad spend (synced)', value: -adSpend },
+      { label: 'Net profit', value: netProfit, emphasis: 'total' },
+    );
     const grossMargin = netRevenue > 0 ? (grossProfit / netRevenue) * 100 : 0;
     const roi = (totalCogs + totalProductShippingCost + totalAffiliateCost + totalExpenses) > 0 ? (netProfit / (totalCogs + totalProductShippingCost + totalAffiliateCost + totalExpenses)) * 100 : 0;
 
@@ -769,57 +862,92 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
       .filter(o => !isCancelledOrRefunded(o))
       .reduce((sum, o) => sum + o.line_items.reduce((s, item) => s + (item.quantity || 0), 0), 0);
 
-    return {
-      totalOrderAmount,
-      totalTax,
-      totalProductTax,
-      totalShippingTax,
-      grossSalesGMV,
-      refunds,
-      netRevenue,
-      totalCogs,
-      totalProductShippingCost,
-      grossProfit,
-      tiktokCommission,
-      shippingCosts,
-      adSpend,
-      packagingSupplies,
-      totalExpenses,
-      netProfit,
-      grossMargin,
-      roi,
-      adConversionValue,
-      adROAS,
-      // GMV Components
-      totalUnitsSold,
-      realOperatingExpenses,
-      fbtFeesFromOrders: totalFbtFees,
-      // GMV Components
-      gmvOriginalProductPrice: gmvComponents.originalProductPrice,
-      gmvShippingFees: gmvComponents.shippingFees,
-      gmvSellerDiscounts: gmvComponents.sellerDiscounts,
-      gmvPlatformDiscounts: gmvComponents.platformDiscounts,
-      manualAffiliateRetainers,
-      autoAffiliateCommission,
-      totalAffiliateCost,
-      shopAdsFees,
-      totalAgencyFees,
-      hasTransactionData: plData?.meta?.has_complete_data || false,
-      totalFees: Math.abs(plData?.statement_totals?.total_fees || 0) - shopAdsFees - autoAffiliateCommission,
-      totalShipping: Math.abs(plData?.statement_totals?.total_shipping || 0),
-      settlementAmount: plData?.statement_totals?.total_settlement || 0,
-      platformFees: platformFeesSum,
-      fbtFees: totalFbtFees,
       // serviceFees = residual using the same transaction-level base (total_fee_tax) as the
       // individual fee breakdown. This ensures both the total and the itemized rows come from
       // the same data source so they are internally consistent.
-      serviceFees: plData ? Math.max(0, Math.abs(plData.total_fee_tax ?? plData.statement_totals?.total_fees ?? 0) - platformFeesSum - autoAffiliateCommission - shopAdsFees) : 0,
-      totalTaxes,
-      operatingExpenses: totalExpenses,
-      grossProfitPct,
-      operatingIncome,
-      operatingIncomePct,
-    };
+      const serviceFeesResidual = plData ? Math.max(0, Math.abs(plData.total_fee_tax ?? plData.statement_totals?.total_fees ?? 0) - platformFeesSum - autoAffiliateCommission - shopAdsFees) : 0;
+
+      let serviceFeeItems: { label: string; value: number }[] = [];
+      if (plData && plData.fees) {
+        const itemizedServiceFees = Object.keys(plData.fees)
+          .filter(k =>
+            !isPlatformFeeKey(k) &&
+            !isAffiliateCogsFeeKey(k) &&
+            !isAdSpendFeeKey(k) &&
+            Math.abs(plData.fees[k]) > 0
+          )
+          .map(k => ({
+            label: k.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
+            value: Math.abs(plData.fees[k])
+          }))
+          .sort((a, b) => b.value - a.value);
+
+        const itemizedSum = itemizedServiceFees.reduce((sum, item) => sum + item.value, 0);
+        const diff = serviceFeesResidual - itemizedSum;
+
+        serviceFeeItems = [...itemizedServiceFees];
+        if (diff > 0.05) {
+          serviceFeeItems.push({
+            label: 'Other Uncategorized Fees',
+            value: diff
+          });
+        }
+      }
+
+      return {
+        totalOrderAmount,
+        totalTax,
+        totalProductTax,
+        totalShippingTax,
+        grossSalesGMV,
+        refunds,
+        netRevenue,
+        totalCogs,
+        totalProductShippingCost,
+        grossProfit,
+        tiktokCommission,
+        shippingCosts,
+        adSpend,
+        packagingSupplies,
+        totalExpenses,
+        netProfit,
+        grossMargin,
+        roi,
+        adConversionValue,
+        adROAS,
+        // GMV Components
+        totalUnitsSold,
+        realOperatingExpenses,
+        fbtFeesFromOrders: totalFbtFees,
+        gmvOriginalProductPrice: gmvComponents.originalProductPrice,
+        gmvShippingFees: gmvComponents.shippingFees,
+        gmvSellerDiscounts: gmvComponents.sellerDiscounts,
+        gmvPlatformDiscounts: gmvComponents.platformDiscounts,
+        manualAffiliateRetainers,
+        autoAffiliateCommission,
+        totalAffiliateCost,
+        shopAdsFees,
+        totalAgencyFees,
+        agencyFeeLines,
+        agencyFeeSummaryNotes,
+        hasTransactionData: plData?.meta?.has_complete_data || false,
+        totalFees: Math.abs(plData?.statement_totals?.total_fees || 0) - shopAdsFees - autoAffiliateCommission,
+        totalShipping: Math.abs(plData?.statement_totals?.total_shipping || 0),
+        settlementAmount: plData?.statement_totals?.total_settlement || 0,
+        statementNetSales: plData?.statement_totals?.total_net_sales ?? 0,
+        platformFees: platformFeesSum,
+        fbtFees: totalFbtFees,
+        serviceFees: serviceFeesResidual,
+        serviceFeeItems,
+        totalTaxes,
+        operatingExpenses: totalExpenses,
+        grossProfitPct,
+        operatingIncome,
+        operatingIncomePct,
+        heroGmvLines,
+        heroNetSalesLines,
+        heroNetProfitLines,
+      };
   }, [orders, cogsStats, dateRange, dataVersion, affiliateSettlements, agencyFees, plData, includeCancelledFinancials, marketingDaily, timezone]);
 
   // Destructure for easier usage in render
@@ -835,11 +963,14 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
     manualAffiliateRetainers,
     autoAffiliateCommission,
     totalAffiliateCost,
-    totalAgencyFees
+    totalAgencyFees,
+    agencyFeeLines,
+    agencyFeeSummaryNotes,
   } = financials;
 
   const handleDeleteRetainer = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
+    if (!canMutateShop) return;
     if (confirm('Are you sure you want to delete this retainer?')) {
       await deleteAffiliateSettlement(id);
     }
@@ -898,8 +1029,8 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
   const handleTodayClick = useCallback(() => {
     const today = new Date();
     const todayStr = formatShopDateISO(today, timezone);
-    setDateRange({ startDate: todayStr, endDate: todayStr });
-  }, [timezone]);
+    applyDateRange({ startDate: todayStr, endDate: todayStr });
+  }, [timezone, applyDateRange]);
 
   const isTodayActive = () => {
     const todayStr = formatShopDateISO(new Date(), timezone);
@@ -910,8 +1041,8 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
     const yesterday = new Date();
     yesterday.setDate(yesterday.getDate() - 1);
     const yesterdayStr = formatShopDateISO(yesterday, timezone);
-    setDateRange({ startDate: yesterdayStr, endDate: yesterdayStr });
-  }, [timezone]);
+    applyDateRange({ startDate: yesterdayStr, endDate: yesterdayStr });
+  }, [timezone, applyDateRange]);
 
   const isYesterdayActive = () => {
     const yesterday = new Date();
@@ -931,8 +1062,14 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
         ['Export Date', new Date().toLocaleDateString()],
         ['', ''],
 
-        // ===== REVENUE SECTION =====
-        ['═══ REVENUE ═══', ''],
+        ...buildTiktokStatementExportRows(plData, {
+          formatCurrency,
+          dateRangeLabel: `${dateRange.startDate} to ${dateRange.endDate}`,
+          timezoneLabel: timezone,
+        }),
+
+        // ===== MAMBA P&L (orders + statements) ═══
+        ['═══ REVENUE (order-based) ═══', ''],
         ['Gross Sales (GMV)', formatCurrency(financials.grossSalesGMV)],
         ['  Original Product Price', formatCurrency(financials.gmvOriginalProductPrice)],
         ['  Shipping Fees', formatCurrency(financials.gmvShippingFees)],
@@ -942,26 +1079,13 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
         ['Net Revenue', formatCurrency(financials.netRevenue)],
         ['', ''],
 
-        // ===== COSTS SECTION =====
-        ['═══ COST OF GOODS SOLD ═══', ''],
-        ['Total COGS', `-${formatCurrency(financials.totalCogs)}`],
-        ['  Regular Orders COGS', `-${formatCurrency(financials.totalCogs - cogsStats.sampleOrders.totalCogsValue)}`],
-        ['  Regular Orders Count', (orders.filter(o => !o.is_sample_order && getOrderTs(o) >= getShopDayStartTimestamp(dateRange.startDate, timezone) && getOrderTs(o) < getShopDayStartTimestamp(dateRange.endDate, timezone) + 86400).length - cogsStats.sampleOrders.count).toString()],
-        ['  Regular Orders Units', (financials.totalUnitsSold - cogsStats.sampleOrders.totalProducts).toString()],
-        ['  Sample Orders COGS', `-${formatCurrency(cogsStats.sampleOrders.totalCogsValue)}`],
-        ['  Sample Orders Count', cogsStats.sampleOrders.count.toString()],
-        ['  Sample Orders Units', cogsStats.sampleOrders.totalProducts.toString()],
-        ['Gross Profit', formatCurrency(financials.grossProfit)],
-        ['Gross Margin', formatPercent(financials.grossMargin)],
-        ['', ''],
-
         // ===== OPERATING EXPENSES =====
         ['═══ OPERATING EXPENSES ═══', ''],
 
         // Platform Fees
         ['Platform Fees', `-${formatCurrency(plData?.fees ? platformFeeKeys.reduce((sum, k) => sum + (plData.fees[k] || 0), 0) : 0)}`],
         ...Object.entries(plData?.fees || {})
-          .filter(([key]) => platformFeeKeys.includes(key))
+          .filter(([key]) => isPlatformFeeKey(key))
           .filter(([_, value]) => Math.abs(value) >= 0.01)
           .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
           .map(([key, value]) => [
@@ -973,7 +1097,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
         // Affiliate Fees
         ['Affiliate Fees', `-${formatCurrency(plData?.fees ? affiliateFeeKeys.reduce((sum, k) => sum + (plData.fees[k] || 0), 0) : 0)}`],
         ...Object.entries(plData?.fees || {})
-          .filter(([key]) => affiliateFeeKeys.includes(key))
+          .filter(([key]) => isAffiliateCogsFeeKey(key))
           .filter(([_, value]) => Math.abs(value) >= 0.01)
           .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
           .map(([key, value]) => [
@@ -983,8 +1107,8 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
         ['', ''],
 
         // Service Fees
-        ['Service Fees', `-${formatCurrency(plData?.fees ? Object.keys(plData.fees).filter(k => !platformFeeKeys.includes(k) && !affiliateFeeKeys.includes(k)).reduce((sum, k) => sum + (plData.fees[k] || 0), 0) : 0)}`],
-        ...Object.entries(plData?.fees || {}).filter(([key]) => !platformFeeKeys.includes(key) && !affiliateFeeKeys.includes(key)).filter(([_, value]) => Math.abs(value) >= 0.01).sort((a, b) => Math.abs(b[1]) - Math.abs(a[1])).map(([key, value]) => [`  ${SERVICE_LABELS[key] || key.replace(/_/g, ' ')}`, `-${formatCurrency(Math.abs(value))}`]),
+        ['Service Fees', `-${formatCurrency(plData?.fees ? Object.keys(plData.fees).filter(k => !isPlatformFeeKey(k) && !isAffiliateCogsFeeKey(k) && !isAdSpendFeeKey(k)).reduce((sum, k) => sum + (plData.fees[k] || 0), 0) : 0)}`],
+        ...Object.entries(plData?.fees || {}).filter(([key]) => !isPlatformFeeKey(key) && !isAffiliateCogsFeeKey(key) && !isAdSpendFeeKey(key)).filter(([_, value]) => Math.abs(value) >= 0.01).sort((a, b) => Math.abs(b[1]) - Math.abs(a[1])).map(([key, value]) => [`  ${SERVICE_LABELS[key] || key.replace(/_/g, ' ')}`, `-${formatCurrency(Math.abs(value))}`]),
         ['', ''],
 
         // Shipping Costs
@@ -1010,8 +1134,23 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
         ['  FBT Orders with Fees', orders.filter(o => o.fbt_fulfillment_fee && o.fbt_fulfillment_fee > 0).length.toString()],
         ['', ''],
 
+        // ===== COST OF GOODS SOLD =====
+        ['═══ COST OF GOODS SOLD ═══', ''],
+        ['Total COGS', `-${formatCurrency(financials.totalCogs)}`],
+        ['  Regular Orders COGS', `-${formatCurrency(financials.totalCogs - cogsStats.sampleOrders.totalCogsValue)}`],
+        ['  Regular Orders Count', (orders.filter(o => !o.is_sample_order && getOrderTs(o) >= getShopDayStartTimestamp(dateRange.startDate, timezone) && getOrderTs(o) < getShopDayStartTimestamp(dateRange.endDate, timezone) + 86400).length - cogsStats.sampleOrders.count).toString()],
+        ['  Regular Orders Units', (financials.totalUnitsSold - cogsStats.sampleOrders.totalProducts).toString()],
+        ['  Sample Orders COGS', `-${formatCurrency(cogsStats.sampleOrders.totalCogsValue)}`],
+        ['  Sample Orders Count', cogsStats.sampleOrders.count.toString()],
+        ['  Sample Orders Units', cogsStats.sampleOrders.totalProducts.toString()],
+        ['Gross Profit', formatCurrency(financials.grossProfit)],
+        ['Gross Margin', formatPercent(financials.grossMargin)],
+        ['', ''],
+
         // ===== PROFITABILITY =====
         ['═══ PROFITABILITY ═══', ''],
+        ['Net Sales (TikTok statements)', formatCurrency(financials.statementNetSales)],
+        ['Total Settlement Amount (TikTok)', formatCurrency(financials.settlementAmount)],
         ['Net Profit', formatCurrency(financials.netProfit)],
         ['ROI', formatPercent(financials.roi)],
         ['Ad ROAS', financials.adROAS.toFixed(2) + 'x'],
@@ -1045,7 +1184,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
         );
         break;
     }
-  }, [dateRange, financials, account.name, cogsStats, plData, orders, platformFeeKeys, affiliateFeeKeys, timezone]);
+  }, [dateRange, financials, account.name, cogsStats, plData, orders, timezone]);
 
 
   // Simulated P&L calculation
@@ -1116,26 +1255,156 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
     platformFees,
     fbtFees,
     serviceFees,
+    serviceFeeItems,
     operatingExpenses,
     grossProfitPct,
     operatingIncome,
     operatingIncomePct,
+    netProfit,
+    heroGmvLines,
+    heroNetSalesLines,
+    heroNetProfitLines,
+    refunds,
   } = financials;
 
-  // Basic view: Net Profit = GMV minus every expense bucket
-  const basicNetProfit =
-    financials.grossSalesGMV
-    - financials.totalCogs
-    - financials.totalProductShippingCost
-    - financials.totalAffiliateCost
-    - financials.realOperatingExpenses
-    - financials.adSpend;
-  const basicNetProfitPct =
-    financials.grossSalesGMV > 0 ? (basicNetProfit / financials.grossSalesGMV) * 100 : 0;
+  const toggleHero = useCallback((k: 'gmv' | 'netSales' | 'netProfit') => {
+    setExpandedHero(prev => (prev === k ? null : k));
+  }, []);
 
+  /** Prompt when TikTok statements are missing, incomplete, or likely stale for this shop/range. */
+  const financeDataNotice = useMemo(() => {
+    if (!shopId || plLoading || cacheMetadata.isSyncing) return null;
+    if (cacheMetadata.shopId !== shopId || cacheMetadata.accountId !== account.id) return null;
+    if (error) return null;
+
+    const neverSynced = !cacheMetadata.settlementsLastSynced;
+
+    const totalStatements = plData?.meta?.total_statements ?? 0;
+    const noStatementsInRange =
+      plData != null &&
+      totalStatements === 0 &&
+      financials.grossSalesGMV > 1;
+
+    const incompleteStatements =
+      plData != null &&
+      totalStatements > 0 &&
+      plData.meta?.has_complete_data === false;
+
+    const todayShop = formatShopDateISO(Date.now(), timezone);
+    const viewingRecentEnd = dateRange.endDate >= todayShop;
+    const syncedMs = cacheMetadata.settlementsLastSynced
+      ? new Date(cacheMetadata.settlementsLastSynced).getTime()
+      : 0;
+    const staleMs = 36 * 60 * 60 * 1000;
+    const settlementsStale =
+      Boolean(cacheMetadata.settlementsLastSynced) &&
+      Number.isFinite(syncedMs) &&
+      Date.now() - syncedMs > staleMs &&
+      viewingRecentEnd;
+
+    if (neverSynced) {
+      return {
+        kind: 'never' as const,
+        title: 'Financial statements not synced yet',
+        message:
+          'TikTok settlement data has not been downloaded for this shop. Run Sync finance to load statement totals, fees, shipping, and transaction breakdowns for your reports.',
+        action: 'sync' as const,
+      };
+    }
+    if (noStatementsInRange) {
+      const periodLabel = labelPlDateRangeForSyncPrompt(dateRange.startDate, dateRange.endDate, timezone);
+      return {
+        kind: 'gap' as const,
+        title: `Statement data not synced for ${periodLabel}`,
+        message: `There is sales activity in Mamba for ${periodLabel}, but no matching TikTok statements are loaded for that period yet. Run Sync finance to pull statements from TikTok.`,
+        action: 'sync' as const,
+      };
+    }
+    if (incompleteStatements) {
+      return {
+        kind: 'incomplete' as const,
+        title: 'Statement details incomplete',
+        message:
+          'Some settlements are missing full transaction lines. Use Full sync to backfill fee and shipping breakdowns from TikTok.',
+        action: 'full' as const,
+      };
+    }
+    if (settlementsStale) {
+      return {
+        kind: 'stale' as const,
+        title: 'Financial data may need a refresh',
+        message:
+          'Settlement sync is older than 36 hours while you are viewing dates that include today. Sync finance to pick up the latest daily statement from TikTok.',
+        action: 'sync' as const,
+      };
+    }
+    return null;
+  }, [
+    shopId,
+    plLoading,
+    error,
+    plData,
+    cacheMetadata.shopId,
+    cacheMetadata.accountId,
+    cacheMetadata.settlementsLastSynced,
+    cacheMetadata.isSyncing,
+    account.id,
+    financials.grossSalesGMV,
+    dateRange.startDate,
+    dateRange.endDate,
+    timezone,
+  ]);
 
   return (
     <div className="space-y-6">
+      {!canMutateShop && (
+        <div
+          className="flex items-start gap-3 rounded-xl border border-slate-500/30 bg-slate-800/50 px-4 py-3 text-sm text-slate-300"
+          role="status"
+        >
+          <Lock className="w-5 h-5 text-slate-400 shrink-0 mt-0.5" aria-hidden />
+          <div>
+            <p className="font-medium text-slate-100">Limited editing</p>
+            <p className="text-slate-400 mt-0.5">
+              {canSyncShop
+                ? 'You can use Sync Finance / Full Sync to refresh data from TikTok. You cannot add, edit, or delete manual agency fees or affiliate retainers.'
+                : 'You cannot add, edit, or delete manual agency fees or affiliate retainers for this shop.'}
+            </p>
+          </div>
+        </div>
+      )}
+
+      {financeDataNotice && (
+        <div
+          className="flex flex-col sm:flex-row sm:items-center gap-3 rounded-xl border border-amber-500/35 bg-amber-500/10 px-4 py-3 text-sm"
+          role="status"
+        >
+          <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 sm:mt-0.5" aria-hidden />
+          <div className="flex-1 min-w-0">
+            <p className="font-medium text-amber-100">{financeDataNotice.title}</p>
+            <p className="text-amber-200/85 mt-1 leading-relaxed">{financeDataNotice.message}</p>
+            {cacheMetadata.settlementsLastSynced && financeDataNotice.kind !== 'never' && (
+              <p className="text-xs text-amber-200/60 mt-2">
+                Last settlement sync:{' '}
+                {formatShopDateTime(cacheMetadata.settlementsLastSynced, timezone)}
+              </p>
+            )}
+          </div>
+          {canSyncShop && (
+            <button
+              type="button"
+              onClick={() =>
+                financeDataNotice.action === 'full' ? handleFullSync() : handleSync()
+              }
+              disabled={cacheMetadata.isSyncing || isLoading}
+              className="shrink-0 px-4 py-2 rounded-lg font-medium text-amber-950 bg-amber-400 hover:bg-amber-300 transition-colors disabled:opacity-50 disabled:pointer-events-none"
+            >
+              {financeDataNotice.action === 'full' ? 'Full sync' : 'Sync finance'}
+            </button>
+          )}
+        </div>
+      )}
+
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-2xl font-bold text-white mb-2">Profit & Loss Statement</h2>
@@ -1156,7 +1425,8 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
           )}
           <button
             onClick={handleSync}
-            disabled={cacheMetadata.isSyncing || isLoading}
+            disabled={!canSyncShop || cacheMetadata.isSyncing || isLoading}
+            title={!canSyncShop ? 'You do not have access to sync this shop' : undefined}
             className="flex items-center space-x-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg transition-colors disabled:opacity-50"
           >
             <RefreshCw size={20} className={cacheMetadata.isSyncing ? "animate-spin" : ""} />
@@ -1164,9 +1434,13 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
           </button>
           <button
             onClick={handleFullSync}
-            disabled={cacheMetadata.isSyncing || isLoading}
+            disabled={!canSyncShop || cacheMetadata.isSyncing || isLoading}
+            title={
+              !canSyncShop
+                ? 'You do not have access to sync this shop'
+                : 'Full re-sync: fetches all settlements with complete transaction details (affiliate commissions, platform fees, etc.)'
+            }
             className="flex items-center space-x-2 px-3 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg transition-colors disabled:opacity-50 text-sm"
-            title="Full re-sync: fetches all settlements with complete transaction details (affiliate commissions, platform fees, etc.)"
           >
             <RotateCcw size={16} className={cacheMetadata.isSyncing ? "animate-spin" : ""} />
             <span>Full Sync</span>
@@ -1228,7 +1502,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
             Yesterday
           </button>
 
-          <DateRangePicker value={dateRange} onChange={setDateRange} />
+          <DateRangePicker value={dateRange} onChange={applyDateRange} />
         </div>
       </div>
 
@@ -1318,39 +1592,184 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
         {/* ═══════════════════ FULL DETAIL VIEW ═══════════════════ */}
         <>
 
-          {/* GMV + Net Profit Hero Cards */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          {/* Top metrics: GMV, Net Sales, Net Profit (expandable breakdowns) */}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
             {/* GMV Card */}
-            <div className="bg-gray-800/60 border border-gray-700 rounded-2xl p-8">
-              <div className="flex items-center gap-3 mb-4">
-                <div className="p-2.5 bg-blue-500/20 rounded-xl">
-                  <DollarSign className="w-6 h-6 text-blue-400" />
+            <div className="bg-gray-800/60 border border-gray-700 rounded-2xl overflow-hidden">
+              <div
+                role="button"
+                tabIndex={0}
+                onClick={() => toggleHero('gmv')}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    toggleHero('gmv');
+                  }
+                }}
+                className="w-full p-6 md:p-8 text-left cursor-pointer hover:bg-gray-800/90 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/40"
+                aria-expanded={expandedHero === 'gmv'}
+              >
+                <div className="flex items-start justify-between gap-2 mb-4">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div className="p-2.5 bg-blue-500/20 rounded-xl shrink-0">
+                      <DollarSign className="w-6 h-6 text-blue-400" />
+                    </div>
+                    <p className="text-gray-400 text-sm font-semibold uppercase tracking-widest">Gross Merchandise Value</p>
+                  </div>
+                  <ChevronDown className={`w-5 h-5 shrink-0 text-gray-500 mt-1 transition-transform ${expandedHero === 'gmv' ? 'rotate-180' : ''}`} aria-hidden />
                 </div>
-                <p className="text-gray-400 text-sm font-semibold uppercase tracking-widest">Gross Merchandise Value</p>
+                <p className="text-5xl font-bold text-white tracking-tight">{formatCurrency(financials.grossSalesGMV)}</p>
+                <p className="text-gray-500 text-sm mt-3">Total revenue generated from all orders · click for breakdown</p>
               </div>
-              <p className="text-5xl font-bold text-white tracking-tight">{formatCurrency(financials.grossSalesGMV)}</p>
-              <p className="text-gray-500 text-sm mt-3">Total revenue generated from all orders</p>
+              {expandedHero === 'gmv' && (
+                <div className="px-6 md:px-8 pb-6 md:pb-8 pt-0 border-t border-gray-700/80 space-y-2 text-sm">
+                  <p className="text-gray-500 text-xs uppercase tracking-wide mb-2">How this total is built (orders in date range)</p>
+                  {heroGmvLines.map((row, i) => (
+                    <div key={i} className="flex justify-between gap-3">
+                      <span className="text-gray-400">{row.label}</span>
+                      <span className={`font-mono tabular-nums ${row.value < 0 ? 'text-red-400' : 'text-gray-200'}`}>
+                        {row.value < 0 ? '-' : ''}{formatCurrency(Math.abs(row.value))}
+                      </span>
+                    </div>
+                  ))}
+                  <div className="flex justify-between gap-3 pt-2 border-t border-gray-700 mt-2 font-semibold">
+                    <span className="text-white">Gross Merchandise Value</span>
+                    <span className="font-mono tabular-nums text-white">{formatCurrency(financials.grossSalesGMV)}</span>
+                  </div>
+                  {refunds > 0.005 && (
+                    <>
+                      <div className="flex justify-between gap-3 pt-2">
+                        <span className="text-gray-400">Refunds (cancelled/refunded orders)</span>
+                        <span className="font-mono tabular-nums text-red-400">-{formatCurrency(refunds)}</span>
+                      </div>
+                      <div className="flex justify-between gap-3 font-medium">
+                        <span className="text-gray-300">Net revenue (used downstream)</span>
+                        <span className="font-mono tabular-nums text-sky-400">{formatCurrency(netRevenue)}</span>
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Net Sales Card */}
+            <div className="bg-gray-800/60 border border-sky-500/20 rounded-2xl overflow-hidden">
+              <div
+                role="button"
+                tabIndex={0}
+                onClick={() => toggleHero('netSales')}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    toggleHero('netSales');
+                  }
+                }}
+                className="w-full p-6 md:p-8 text-left cursor-pointer hover:bg-gray-800/90 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-500/40"
+                aria-expanded={expandedHero === 'netSales'}
+              >
+                <div className="flex items-start justify-between gap-2 mb-4">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div className="p-2.5 bg-sky-500/20 rounded-xl shrink-0">
+                      <Receipt className="w-6 h-6 text-sky-400" />
+                    </div>
+                    <p className="text-gray-400 text-sm font-semibold uppercase tracking-widest truncate">Net Sales</p>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <span onClick={e => e.stopPropagation()} className="inline-flex">
+                      <CalculationTooltip
+                        source="TikTok Shop settlements"
+                        calculation="Sum of net_sales_amount for all statements in the selected date range (synced from TikTok)."
+                        api="GET /finance/pl-data → statement_totals.total_net_sales"
+                      />
+                    </span>
+                    <ChevronDown className={`w-5 h-5 text-gray-500 transition-transform ${expandedHero === 'netSales' ? 'rotate-180' : ''}`} aria-hidden />
+                  </div>
+                </div>
+                <p className="text-5xl font-bold text-sky-400 tracking-tight">{formatCurrency(financials.statementNetSales)}</p>
+                <p className="text-gray-500 text-sm mt-3">From statement data (TikTok) · click for breakdown</p>
+              </div>
+              {expandedHero === 'netSales' && (
+                <div className="px-6 md:px-8 pb-6 md:pb-8 pt-0 border-t border-gray-700/80 space-y-2 text-sm">
+                  <p className="text-gray-500 text-xs uppercase tracking-wide mb-2">Statement revenue rollups (synced transactions)</p>
+                  {heroNetSalesLines.length === 0 ? (
+                    <p className="text-gray-500 text-sm">No line-item revenue breakdown in synced data. The total above comes from TikTok settlement <code className="text-gray-400">net_sales_amount</code> per statement.</p>
+                  ) : (
+                    heroNetSalesLines.map((row, i) => (
+                      <div key={i} className="flex justify-between gap-3">
+                        <span className="text-gray-400">{row.label}</span>
+                        <span className={`font-mono tabular-nums ${row.value < 0 ? 'text-red-400' : 'text-gray-200'}`}>
+                          {row.value < 0 ? '-' : ''}{formatCurrency(Math.abs(row.value))}
+                        </span>
+                      </div>
+                    ))
+                  )}
+                  <div className="flex justify-between gap-3 pt-2 border-t border-gray-700 mt-2 font-semibold">
+                    <span className="text-white">Net sales (TikTok statements)</span>
+                    <span className="font-mono tabular-nums text-sky-400">{formatCurrency(financials.statementNetSales)}</span>
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Net Profit Card */}
-            <div className={`border rounded-2xl p-8 ${basicNetProfit >= 0 ? 'bg-emerald-900/20 border-emerald-500/30' : 'bg-red-900/20 border-red-500/30'}`}>
-              <div className="flex items-center gap-3 mb-4">
-                <div className={`p-2.5 rounded-xl ${basicNetProfit >= 0 ? 'bg-emerald-500/20' : 'bg-red-500/20'}`}>
-                  {basicNetProfit >= 0
-                    ? <TrendingUp className="w-6 h-6 text-emerald-400" />
-                    : <TrendingDown className="w-6 h-6 text-red-400" />}
+            <div className={`rounded-2xl overflow-hidden border ${netProfit >= 0 ? 'bg-emerald-900/20 border-emerald-500/30' : 'bg-red-900/20 border-red-500/30'}`}>
+              <div
+                role="button"
+                tabIndex={0}
+                onClick={() => toggleHero('netProfit')}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    toggleHero('netProfit');
+                  }
+                }}
+                className={`w-full p-6 md:p-8 text-left cursor-pointer transition-colors focus:outline-none focus-visible:ring-2 ${netProfit >= 0 ? 'hover:bg-emerald-900/25 focus-visible:ring-emerald-500/40' : 'hover:bg-red-900/25 focus-visible:ring-red-500/40'}`}
+                aria-expanded={expandedHero === 'netProfit'}
+              >
+                <div className="flex items-start justify-between gap-2 mb-4">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div className={`p-2.5 rounded-xl shrink-0 ${netProfit >= 0 ? 'bg-emerald-500/20' : 'bg-red-500/20'}`}>
+                      {netProfit >= 0
+                        ? <TrendingUp className="w-6 h-6 text-emerald-400" />
+                        : <TrendingDown className="w-6 h-6 text-red-400" />}
+                    </div>
+                    <p className="text-gray-400 text-sm font-semibold uppercase tracking-widest">Net Profit</p>
+                  </div>
+                  <ChevronDown className={`w-5 h-5 shrink-0 text-gray-500 mt-1 transition-transform ${expandedHero === 'netProfit' ? 'rotate-180' : ''}`} aria-hidden />
                 </div>
-                <p className="text-gray-400 text-sm font-semibold uppercase tracking-widest">Net Profit</p>
+                <p className={`text-5xl font-bold tracking-tight ${netProfit >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                  {netProfit < 0 ? '-' : ''}{formatCurrency(netProfit)}
+                </p>
+                <div className="flex items-center gap-3 mt-3 flex-wrap">
+                  <span className={`text-sm font-medium ${netProfit >= 0 ? 'text-emerald-400/70' : 'text-red-400/70'}`}>
+                    {operatingIncomePct.toFixed(1)}% of net revenue
+                  </span>
+                  <span className="text-gray-600 text-xs">· After COGS, affiliate, and operating expenses · click for math</span>
+                </div>
               </div>
-              <p className={`text-5xl font-bold tracking-tight ${basicNetProfit >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                {basicNetProfit < 0 ? '-' : ''}{formatCurrency(basicNetProfit)}
-              </p>
-              <div className="flex items-center gap-3 mt-3">
-                <span className={`text-sm font-medium ${basicNetProfit >= 0 ? 'text-emerald-400/70' : 'text-red-400/70'}`}>
-                  {basicNetProfitPct.toFixed(1)}% of GMV
-                </span>
-                <span className="text-gray-600 text-xs">· GMV minus all expenses</span>
-              </div>
+              {expandedHero === 'netProfit' && (
+                <div className="px-6 md:px-8 pb-6 md:pb-8 pt-0 border-t border-gray-700/50 space-y-2 text-sm">
+                  <p className="text-gray-500 text-xs uppercase tracking-wide mb-2">Net profit calculation</p>
+                  {heroNetProfitLines.map((row, i) => {
+                    const isSub = row.emphasis === 'subtotal';
+                    const isTot = row.emphasis === 'total';
+                    const neg = row.value < -0.005;
+                    const cls = isTot
+                      ? 'text-white font-bold text-base pt-2 border-t border-gray-600 mt-1'
+                      : isSub
+                        ? 'text-white font-semibold pt-2 border-t border-gray-700 mt-1'
+                        : '';
+                    return (
+                      <div key={i} className={`flex justify-between gap-3 ${cls}`}>
+                        <span className={isTot || isSub ? 'text-white' : 'text-gray-400'}>{row.label}</span>
+                        <span className={`font-mono tabular-nums ${isTot ? (netProfit >= 0 ? 'text-emerald-400' : 'text-red-400') : isSub ? 'text-blue-400' : neg ? 'text-red-400' : row.value > 0.005 ? 'text-emerald-400' : 'text-gray-200'}`}>
+                          {row.value < 0 ? '-' : ''}{formatCurrency(Math.abs(row.value))}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           </div>
 
@@ -1463,6 +1882,351 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
             </div>
           </div>
 
+          {/* ═══════════════════ OPERATING EXPENSES ═══════════════════ */}
+          <div className="bg-gray-800 rounded-xl border border-gray-700 p-6">
+            <h3 className="text-lg font-semibold text-white mb-2">Operating Expenses</h3>
+            <p className="text-gray-500 text-sm mb-4">
+              {hasTransactionData
+                ? 'Itemized from statement transaction data'
+                : 'Summary from settlement statements - sync to get itemized breakdowns'}
+            </p>
+            <div className="space-y-1">
+              {/* Platform Fees & Commissions */}
+              <ExpandableItem
+                icon={<Receipt className="w-5 h-5 text-white" />}
+                iconBgColor="bg-gradient-to-r from-purple-500 to-pink-500"
+                title="Platform Fees"
+                subtitle={hasTransactionData ? 'Itemized from transactions' : 'From settlement data'}
+                value={formatCurrency(hasTransactionData ? Math.abs(platformFees) : totalFees)}
+                valueColor="text-purple-400"
+                isNegative
+                tooltip={{
+                  source: "Statement Transactions",
+                  calculation: "Sum(platform_commission + referral_fee + transaction_fee + ...)",
+                  api: "GET /finance/pl-data"
+                }}
+                expandedContent={
+                  hasTransactionData ? (
+                    <BreakdownRows
+                      items={[
+                        { label: 'Platform Commission', value: plData?.fees?.platform_commission || 0 },
+                        { label: 'Referral Fee', value: plData?.fees?.referral_fee || 0 },
+                        { label: 'Transaction Fee', value: plData?.fees?.transaction_fee || 0 },
+                        { label: 'Refund Administration Fee', value: plData?.fees?.refund_administration_fee || 0 },
+                        { label: 'Credit Card Handling Fee', value: plData?.fees?.credit_card_handling_fee || 0 },
+                      ]}
+                      color="text-purple-400"
+                    />
+                  ) : (
+                    <p className="text-gray-500 text-sm">Sync finance data to see itemized fee breakdown</p>
+                  )
+                }
+              />
+
+              {/* Agency Fees */}
+              <ExpandableItem
+                icon={<Building2 className="w-5 h-5 text-white" />}
+                iconBgColor="bg-gradient-to-r from-blue-500 to-indigo-500"
+                title="Agency Fees"
+                subtitle="Manual agency service fees"
+                value={formatCurrency(totalAgencyFees)}
+                valueColor="text-blue-400"
+                isNegative
+                tooltip={{
+                  source: "Manual Entry (prorated)",
+                  calculation: "Retainer: daily share of period amount on each shop-calendar day in range. Commission: % × (GMV | net revenue | gross profit) × active days ÷ range days.",
+                  api: "Supabase agency_fees + in-app rollup",
+                }}
+                expandedContent={
+                  <div className="space-y-4">
+                    <div className="bg-gray-800 rounded-lg p-3 border border-gray-700 space-y-2">
+                      <p className="text-xs font-semibold text-gray-300 uppercase tracking-wide">How this is calculated</p>
+                      <ul className="text-xs text-gray-400 space-y-1.5 list-disc pl-4 leading-relaxed">
+                        {agencyFeeSummaryNotes.map((t, i) => (
+                          <li key={i}>{t}</li>
+                        ))}
+                      </ul>
+                    </div>
+
+                    {agencyFeeLines.length > 0 && (
+                      <div className="rounded-lg border border-gray-700 bg-gray-900/40 p-3 space-y-3">
+                        <p className="text-xs font-medium text-gray-300">
+                          Amounts for {dateRange.startDate} → {dateRange.endDate}
+                        </p>
+                        {agencyFeeLines.map((line) => (
+                          <div key={line.id} className="border-t border-gray-800 pt-3 first:border-t-0 first:pt-0">
+                            <div className="flex justify-between gap-2 items-start">
+                              <div>
+                                <p className="text-sm font-medium text-white">{line.agencyName}</p>
+                                <p className="text-[11px] text-gray-500 mt-0.5">
+                                  Starts {line.feeStartDate} · {line.feeType}
+                                  {line.feeType !== 'commission' ? ` · ${line.recurrence}` : ''}
+                                </p>
+                              </div>
+                              <span className="text-sm font-semibold text-blue-400 shrink-0">{formatCurrency(line.total)}</span>
+                            </div>
+                            <ul className="mt-2 space-y-1 text-[11px] text-gray-500 leading-snug">
+                              {line.notes.map((n, j) => (
+                                <li key={j}>{n}</li>
+                              ))}
+                            </ul>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    <div className="bg-gray-800/80 rounded-lg p-3 border border-gray-700">
+                      <p className="text-gray-400 text-xs leading-relaxed">
+                        These costs reduce net profit after gross profit. Edit definitions below; the card total always reflects proration for the selected range.
+                      </p>
+                    </div>
+
+                    {/* Manual Agency Fees List */}
+                    <div className="border-t border-gray-700 pt-4">
+                      <div className="flex items-center justify-between mb-2">
+                        <h4 className="text-sm font-medium text-white">Configured fees</h4>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (canMutateShop) setIsAgencyModalOpen(true);
+                          }}
+                          disabled={!canMutateShop}
+                          title={!canMutateShop ? 'Read-only for your role' : undefined}
+                          className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 active:bg-blue-500/30 rounded-lg transition-colors border border-blue-500/20 disabled:opacity-40 disabled:pointer-events-none"
+                        >
+                          <Plus size={14} />
+                          Add Fee
+                        </button>
+                      </div>
+
+                      {agencyFees.length === 0 ? (
+                        <p className="text-gray-500 text-xs italic">No manual agency fees on file for this shop (through {dateRange.endDate}).</p>
+                      ) : (
+                        <div className="space-y-2 max-h-60 overflow-y-auto pr-2 custom-scrollbar">
+                          {agencyFees.map((fee) => {
+                            const rolled = agencyFeeLines.find((l) => l.id === fee.id);
+                            const periodAmt = rolled?.total ?? 0;
+                            return (
+                              <div key={fee.id} className="flex items-center justify-between bg-gray-900/50 p-2 rounded border border-gray-800 gap-2">
+                                <div className="min-w-0">
+                                  <p className="text-sm text-gray-300 font-medium truncate">{fee.agency_name}</p>
+                                  <div className="flex flex-wrap items-center gap-x-2 text-xs text-gray-500">
+                                    <span>Starts {fee.date}</span>
+                                    {fee.description && (
+                                      <>
+                                        <span>•</span>
+                                        <span className="truncate max-w-[140px]">{fee.description}</span>
+                                      </>
+                                    )}
+                                  </div>
+                                  <p className="text-[11px] text-gray-600 mt-1">
+                                    This range: <span className="text-blue-400/90">{formatCurrency(periodAmt)}</span>
+                                    {fee.fee_type !== 'commission' &&
+                                      Number(fee.retainer_amount ?? fee.amount ?? 0) > 0 && (
+                                      <span className="text-gray-600">
+                                        {' '}
+                                        · retainer config ${Number(fee.retainer_amount ?? fee.amount).toFixed(2)}
+                                      </span>
+                                    )}
+                                  </p>
+                                </div>
+                                <div className="flex items-center gap-2 shrink-0">
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      if (!canMutateShop) return;
+                                      if (confirm('Are you sure you want to delete this agency fee?')) {
+                                        deleteAgencyFee(fee.id);
+                                      }
+                                    }}
+                                    disabled={!canMutateShop}
+                                    title={!canMutateShop ? 'Read-only for your role' : 'Delete Fee'}
+                                    className="text-gray-600 hover:text-red-400 transition-colors p-1 disabled:opacity-30 disabled:pointer-events-none"
+                                  >
+                                    <Trash2 size={14} />
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                }
+              />
+
+              {/* Ad Spend / Marketing (always visible so total adds up) */}
+              <ExpandableItem
+                icon={<Megaphone className="w-5 h-5 text-white" />}
+                iconBgColor={adSpend > 0
+                  ? "bg-gradient-to-r from-orange-500 to-red-500"
+                  : "bg-gradient-to-r from-gray-600 to-gray-500"}
+                title="Marketing / Ad Spend"
+                subtitle={adsConnected
+                  ? `TikTok Ads API + Shop Settlement Deductions`
+                  : "TikTok advertising costs (connect Ads account to populate)"}
+                value={formatCurrency(adSpend)}
+                valueColor={adSpend > 0 ? "text-orange-400" : "text-gray-500"}
+                isNegative={adSpend > 0}
+                tooltip={{
+                  source: adsConnected ? "TikTok Business API + Shop Settlements" : "Not Available",
+                  calculation: "Marketing API Spend + Shop Ads Fees (TAP from settlements); affiliate ads commission is in Affiliate COGS",
+                  api: "GET /tiktok-ads/spend + GET /finance/pl-data"
+                }}
+                expandedContent={
+                  adsConnected && adSpend > 0 ? (
+                    <BreakdownRows
+                      items={[
+                        { label: 'TikTok Ads API Spend', value: financials.adSpend - financials.shopAdsFees },
+                        ...adSpendFeeKeys
+                          .filter(k => Math.abs(plData?.fees?.[k] || 0) >= 0.01)
+                          .map(k => ({
+                            label: FEE_LABELS[k] || k.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
+                            value: Math.abs(plData?.fees?.[k] || 0)
+                          }))
+                      ]}
+                      color="text-orange-400"
+                    />
+                  ) : (
+                    <p className="text-gray-400 text-sm">Connect your TikTok Ads account in the Marketing tab to include ad spend in your P&L.</p>
+                  )
+                }
+              />
+
+              {/* Service Fees */}
+              {serviceFees > 0 && (
+                <ExpandableItem
+                  icon={<DollarSign className="w-5 h-5 text-white" />}
+                  iconBgColor="bg-gradient-to-r from-indigo-500 to-purple-500"
+                  title="Service Fees"
+                  subtitle="TikTok service and promotion fees"
+                  value={formatCurrency(serviceFees)}
+                  valueColor="text-indigo-400"
+                  isNegative
+                  tooltip={{
+                    source: "Statement Transactions",
+                    calculation: "Sum(all service fees)",
+                    api: "GET /finance/pl-data"
+                  }}
+                  expandedContent={
+                    serviceFeeItems.length > 0 ? (
+                      <BreakdownRows
+                        items={serviceFeeItems}
+                        color="text-indigo-400"
+                      />
+                    ) : (
+                      <p className="text-gray-400 text-sm">No detailed itemization available for these service fees.</p>
+                    )
+                  }
+                />
+              )}
+
+              {/* Shipping Costs (includes FBT Fulfillment Fees) */}
+              <ExpandableItem
+                icon={<Truck className="w-5 h-5 text-white" />}
+                iconBgColor={totalShipping > 0
+                  ? 'bg-gradient-to-r from-cyan-500 to-blue-500'
+                  : 'bg-gradient-to-r from-gray-600 to-gray-500'}
+                title="Shipping Costs"
+                subtitle={`${hasTransactionData ? 'Itemized shipping breakdown' : 'From settlement data'} (excl. FBT)`}
+                value={totalShipping > 0 ? formatCurrency(totalShipping) : '$0.00'}
+                valueColor={totalShipping > 0 ? 'text-cyan-400' : 'text-gray-500'}
+                isNegative={totalShipping > 0}
+                tooltip={{
+                  source: "Statement Transactions",
+                  calculation: "Sum(shipping_cost_amount) — FBT fees shown for reference only, excluded from OpEx",
+                  api: "GET /finance/pl-data"
+                }}
+                expandedContent={
+                  <div className="space-y-1">
+                    {hasTransactionData ? (
+                      <BreakdownRows
+                        items={recordToItems(plData?.shipping, SHIPPING_LABELS)}
+                        color="text-cyan-400"
+                      />
+                    ) : (
+                      <p className="text-gray-500 text-sm">Sync finance data to see itemized shipping breakdown</p>
+                    )}
+                    {/* Shipping subtotal (included in OpEx) */}
+                    {totalShipping > 0 && (
+                      <div className="flex justify-between text-xs text-gray-400 pt-1 border-t border-gray-700/50 mt-2">
+                        <span>Shipping subtotal (in OpEx)</span>
+                        <span>{formatCurrency(totalShipping)}</span>
+                      </div>
+                    )}
+                    {/* FBT fees — shown for reference, excluded from OpEx calculation */}
+                    {fbtFees > 0 && (
+                      <div className="mt-3 pt-3 border-t border-gray-700">
+                        <p className="text-xs text-gray-500 mb-2 uppercase tracking-wide">FBT Fees (excluded from OpEx)</p>
+                        <div className="flex justify-between text-sm opacity-50">
+                          <span className="line-through text-gray-400">FBT Fulfillment Fee</span>
+                          <span className="line-through text-gray-400">{formatCurrency(fbtFees)}</span>
+                        </div>
+                        <p className="text-gray-600 text-xs mt-1 line-through">
+                          From {orders.filter((o: any) => o.fbt_fulfillment_fee && o.fbt_fulfillment_fee > 0).length} FBT orders
+                        </p>
+                        <div className="flex justify-between text-xs text-gray-500 pt-2 mt-1 border-t border-gray-700/50">
+                          <span>Total incl. FBT (reference only)</span>
+                          <span>{formatCurrency(totalShipping + fbtFees)}</span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                }
+              />
+
+
+              {/* Total Operating Expenses */}
+              <div className="flex items-center justify-between py-4 bg-red-500/10 rounded-lg px-4 mt-2">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-lg bg-gradient-to-r from-red-500 to-pink-500 flex items-center justify-center">
+                    <TrendingDown className="w-5 h-5 text-white" />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <p className="text-lg font-bold text-white">Total Operating Expenses</p>
+                      <CalculationTooltip
+                        source="Calculated"
+                        calculation="Platform Fees + Service Fees + Shipping + Marketing/Ad Spend + Agency Fees"
+                        api="Calculated"
+                      />
+                    </div>
+                    <p className="text-xs text-gray-400">Platform, service fees + Shipping (excl. FBT) + Marketing + Agency (excludes Affiliate COGS, FBT & Taxes)</p>
+                  </div>
+                </div>
+                <p className="text-2xl font-bold text-red-400">-{formatCurrency(operatingExpenses)}</p>
+              </div>
+
+              {/* Operating Income */}
+              <div className="flex items-center justify-between py-4 bg-emerald-500/10 rounded-lg px-4 mt-2">
+                <div className="flex items-center gap-3">
+                  <div className={`w-10 h-10 rounded-lg ${operatingIncome >= 0 ? 'bg-gradient-to-r from-emerald-500 to-teal-500' : 'bg-gradient-to-r from-red-500 to-pink-500'} flex items-center justify-center`}>
+                    {operatingIncome >= 0 ? <TrendingUp className="w-5 h-5 text-white" /> : <TrendingDown className="w-5 h-5 text-white" />}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <p className="text-lg font-bold text-white">Operating Income</p>
+                    <CalculationTooltip
+                      source="Calculated"
+                      calculation="Gross Profit - Operating Expenses"
+                      api="Calculated"
+                    />
+                  </div>
+                </div>
+                <div className="text-right">
+                  <p className={`text-2xl font-bold ${operatingIncome >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                    {operatingIncome < 0 ? '-' : ''}{formatCurrency(operatingIncome)}
+                  </p>
+                  <p className={`text-sm font-medium ${operatingIncome >= 0 ? 'text-emerald-400/70' : 'text-red-400/70'}`}>
+                    {formatPercent(operatingIncomePct)}
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+
           {/* ═══════════════════ COST OF GOODS SOLD ═══════════════════ */}
           <div className="bg-gray-800 rounded-xl border border-gray-700 p-6">
             <h3 className="text-lg font-semibold text-white mb-2">Cost of Goods Sold</h3>
@@ -1546,11 +2310,14 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                       <div className="flex items-center justify-between mb-2">
                         <h4 className="text-sm font-medium text-white">Manual Retainers</h4>
                         <button
+                          type="button"
                           onClick={(e) => {
                             e.stopPropagation();
-                            setIsAffiliateModalOpen(true);
+                            if (canMutateShop) setIsAffiliateModalOpen(true);
                           }}
-                          className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-pink-500/10 text-pink-400 hover:bg-pink-500/20 active:bg-pink-500/30 rounded-lg transition-colors border border-pink-500/20"
+                          disabled={!canMutateShop}
+                          title={!canMutateShop ? 'Read-only for your role' : undefined}
+                          className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-pink-500/10 text-pink-400 hover:bg-pink-500/20 active:bg-pink-500/30 rounded-lg transition-colors border border-pink-500/20 disabled:opacity-40 disabled:pointer-events-none"
                         >
                           <Plus size={14} />
                           Add Retainer
@@ -1578,9 +2345,11 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                               <div className="flex items-center gap-3">
                                 <span className="text-pink-400 text-sm font-medium">{formatCurrency(settlement.amount)}</span>
                                 <button
+                                  type="button"
                                   onClick={(e) => handleDeleteRetainer(settlement.id, e)}
-                                  className="text-gray-600 hover:text-red-400 transition-colors p-1"
-                                  title="Delete Retainer"
+                                  disabled={!canMutateShop}
+                                  title={!canMutateShop ? 'Read-only for your role' : 'Delete Retainer'}
+                                  className="text-gray-600 hover:text-red-400 transition-colors p-1 disabled:opacity-30 disabled:pointer-events-none"
                                 >
                                   <Trash2 size={14} />
                                 </button>
@@ -1741,330 +2510,10 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
             )}
           </div>
 
-          {/* ═══════════════════ MARKETING COSTS (AD SPEND) ═══════════════════ */}
-          {adSpend > 0 && (
-            <div className="bg-gray-800 rounded-xl border border-gray-700 p-6">
-              <h3 className="text-lg font-semibold text-white mb-2">Marketing Costs</h3>
-              <p className="text-gray-500 text-sm mb-4">Total ad spend from synced marketing data (same as Marketing Dashboard)</p>
-              <div className="space-y-1">
-                <ExpandableItem
-                  icon={<Megaphone className="w-5 h-5 text-white" />}
-                  iconBgColor="bg-gradient-to-r from-pink-600 to-red-600"
-                  title="TikTok Ad Spend"
-                  subtitle="Synced from Marketing Dashboard"
-                  value={formatCurrency(adSpend)}
-                  valueColor="text-red-400"
-                  isNegative
-                  tooltip={{
-                    source: "Synced Marketing Data (tiktok_ad_spend_daily)",
-                    calculation: "Sum of daily total_spend within selected date range",
-                    api: "GET /api/tiktok-ads/marketing-data (synced DB)"
-                  }}
-                />
-
-                {/* Total Marketing Costs */}
-                <div className="flex items-center justify-between py-4 bg-red-500/10 rounded-lg px-4 mt-2">
-                  <div className="flex items-center gap-3">
-                    <div className="w-10 h-10 rounded-lg bg-gradient-to-r from-pink-600 to-red-600 flex items-center justify-center">
-                      <Zap className="w-5 h-5 text-white" />
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <p className="text-lg font-bold text-white">Total Marketing Costs</p>
-                      <CalculationTooltip
-                        source="Synced Marketing Data (tiktok_ad_spend_daily)"
-                        calculation="Sum of total_spend within selected date range"
-                        api="GET /api/tiktok-ads/marketing-data (synced DB)"
-                      />
-                    </div>
-                  </div>
-                  <p className="text-2xl font-bold text-red-400">-{formatCurrency(adSpend)}</p>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* ═══════════════════ OPERATING EXPENSES ═══════════════════ */}
-          <div className="bg-gray-800 rounded-xl border border-gray-700 p-6">
-            <h3 className="text-lg font-semibold text-white mb-2">Operating Expenses</h3>
-            <p className="text-gray-500 text-sm mb-4">
-              {hasTransactionData
-                ? 'Itemized from statement transaction data'
-                : 'Summary from settlement statements - sync to get itemized breakdowns'}
-            </p>
-            <div className="space-y-1">
-              {/* Platform Fees & Commissions */}
-              <ExpandableItem
-                icon={<Receipt className="w-5 h-5 text-white" />}
-                iconBgColor="bg-gradient-to-r from-purple-500 to-pink-500"
-                title="Platform Fees"
-                subtitle={hasTransactionData ? 'Itemized from transactions' : 'From settlement data'}
-                value={formatCurrency(hasTransactionData ? Math.abs(platformFees) : totalFees)}
-                valueColor="text-purple-400"
-                isNegative
-                tooltip={{
-                  source: "Statement Transactions",
-                  calculation: "Sum(platform_commission + referral_fee + transaction_fee + ...)",
-                  api: "GET /finance/pl-data"
-                }}
-                expandedContent={
-                  hasTransactionData ? (
-                    <BreakdownRows
-                      items={[
-                        { label: 'Platform Commission', value: plData?.fees?.platform_commission || 0 },
-                        { label: 'Referral Fee', value: plData?.fees?.referral_fee || 0 },
-                        { label: 'Transaction Fee', value: plData?.fees?.transaction_fee || 0 },
-                        { label: 'Refund Administration Fee', value: plData?.fees?.refund_administration_fee || 0 },
-                        { label: 'Credit Card Handling Fee', value: plData?.fees?.credit_card_handling_fee || 0 },
-                      ]}
-                      color="text-purple-400"
-                    />
-                  ) : (
-                    <p className="text-gray-500 text-sm">Sync finance data to see itemized fee breakdown</p>
-                  )
-                }
-              />
-
-              {/* Agency Fees */}
-              <ExpandableItem
-                icon={<Building2 className="w-5 h-5 text-white" />}
-                iconBgColor="bg-gradient-to-r from-blue-500 to-indigo-500"
-                title="Agency Fees"
-                subtitle="Manual agency service fees"
-                value={formatCurrency(totalAgencyFees)}
-                valueColor="text-blue-400"
-                isNegative
-                tooltip={{
-                  source: "Manual Entry",
-                  calculation: "Sum(manual agency fees)",
-                  api: "GET /agency-fees"
-                }}
-                expandedContent={
-                  <div className="space-y-4">
-                    <div className="bg-gray-800 rounded-lg p-3 border border-gray-700">
-                      <p className="text-gray-400 text-xs">Manage manual agency fees for this period. These costs are subtracted from gross profit to calculate net profit.</p>
-                    </div>
-
-                    {/* Manual Agency Fees List */}
-                    <div className="border-t border-gray-700 pt-4">
-                      <div className="flex items-center justify-between mb-2">
-                        <h4 className="text-sm font-medium text-white">Agency Fees</h4>
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setIsAgencyModalOpen(true);
-                          }}
-                          className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 active:bg-blue-500/30 rounded-lg transition-colors border border-blue-500/20"
-                        >
-                          <Plus size={14} />
-                          Add Fee
-                        </button>
-                      </div>
-
-                      {agencyFees.length === 0 ? (
-                        <p className="text-gray-500 text-xs italic">No manual agency fees for this period.</p>
-                      ) : (
-                        <div className="space-y-2 max-h-60 overflow-y-auto pr-2 custom-scrollbar">
-                          {agencyFees.map(fee => (
-                            <div key={fee.id} className="flex items-center justify-between bg-gray-900/50 p-2 rounded border border-gray-800">
-                              <div>
-                                <p className="text-sm text-gray-300 font-medium">{fee.agency_name}</p>
-                                <div className="flex items-center gap-2 text-xs text-gray-500">
-                                  <span>{fee.date}</span>
-                                  {fee.description && (
-                                    <>
-                                      <span>•</span>
-                                      <span className="truncate max-w-[150px]">{fee.description}</span>
-                                    </>
-                                  )}
-                                </div>
-                              </div>
-                              <div className="flex items-center gap-3">
-                                <span className="text-blue-400 text-sm font-medium">{formatCurrency(fee.amount)}</span>
-                                <button
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    if (confirm('Are you sure you want to delete this agency fee?')) {
-                                      deleteAgencyFee(fee.id);
-                                    }
-                                  }}
-                                  className="text-gray-600 hover:text-red-400 transition-colors p-1"
-                                  title="Delete Fee"
-                                >
-                                  <Trash2 size={14} />
-                                </button>
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                }
-              />
-
-              {/* Ad Spend / Marketing (always visible so total adds up) */}
-              <ExpandableItem
-                icon={<Megaphone className="w-5 h-5 text-white" />}
-                iconBgColor={adSpend > 0
-                  ? "bg-gradient-to-r from-orange-500 to-red-500"
-                  : "bg-gradient-to-r from-gray-600 to-gray-500"}
-                title="Marketing / Ad Spend"
-                subtitle={adsConnected
-                  ? `TikTok Ads API + Shop Settlement Deductions`
-                  : "TikTok advertising costs (connect Ads account to populate)"}
-                value={formatCurrency(adSpend)}
-                valueColor={adSpend > 0 ? "text-orange-400" : "text-gray-500"}
-                isNegative={adSpend > 0}
-                tooltip={{
-                  source: adsConnected ? "TikTok Business API + Shop Settlements" : "Not Available",
-                  calculation: "Marketing API Spend + Shop Ads Fees (TAP/Affiliate Ads)",
-                  api: "GET /tiktok-ads/spend + GET /finance/pl-data"
-                }}
-                expandedContent={
-                  adsConnected && adSpend > 0 ? (
-                    <BreakdownRows
-                      items={[
-                        { label: 'TikTok Ads API Spend', value: financials.adSpend - financials.shopAdsFees },
-                        ...adSpendFeeKeys
-                          .filter(k => Math.abs(plData?.fees?.[k] || 0) >= 0.01)
-                          .map(k => ({
-                            label: FEE_LABELS[k] || k.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
-                            value: Math.abs(plData?.fees?.[k] || 0)
-                          }))
-                      ]}
-                      color="text-orange-400"
-                    />
-                  ) : (
-                    <p className="text-gray-400 text-sm">Connect your TikTok Ads account in the Marketing tab to include ad spend in your P&L.</p>
-                  )
-                }
-              />
-
-              {/* Service Fees — no dropdown, total only */}
-              {serviceFees > 0 && (
-                <ExpandableItem
-                  icon={<DollarSign className="w-5 h-5 text-white" />}
-                  iconBgColor="bg-gradient-to-r from-indigo-500 to-purple-500"
-                  title="Service Fees"
-                  subtitle="TikTok service and promotion fees"
-                  value={formatCurrency(serviceFees)}
-                  valueColor="text-indigo-400"
-                  isNegative
-                  tooltip={{
-                    source: "Statement Transactions",
-                    calculation: "Sum(all service fees)",
-                    api: "GET /finance/pl-data"
-                  }}
-                />
-              )}
-
-              {/* Shipping Costs (includes FBT Fulfillment Fees) */}
-              <ExpandableItem
-                icon={<Truck className="w-5 h-5 text-white" />}
-                iconBgColor={totalShipping > 0
-                  ? 'bg-gradient-to-r from-cyan-500 to-blue-500'
-                  : 'bg-gradient-to-r from-gray-600 to-gray-500'}
-                title="Shipping Costs"
-                subtitle={`${hasTransactionData ? 'Itemized shipping breakdown' : 'From settlement data'} (excl. FBT)`}
-                value={totalShipping > 0 ? formatCurrency(totalShipping) : '$0.00'}
-                valueColor={totalShipping > 0 ? 'text-cyan-400' : 'text-gray-500'}
-                isNegative={totalShipping > 0}
-                tooltip={{
-                  source: "Statement Transactions",
-                  calculation: "Sum(shipping_cost_amount) — FBT fees shown for reference only, excluded from OpEx",
-                  api: "GET /finance/pl-data"
-                }}
-                expandedContent={
-                  <div className="space-y-1">
-                    {hasTransactionData ? (
-                      <BreakdownRows
-                        items={recordToItems(plData?.shipping, SHIPPING_LABELS)}
-                        color="text-cyan-400"
-                      />
-                    ) : (
-                      <p className="text-gray-500 text-sm">Sync finance data to see itemized shipping breakdown</p>
-                    )}
-                    {/* Shipping subtotal (included in OpEx) */}
-                    {totalShipping > 0 && (
-                      <div className="flex justify-between text-xs text-gray-400 pt-1 border-t border-gray-700/50 mt-2">
-                        <span>Shipping subtotal (in OpEx)</span>
-                        <span>{formatCurrency(totalShipping)}</span>
-                      </div>
-                    )}
-                    {/* FBT fees — shown for reference, excluded from OpEx calculation */}
-                    {fbtFees > 0 && (
-                      <div className="mt-3 pt-3 border-t border-gray-700">
-                        <p className="text-xs text-gray-500 mb-2 uppercase tracking-wide">FBT Fees (excluded from OpEx)</p>
-                        <div className="flex justify-between text-sm opacity-50">
-                          <span className="line-through text-gray-400">FBT Fulfillment Fee</span>
-                          <span className="line-through text-gray-400">{formatCurrency(fbtFees)}</span>
-                        </div>
-                        <p className="text-gray-600 text-xs mt-1 line-through">
-                          From {orders.filter((o: any) => o.fbt_fulfillment_fee && o.fbt_fulfillment_fee > 0).length} FBT orders
-                        </p>
-                        <div className="flex justify-between text-xs text-gray-500 pt-2 mt-1 border-t border-gray-700/50">
-                          <span>Total incl. FBT (reference only)</span>
-                          <span>{formatCurrency(totalShipping + fbtFees)}</span>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                }
-              />
-
-
-              {/* Total Operating Expenses */}
-              <div className="flex items-center justify-between py-4 bg-red-500/10 rounded-lg px-4 mt-2">
-                <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 rounded-lg bg-gradient-to-r from-red-500 to-pink-500 flex items-center justify-center">
-                    <TrendingDown className="w-5 h-5 text-white" />
-                  </div>
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <p className="text-lg font-bold text-white">Total Operating Expenses</p>
-                      <CalculationTooltip
-                        source="Calculated"
-                        calculation="Platform Fees + Service Fees + Shipping + Marketing/Ad Spend + Agency Fees"
-                        api="Calculated"
-                      />
-                    </div>
-                    <p className="text-xs text-gray-400">Platform, service fees + Shipping (excl. FBT) + Marketing + Agency (excludes Affiliate COGS, FBT & Taxes)</p>
-                  </div>
-                </div>
-                <p className="text-2xl font-bold text-red-400">-{formatCurrency(operatingExpenses)}</p>
-              </div>
-
-              {/* Operating Income */}
-              <div className="flex items-center justify-between py-4 bg-emerald-500/10 rounded-lg px-4 mt-2">
-                <div className="flex items-center gap-3">
-                  <div className={`w-10 h-10 rounded-lg ${operatingIncome >= 0 ? 'bg-gradient-to-r from-emerald-500 to-teal-500' : 'bg-gradient-to-r from-red-500 to-pink-500'} flex items-center justify-center`}>
-                    {operatingIncome >= 0 ? <TrendingUp className="w-5 h-5 text-white" /> : <TrendingDown className="w-5 h-5 text-white" />}
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <p className="text-lg font-bold text-white">Operating Income</p>
-                    <CalculationTooltip
-                      source="Calculated"
-                      calculation="Gross Profit - Operating Expenses"
-                      api="Calculated"
-                    />
-                  </div>
-                </div>
-                <div className="text-right">
-                  <p className={`text-2xl font-bold ${operatingIncome >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                    {operatingIncome < 0 ? '-' : ''}{formatCurrency(operatingIncome)}
-                  </p>
-                  <p className={`text-sm font-medium ${operatingIncome >= 0 ? 'text-emerald-400/70' : 'text-red-400/70'}`}>
-                    {formatPercent(operatingIncomePct)}
-                  </p>
-                </div>
-              </div>
-            </div>
-          </div>
-
           {/* ═══════════════════ PROFITABILITY SUMMARY ═══════════════════ */}
           <div className="bg-gradient-to-r from-green-500/10 to-emerald-500/10 border border-green-500/30 rounded-xl p-6">
             <h3 className="text-lg font-semibold text-white mb-6">Profitability Summary</h3>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-7 gap-4">
               {/* GMV */}
               <div className="bg-gray-800/50 rounded-lg p-5 border border-gray-700">
                 <div className="flex items-center gap-3 mb-3">
@@ -2075,20 +2524,92 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                 <p className="text-xs text-gray-500 mt-1">Gross Merchandise Value</p>
               </div>
 
+              {/* Net sales (statement) */}
+              <div className="bg-gray-800/50 rounded-lg p-5 border border-gray-700">
+                <div className="flex items-center justify-between gap-2 mb-3">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <Receipt className="w-5 h-5 text-sky-400 shrink-0" />
+                    <p className="text-gray-400 text-sm font-medium truncate">Net Sales</p>
+                  </div>
+                  <CalculationTooltip
+                    source="TikTok Shop settlements"
+                    calculation="Sum of net_sales_amount for all statements in the selected date range (synced from TikTok)."
+                    api="GET /finance/pl-data → statement_totals.total_net_sales"
+                  />
+                </div>
+                <p className="text-2xl font-bold text-sky-400">{formatCurrency(financials.statementNetSales)}</p>
+                <p className="text-xs text-gray-500 mt-1">From statement data (TikTok)</p>
+              </div>
+
+              {/* Total settlement amount */}
+              <div className="bg-gray-800/50 rounded-lg p-5 border border-gray-700">
+                <div className="flex items-center justify-between gap-2 mb-3">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <CircleDollarSign className="w-5 h-5 text-violet-400 shrink-0" />
+                    <p className="text-gray-400 text-sm font-medium truncate">Total Settlement</p>
+                  </div>
+                  <CalculationTooltip
+                    source="TikTok Shop settlements"
+                    calculation="Sum of statement settlement amounts for the date range. Uses settlement_data.settlement_amount from the Finance API when present (matches Seller Center); otherwise transaction summary or net_amount."
+                    api="GET /finance/pl-data → statement_totals.total_settlement"
+                  />
+                </div>
+                <p className="text-2xl font-bold text-violet-400">{formatCurrency(financials.settlementAmount)}</p>
+                <p className="text-xs text-gray-500 mt-1">Settlement amount (TikTok)</p>
+              </div>
+
+              {/* Gross Profit */}
+              <div className="bg-gray-800/50 rounded-lg p-5 border border-gray-700">
+                <div className="flex items-center justify-between gap-2 mb-3">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <Wallet className="w-5 h-5 text-amber-400 shrink-0" />
+                    <p className="text-gray-400 text-sm font-medium truncate">Gross Profit</p>
+                  </div>
+                  <CalculationTooltip
+                    source="Calculated in app"
+                    calculation="Net Revenue − Product COGS − Product Shipping Cost (your data) − Affiliate Commissions (COGS)"
+                    api="TikTok API: none (computed from orders + statement fee rollups)"
+                  />
+                </div>
+                <p className={`text-2xl font-bold ${financials.grossProfit >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                  {financials.grossProfit < 0 ? '-' : ''}{formatCurrency(financials.grossProfit)}
+                </p>
+                <p className="text-xs text-gray-500 mt-1">Profit after COGS & affiliate commissions</p>
+              </div>
+
+              {/* Gross Margin */}
+              <div className="bg-gray-800/50 rounded-lg p-5 border border-gray-700">
+                <div className="flex items-center justify-between gap-2 mb-3">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <Percent className="w-5 h-5 text-cyan-400 shrink-0" />
+                    <p className="text-gray-400 text-sm font-medium truncate">Gross Margin</p>
+                  </div>
+                  <CalculationTooltip
+                    source="Calculated in app"
+                    calculation="(Gross Profit ÷ Net Revenue) × 100 — 0% when Net Revenue is 0"
+                    api="TikTok API: none (computed)"
+                  />
+                </div>
+                <p className={`text-2xl font-bold ${financials.grossMargin >= 20 ? 'text-emerald-400' : financials.grossMargin >= 0 ? 'text-yellow-400' : 'text-red-400'}`}>
+                  {financials.grossMargin.toFixed(1)}%
+                </p>
+                <p className="text-xs text-gray-500 mt-1">Gross Profit ÷ Net Revenue</p>
+              </div>
+
               {/* Net Profit $ */}
               <div className="bg-gray-800/50 rounded-lg p-5 border border-gray-700">
                 <div className="flex items-center gap-3 mb-3">
-                  {basicNetProfit >= 0 ? (
+                  {netProfit >= 0 ? (
                     <TrendingUp className="w-5 h-5 text-emerald-400" />
                   ) : (
                     <TrendingDown className="w-5 h-5 text-red-400" />
                   )}
                   <p className="text-gray-400 text-sm font-medium">Net Profit</p>
                 </div>
-                <p className={`text-2xl font-bold ${basicNetProfit >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                  {basicNetProfit < 0 ? '-' : ''}{formatCurrency(basicNetProfit)}
+                <p className={`text-2xl font-bold ${netProfit >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                  {netProfit < 0 ? '-' : ''}{formatCurrency(netProfit)}
                 </p>
-                <p className="text-xs text-gray-500 mt-1">GMV minus all expenses</p>
+                <p className="text-xs text-gray-500 mt-1">Net revenue after all expenses</p>
               </div>
 
               {/* Net Profit % */}
@@ -2097,10 +2618,10 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                   <PieChart className="w-5 h-5 text-emerald-400" />
                   <p className="text-gray-400 text-sm font-medium">Net Profit %</p>
                 </div>
-                <p className={`text-2xl font-bold ${basicNetProfitPct >= 10 ? 'text-green-400' : basicNetProfitPct >= 0 ? 'text-yellow-400' : 'text-red-400'}`}>
-                  {basicNetProfitPct.toFixed(1)}%
+                <p className={`text-2xl font-bold ${operatingIncomePct >= 10 ? 'text-green-400' : operatingIncomePct >= 0 ? 'text-yellow-400' : 'text-red-400'}`}>
+                  {operatingIncomePct.toFixed(1)}%
                 </p>
-                <p className="text-xs text-gray-500 mt-1">Net Profit / GMV</p>
+                <p className="text-xs text-gray-500 mt-1">Net Profit ÷ Net Revenue</p>
               </div>
 
             </div>
@@ -2319,19 +2840,23 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
         </>
       </>
 
-      <ManualAffiliateModal
-        isOpen={isAffiliateModalOpen}
-        onClose={() => setIsAffiliateModalOpen(false)}
-        account={account}
-        shopId={shopId || ''}
-      />
+      {canMutateShop && (
+        <ManualAffiliateModal
+          isOpen={isAffiliateModalOpen}
+          onClose={() => setIsAffiliateModalOpen(false)}
+          account={account}
+          shopId={shopId || ''}
+        />
+      )}
 
-      <ManualAgencyFeeModal
-        isOpen={isAgencyModalOpen}
-        onClose={() => setIsAgencyModalOpen(false)}
-        account={account}
-        shopId={shopId || ''}
-      />
+      {canMutateShop && (
+        <ManualAgencyFeeModal
+          isOpen={isAgencyModalOpen}
+          onClose={() => setIsAgencyModalOpen(false)}
+          account={account}
+          shopId={shopId || ''}
+        />
+      )}
     </div>
   );
 }

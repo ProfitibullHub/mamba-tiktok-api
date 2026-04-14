@@ -21,7 +21,6 @@ export const adminMiddleware = async (req: Request, res: Response, next: NextFun
             return res.status(401).json({ success: false, error: 'No token provided' });
         }
 
-        // Verify token with Supabase (retry once on transient network/SSL errors)
         let user: any = null;
         let authError: any = null;
         for (let attempt = 0; attempt < 2; attempt++) {
@@ -36,19 +35,34 @@ export const adminMiddleware = async (req: Request, res: Response, next: NextFun
             return res.status(401).json({ success: false, error: 'Invalid token' });
         }
 
-        // Check if user is admin in profiles table
-        const { data: profile, error: profileError } = await supabase
-            .from('profiles')
-            .select('role')
-            .eq('id', user.id)
-            .single();
+        // Check Super Admin membership (new RBAC system)
+        const { data: membership } = await supabase
+            .from('tenant_memberships')
+            .select('id, roles!inner(name), tenants!inner(type)')
+            .eq('user_id', user.id)
+            .eq('status', 'active')
+            .eq('roles.name', 'Super Admin')
+            .eq('tenants.type', 'platform')
+            .limit(1)
+            .maybeSingle();
 
-        if (profileError || !profile || profile.role !== 'admin') {
-            return res.status(403).json({ success: false, error: 'Access denied. Admin role required.' });
+        // Legacy fallback: profiles.role = 'admin'
+        let legacyAdmin = false;
+        if (!membership) {
+            const { data: profile } = await supabase
+                .from('profiles')
+                .select('role')
+                .eq('id', user.id)
+                .single();
+            legacyAdmin = profile?.role === 'admin';
         }
 
-        // Add user to request for later use
+        if (!membership && !legacyAdmin) {
+            return res.status(403).json({ success: false, error: 'Access denied. Super Admin role required.' });
+        }
+
         (req as any).user = user;
+        (req as any).isSuperAdmin = !!membership;
         next();
     } catch (error: any) {
         console.error('Admin middleware error:', error);

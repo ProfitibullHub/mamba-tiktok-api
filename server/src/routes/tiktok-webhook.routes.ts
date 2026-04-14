@@ -1,13 +1,62 @@
 import { Router, Request, Response } from 'express';
 import crypto from 'crypto';
 import { supabase } from '../config/supabase.js';
+import { getShopWithToken, syncOrders, syncProducts, syncSingleOrder } from './tiktok-shop-data.routes.js';
 
 const router = Router();
 
 // TikTok webhook event types
 const WEBHOOK_TYPE = {
+    ORDER_STATUS_CHANGE: 1,
+    REVERSE_STATUS_UPDATE: 2,
+    RECIPIENT_ADDRESS_UPDATE: 3,
+    PACKAGE_UPDATE: 4,
+    PRODUCT_STATUS_CHANGE: 5,
     SELLER_DEAUTHORIZED: 6,
+    CANCELLATION_STATUS_CHANGE: 11,
+    ORDER_RETURN_STATUS: 12,
+    NEW_CONVERSATION: 13,
+    PRODUCT_INFORMATION_CHANGE: 15,
+    PRODUCT_CREATION: 16,
 } as const;
+
+/**
+ * Maps incoming webhook events to user-friendly notification summaries.
+ */
+function formatWebhookNotification(type: number, data: any): { category: string; title: string; message: string } | null {
+    switch (type) {
+        case WEBHOOK_TYPE.ORDER_STATUS_CHANGE:
+            const status = data?.order_status || 'updated';
+            // IMPORTANT: We no longer label "New Order Placed" purely by status.
+            // The webhook handler will sync orders first and only label as new if the
+            // order is newly present in our DB.
+            return {
+                category: 'Order',
+                title: 'Order Status Changed',
+                message: `Order ${data?.order_id || 'updated'} status changed to ${status}.`
+            };
+        case WEBHOOK_TYPE.REVERSE_STATUS_UPDATE:
+            return { category: 'Reverse', title: 'Reverse Status Updated', message: `Customer request updated for order ${data?.order_id || ''}.` };
+        case WEBHOOK_TYPE.RECIPIENT_ADDRESS_UPDATE:
+            return { category: 'Order', title: 'Address Updated', message: `Recipient address changed for order ${data?.order_id || ''}.` };
+        case WEBHOOK_TYPE.PACKAGE_UPDATE:
+            return { category: 'Fulfillment', title: 'Package Updated', message: `Fulfillment package status updated.` };
+        case WEBHOOK_TYPE.PRODUCT_STATUS_CHANGE:
+            return { category: 'Product', title: 'Product Status Changed', message: `Product ${data?.product_id || ''} status updated.` };
+        case WEBHOOK_TYPE.CANCELLATION_STATUS_CHANGE:
+            return { category: 'Order', title: 'Cancellation Request', message: `Cancellation status changed for order ${data?.order_id || ''}.` };
+        case WEBHOOK_TYPE.ORDER_RETURN_STATUS:
+            return { category: 'Order', title: 'Return Request Update', message: `Return status changed for order ${data?.order_id || ''}.` };
+        case WEBHOOK_TYPE.NEW_CONVERSATION:
+            return { category: 'Customer Service', title: 'New Message', message: `New message received from customer.` };
+        case WEBHOOK_TYPE.PRODUCT_INFORMATION_CHANGE:
+            return { category: 'Product', title: 'Product Info Updated', message: `Information updated for product ${data?.product_id || ''}.` };
+        case WEBHOOK_TYPE.PRODUCT_CREATION:
+            return { category: 'Product', title: 'New Product Created', message: `A new product was created in the shop.` };
+        default:
+            return null;
+    }
+}
 
 /**
  * Verify TikTok webhook signature.
@@ -16,14 +65,23 @@ const WEBHOOK_TYPE = {
  */
 function verifyWebhookSignature(req: Request, rawBody: string): boolean {
     const appSecret = process.env.TIKTOK_SHOP_APP_SECRET?.trim();
+    const appKey = process.env.TIKTOK_SHOP_APP_KEY?.trim() || '';
     if (!appSecret) {
         console.warn('[Webhook] No app secret configured — skipping signature verification');
         return true; // Allow through but warn
     }
 
-    const authHeader = req.headers['authorization'] || req.headers['x-tts-signature'] || '';
-    const timestamp = req.headers['timestamp'] as string || '';
-    const nonce = req.headers['nonce'] as string || '';
+    const getHeader = (...names: string[]): string => {
+        for (const name of names) {
+            const value = req.headers[name.toLowerCase()];
+            if (value) return String(Array.isArray(value) ? value[0] : value);
+        }
+        return '';
+    };
+
+    const authHeader = getHeader('authorization', 'x-tts-signature', 'x-tiktok-signature', 'tiktok-signature');
+    const timestamp = getHeader('timestamp', 'x-tts-timestamp', 'x-tiktok-timestamp');
+    const nonce = getHeader('nonce', 'x-tts-nonce', 'x-tiktok-nonce');
 
     if (!authHeader) {
         console.warn('[Webhook] No signature header found — cannot verify');
@@ -31,19 +89,70 @@ function verifyWebhookSignature(req: Request, rawBody: string): boolean {
     }
 
     try {
-        // TikTok signature: HMAC-SHA256(app_secret, timestamp + nonce + rawBody)
-        const stringToSign = `${timestamp}${nonce}${rawBody}`;
-        const expected = crypto
-            .createHmac('sha256', appSecret)
-            .update(stringToSign)
-            .digest('hex');
+        const rawSignature = String(authHeader).trim();
 
-        const received = String(authHeader);
-        const isValid = crypto.timingSafeEqual(
-            Buffer.from(expected, 'hex'),
-            Buffer.from(received.length === expected.length ? received : expected, 'hex')
-        );
-        return isValid;
+        const safeEqualHex = (a: string, b: string): boolean => {
+            if (!a || !b) return false;
+            if (!/^[0-9a-f]+$/i.test(a) || !/^[0-9a-f]+$/i.test(b)) return false;
+            if (a.length !== b.length) return false;
+            return crypto.timingSafeEqual(Buffer.from(a, 'hex'), Buffer.from(b, 'hex'));
+        };
+
+        // Parse k=v header styles commonly used in webhook signatures.
+        const kv: Record<string, string> = {};
+        rawSignature.split(',').forEach((part) => {
+            const [k, ...rest] = part.split('=');
+            if (!k || rest.length === 0) return;
+            kv[k.trim().toLowerCase()] = rest.join('=').trim();
+        });
+
+        const tsCandidate = kv.t || kv.ts || kv.timestamp || timestamp;
+        const sigCandidate = (kv.s || kv.v1 || kv.sign || kv.signature || '').replace(/^sha256=/i, '').toLowerCase();
+
+        // Scheme 1: HMAC(rawBody + "." + timestamp) OR HMAC(timestamp + "." + rawBody)
+        if (tsCandidate && sigCandidate) {
+            const expectedA = crypto.createHmac('sha256', appSecret).update(`${rawBody}.${tsCandidate}`).digest('hex').toLowerCase();
+            const expectedB = crypto.createHmac('sha256', appSecret).update(`${tsCandidate}.${rawBody}`).digest('hex').toLowerCase();
+            if (safeEqualHex(sigCandidate, expectedA) || safeEqualHex(sigCandidate, expectedB)) {
+                return true;
+            }
+        }
+
+        // Scheme 2: raw hex signature in Authorization with timestamp/nonce headers
+        const received = rawSignature
+            .replace(/^Bearer\s+/i, '')
+            .replace(/^sha256=/i, '')
+            .trim()
+            .toLowerCase();
+
+        const expectedLegacy = crypto
+            .createHmac('sha256', appSecret)
+            .update(`${timestamp}${nonce}${rawBody}`)
+            .digest('hex')
+            .toLowerCase();
+
+        if (safeEqualHex(received, expectedLegacy)) {
+            return true;
+        }
+
+        // Additional fallback variants observed in some edge integrations.
+        if (timestamp) {
+            const expectedC = crypto.createHmac('sha256', appSecret).update(`${timestamp}${rawBody}`).digest('hex').toLowerCase();
+            const expectedD = crypto.createHmac('sha256', appSecret).update(`${rawBody}${timestamp}`).digest('hex').toLowerCase();
+            if (safeEqualHex(received, expectedC) || safeEqualHex(received, expectedD)) {
+                return true;
+            }
+        }
+
+        // Newer TikTok Webhooks often prepend the app_key to the payload before hashing
+        if (appKey) {
+            const expectedAppKeyPrepend = crypto.createHmac('sha256', appSecret).update(`${appKey}${rawBody}`).digest('hex').toLowerCase();
+            if (safeEqualHex(received, expectedAppKeyPrepend)) {
+                return true;
+            }
+        }
+
+        return false;
     } catch {
         return false;
     }
@@ -54,7 +163,6 @@ function verifyWebhookSignature(req: Request, rawBody: string): boolean {
  * Deletes: tiktok_ad_metrics, tiktok_ad_spend_daily, tiktok_ads, tiktok_ad_groups, tiktok_ad_campaigns, tiktok_advertisers.
  */
 async function purgeAdsData(accountId: string): Promise<void> {
-    // Find the advertiser record for this account
     const { data: advertiser } = await supabase
         .from('tiktok_advertisers')
         .select('id')
@@ -69,7 +177,6 @@ async function purgeAdsData(accountId: string): Promise<void> {
     const advId = advertiser.id;
     console.log(`[Webhook] Purging ads data for advertiser UUID: ${advId}`);
 
-    // Delete child tables first (foreign key order), then the advertiser record
     const results = await Promise.all([
         supabase.from('tiktok_ad_metrics').delete().eq('advertiser_id', advId),
         supabase.from('tiktok_ad_spend_daily').delete().eq('advertiser_id', advId),
@@ -83,7 +190,6 @@ async function purgeAdsData(accountId: string): Promise<void> {
         if (r.error) console.error(`[Webhook] ${tableNames[i]} deletion error:`, r.error.message);
     });
 
-    // Finally delete the advertiser record (holds access_token)
     const { error: advDeleteError } = await supabase
         .from('tiktok_advertisers')
         .delete()
@@ -98,7 +204,6 @@ async function purgeAdsData(accountId: string): Promise<void> {
  * Deletes: shop_orders, shop_products, shop_settlements, ads data, then tiktok_shops.
  */
 async function purgeShopData(tiktokShopId: string): Promise<{ found: boolean; shopName: string }> {
-    // Look up internal shop record (shop_id is the TikTok external ID, id is the UUID primary key)
     const { data: shop, error: fetchError } = await supabase
         .from('tiktok_shops')
         .select('id, shop_name, account_id')
@@ -110,7 +215,6 @@ async function purgeShopData(tiktokShopId: string): Promise<{ found: boolean; sh
 
     const { id: internalId, shop_name: shopName, account_id: accountId } = shop;
 
-    // Wipe all customer data in parallel (shop data + ads data)
     const [ordersResult, productsResult, settlementsResult] = await Promise.all([
         supabase.from('shop_orders').delete().eq('shop_id', internalId),
         supabase.from('shop_products').delete().eq('shop_id', internalId),
@@ -122,7 +226,6 @@ async function purgeShopData(tiktokShopId: string): Promise<{ found: boolean; sh
     if (productsResult.error) console.error(`[Webhook] Products deletion error for ${shopName}:`, productsResult.error.message);
     if (settlementsResult.error) console.error(`[Webhook] Settlements deletion error for ${shopName}:`, settlementsResult.error.message);
 
-    // Remove the shop record (tokens, cipher, etc.)
     const { error: shopDeleteError } = await supabase
         .from('tiktok_shops')
         .delete()
@@ -136,51 +239,343 @@ async function purgeShopData(tiktokShopId: string): Promise<{ found: boolean; sh
 /**
  * POST /api/tiktok-shop/webhook
  * Receives TikTok Shop event notifications.
- *
- * Handles:
- *   type 6 — Seller deauthorized the app: wipe all shop data from our database.
- *
- * TikTok expects a 200 response within 3 seconds — heavy work runs async.
  */
 router.post('/', async (req: Request, res: Response) => {
-    const rawBody = JSON.stringify(req.body);
-    const { type, shop_id, tts_notification_id, timestamp } = req.body;
+    const rawBody = Buffer.isBuffer(req.body)
+        ? req.body.toString('utf8')
+        : JSON.stringify(req.body ?? {});
+
+    let payload: any = null;
+    try {
+        payload = rawBody ? JSON.parse(rawBody) : {};
+    } catch {
+        console.warn('[Webhook] Invalid JSON payload received — discarding');
+        return res.status(200).json({ code: 0, message: "success" });
+    }
+
+    const { type, shop_id, tts_notification_id, timestamp } = payload;
 
     console.log(`[Webhook] Received event type=${type} shop_id=${shop_id} notification_id=${tts_notification_id}`);
 
-    // Verify signature (log warning if invalid but don't hard-reject in case of TikTok format changes)
     const signatureValid = verifyWebhookSignature(req, rawBody);
+    const strictWebhookVerification = String(process.env.TIKTOK_WEBHOOK_STRICT_VERIFY || '').toLowerCase() === 'true';
     if (!signatureValid) {
-        console.warn(`[Webhook] ⚠️  Signature verification failed for notification ${tts_notification_id} — processing anyway with caution`);
+        const headerSnapshot = {
+            authorization: req.headers['authorization'] ? 'present' : 'missing',
+            x_tts_signature: req.headers['x-tts-signature'] ? 'present' : 'missing',
+            x_tiktok_signature: req.headers['x-tiktok-signature'] ? 'present' : 'missing',
+            tiktok_signature: req.headers['tiktok-signature'] ? 'present' : 'missing',
+            timestamp: req.headers['timestamp'] ? 'present' : 'missing',
+            x_tts_timestamp: req.headers['x-tts-timestamp'] ? 'present' : 'missing',
+            x_tiktok_timestamp: req.headers['x-tiktok-timestamp'] ? 'present' : 'missing',
+            nonce: req.headers['nonce'] ? 'present' : 'missing',
+            x_tts_nonce: req.headers['x-tts-nonce'] ? 'present' : 'missing',
+            x_tiktok_nonce: req.headers['x-tiktok-nonce'] ? 'present' : 'missing'
+        };
+        // Respond success so TikTok doesn't keep retrying, but do not trust the payload.
+        // Prevents fake notification spam when signatures are invalid.
+        console.warn(
+            strictWebhookVerification
+                ? `[Webhook] ⚠️  Signature verification failed for notification ${tts_notification_id} — discarding`
+                : `[Webhook] ⚠️  Signature verification failed for notification ${tts_notification_id} — continuing (strict mode disabled)`
+        );
+        console.warn('[Webhook] Signature header snapshot:', headerSnapshot);
+        if (typeof req.headers['authorization'] === 'string') {
+            const auth = req.headers['authorization'];
+            console.warn('[Webhook] Authorization preview:', auth.slice(0, 120));
+        }
+        if (strictWebhookVerification) {
+            res.status(200).json({ code: 0, message: "success" });
+            return;
+        }
+        console.warn('[Webhook] STRICT mode OFF - continuing processing for delivery reliability');
     }
 
-    // Reject obviously replayed/stale webhooks (older than 10 minutes)
     const now = Math.floor(Date.now() / 1000);
-    if (timestamp && Math.abs(now - Number(timestamp)) > 600) {
-        console.warn(`[Webhook] Stale webhook rejected (timestamp ${timestamp}, now ${now})`);
-        return res.status(200).json({ received: true }); // Still 200 to avoid TikTok retries
+    const headerTimestamp = Number(
+        req.headers['x-tts-timestamp'] ||
+        req.headers['x-tiktok-timestamp'] ||
+        req.headers['timestamp'] ||
+        ((typeof req.headers['authorization'] === 'string' && req.headers['authorization'].match(/(?:^|,)\s*t=(\d+)\s*(?:,|$)/i)?.[1]) || undefined) ||
+        timestamp
+    );
+    if (headerTimestamp && Math.abs(now - headerTimestamp) > 600) {
+        console.warn(`[Webhook] Stale webhook rejected (timestamp ${headerTimestamp}, now ${now})`);
+        return res.status(200).json({ code: 0, message: "success" });
     }
 
-    // Acknowledge immediately so TikTok doesn't time out
-    res.status(200).json({ received: true });
+    // -----------------------------------------------------
+    // HARD PAUSE CHECK
+    // If the shop is paused in the database, we discard the message immediately.
+    // -----------------------------------------------------
+    try {
+        const { data: currentShop } = await supabase
+            .from('tiktok_shops')
+            .select('is_paused')
+            .eq('shop_id', String(shop_id))
+            .maybeSingle();
+
+        if (currentShop?.is_paused) {
+            console.log(`[Webhook] ⏸️  Shop ${shop_id} is HARD PAUSED — ignoring event type ${type}`);
+            return res.status(200).json({ code: 0, message: "success" });
+        }
+    } catch (err: any) {
+        console.error('[Webhook] Error checking pause state in database:', err.message);
+    }
 
     // Process async after response
     if (type === WEBHOOK_TYPE.SELLER_DEAUTHORIZED) {
         console.log(`[Webhook] 🔔 Seller deauthorization — shop_id: ${shop_id}`);
-
         try {
             const { found, shopName } = await purgeShopData(String(shop_id));
-
-            if (found) {
-                console.log(`[Webhook] ✅ Shop "${shopName}" (${shop_id}) fully purged after seller deauthorization`);
-            } else {
-                console.warn(`[Webhook] ⚠️  Shop ${shop_id} not found in database — may have already been removed`);
-            }
+            if (found) console.log(`[Webhook] ✅ Shop "${shopName}" (${shop_id}) fully purged`);
         } catch (err: any) {
-            console.error(`[Webhook] ❌ Failed to purge shop ${shop_id} after deauthorization:`, err.message);
+            console.error(`[Webhook] ❌ Failed to purge shop ${shop_id}:`, err.message);
         }
+        return res.status(200).json({ code: 0, message: "success" });
     } else {
-        console.log(`[Webhook] Event type ${type} received — no handler defined, ignoring`);
+        const payloadData = payload.data || payload;
+        const notificationData = formatWebhookNotification(type, payloadData);
+
+        if (!notificationData) return res.status(200).json({ code: 0, message: "success" });
+
+        // -----------------------------------------------------
+        // Deduping: if TikTok retries the *same* delivery, we
+        // should not create additional "INSERT" notifications.
+        // -----------------------------------------------------
+        let shouldInsert = true;
+        if (tts_notification_id) {
+            try {
+                const { data: existingNotif } = await supabase
+                    .from('webhook_notifications')
+                    .select('id')
+                    .eq('shop_id', String(shop_id))
+                    .eq('tts_notification_id', String(tts_notification_id))
+                    .maybeSingle();
+
+                shouldInsert = !existingNotif;
+            } catch (dedupeErr: any) {
+                // If dedupe fails (e.g. column not present yet), fall back to inserting.
+                console.error('[Webhook] Dedupe check failed:', dedupeErr.message);
+                shouldInsert = true;
+            }
+        }
+
+        // -----------------------------------------------------
+        // IMPORTANT RELIABILITY RULE:
+        // Notification insertion must not depend on sync/token success.
+        // We first try best-effort title refinement, then always insert.
+        // Sync happens after insert and is non-blocking.
+        // -----------------------------------------------------
+        let dbShop: any = null;
+        try {
+            const { data } = await supabase
+                .from('tiktok_shops')
+                .select('id, account_id')
+                .eq('shop_id', String(shop_id))
+                .maybeSingle();
+            dbShop = data;
+        } catch (shopLookupErr: any) {
+            console.error('[Webhook] Shop lookup failed (non-fatal):', shopLookupErr.message);
+        }
+
+        // Best-effort "new order" refinement. Sync orders for ALL status changes (so Realtime UI updates work),
+        // but only create notifications for AWAITING_SHIPMENT (new orders), CANCELLED, and REVERSE events.
+        if (dbShop && type === WEBHOOK_TYPE.ORDER_STATUS_CHANGE) {
+            try {
+                const status = payloadData?.order_status || 'updated';
+                const shouldNotifyStatus = status === 'UNPAID' ||
+                    status === 'AWAITING_SHIPMENT' ||
+                    status === 'CANCELLED' ||
+                    status.startsWith('REVERSE_') ||
+                    status.includes('CANCEL');
+                const orderId = payloadData?.order_id;
+
+                // Always sync orders so that Realtime subscription picks up the DB change
+                if (orderId) {
+                    const { data: internalShops } = await supabase
+                        .from('tiktok_shops')
+                        .select('id')
+                        .eq('shop_id', String(shop_id));
+
+                    const internalIds = (internalShops || []).map(s => s.id);
+                    if (internalIds.length > 0) {
+                        // 1. Check if order already exists (fetch its status too) BEFORE sync
+                        const { data: preExisting } = await supabase
+                            .from('shop_orders')
+                            .select('order_id, order_status')
+                            .in('shop_id', internalIds)
+                            .eq('order_id', String(orderId))
+                            .maybeSingle();
+
+                        const shop = await getShopWithToken(dbShop.account_id, String(shop_id));
+
+                        // 2. Targeted Sync Logic to save massive API rate limits
+                        const isOrderUnknown = !preExisting;
+                        if (isOrderUnknown) {
+                            // Fresh order: we absolutely need the full shipping/buyer info from TikTok API
+                            await syncSingleOrder(shop, String(orderId));
+                        } else {
+                            // Status update (e.g. IN_TRANSIT, DELIVERED, CANCELLED): order should already exist!
+                            // Skip the expensive API call entirely and update our DB directly.
+                            await supabase
+                                .from('shop_orders')
+                                .update({
+                                    order_status: status,
+                                    update_time: payloadData?.update_time || Math.floor(Date.now() / 1000),
+                                    updated_at: new Date().toISOString()
+                                })
+                                .in('shop_id', internalIds)
+                                .eq('order_id', String(orderId));
+                        }
+
+                        // 3. Fetch the FULL order row after sync/update to broadcast
+                        const { data: fullOrderRow } = await supabase
+                            .from('shop_orders')
+                            .select('*')
+                            .in('shop_id', internalIds)
+                            .eq('order_id', String(orderId))
+                            .maybeSingle();
+
+                        // 4. If we have the updated order, broadcast it to the Realtime UI
+                        if (fullOrderRow) {
+                            internalIds.forEach(internalId => {
+                                const channel = supabase.channel(`shop-orders-realtime-${internalId}`);
+                                (channel as any).httpSend('broadcast', {
+                                    event: 'order_update',
+                                    payload: fullOrderRow
+                                }).catch((err: any) => console.error('[Webhook] Broadcast error:', err));
+                            });
+                        }
+
+                        // 5. Evaluate notification rules
+                        if (shouldNotifyStatus && fullOrderRow) {
+                            const prevStatus = preExisting ? preExisting.order_status : null;
+                            const isBrandNew = !preExisting;
+
+                            if (status === 'UNPAID') {
+                                shouldInsert = isBrandNew || prevStatus !== 'UNPAID';
+                                if (shouldInsert) {
+                                    notificationData.title = 'New Order Placed';
+                                    notificationData.message = `New order ${orderId} is awaiting payment.`;
+                                }
+                            } else if (status === 'AWAITING_SHIPMENT') {
+                                shouldInsert = isBrandNew || prevStatus !== 'AWAITING_SHIPMENT';
+                                if (shouldInsert) {
+                                    if (prevStatus === 'UNPAID') {
+                                        notificationData.title = 'Order Paid';
+                                        notificationData.message = `Order ${orderId} has been paid and is ready to ship.`;
+                                    } else {
+                                        notificationData.title = 'New Order Placed';
+                                        notificationData.message = `New order ${orderId} received and is ready to ship.`;
+                                    }
+                                }
+                            } else {
+                                // For Cancelled/Reverse, always notify
+                                shouldInsert = true;
+                                if (status === 'CANCELLED' || status.includes('CANCEL')) {
+                                    notificationData.title = 'Order Cancelled';
+                                } else {
+                                    notificationData.title = 'Order Reversal/Return';
+                                }
+                                notificationData.message = `Order ${orderId} reached status ${status}.`;
+                            }
+                        } else {
+                            // Non-notifiable status (e.g., IN_TRANSIT, DELIVERED)
+                            shouldInsert = false;
+                        }
+                    } else {
+                        shouldInsert = false;
+                    }
+                } else {
+                    shouldInsert = false;
+                }
+            } catch (classifyErr: any) {
+                console.error('[Webhook] New-order classification failed (non-fatal):', classifyErr.message);
+            }
+        }
+
+        if (shouldInsert) {
+            console.log(`[Webhook] Storing notification for type ${type} (${notificationData.title})`);
+            try {
+                const baseInsert = {
+                    shop_id: String(shop_id),
+                    type_id: type,
+                    category: notificationData.category,
+                    title: notificationData.title,
+                    message: notificationData.message,
+                    raw_payload: payload
+                };
+
+                const { error: insertError } = await supabase
+                    .from('webhook_notifications')
+                    .insert({
+                        ...baseInsert,
+                        tts_notification_id: tts_notification_id ? String(tts_notification_id) : null
+                    });
+
+                if (insertError) {
+                    // Graceful fallback in case the column is not present yet in DB.
+                    if (insertError.message?.includes('tts_notification_id')) {
+                        const { error: fallbackError } = await supabase
+                            .from('webhook_notifications')
+                            .insert(baseInsert);
+
+                        if (fallbackError) console.error('[Webhook] Failed to store notification (fallback):', fallbackError.message);
+                    } else {
+                        console.error('[Webhook] Failed to store notification:', insertError.message);
+                    }
+                }
+            } catch (err: any) {
+                console.error('[Webhook] Error writing notification:', err.message);
+            }
+        }
+
+        // Critical Database and Realtime operations completed. Respond to TikTok safely.
+        res.status(200).json({ code: 0, message: "success" });
+
+        // Background task: Daily reset logic. Wipe yesterday's notifications, keep today's.
+        (async () => {
+            try {
+                const shopTz = dbShop?.timezone || 'America/Los_Angeles';
+                const now = new Date();
+                const tzString = now.toLocaleString('en-US', { timeZone: shopTz });
+                const localTzTime = new Date(tzString);
+                const tzOffset = now.getTime() - localTzTime.getTime();
+                
+                localTzTime.setHours(0, 0, 0, 0);
+                const todayStartUTC = new Date(localTzTime.getTime() + tzOffset).toISOString();
+
+                const { data: deletedNodes, error } = await supabase
+                    .from('webhook_notifications')
+                    .delete()
+                    .eq('shop_id', String(shop_id))
+                    .lt('created_at', todayStartUTC)
+                    .select('id');
+
+                if (!error && deletedNodes && deletedNodes.length > 0) {
+                    console.log(`[Webhook] Daily Reset: Cleaned up ${deletedNodes.length} notifications from previous days for shop ${shop_id}`);
+                }
+            } catch (err: any) {
+                console.error('[Webhook] Daily cleanup error:', err.message);
+            }
+        })();
+
+        // Fire-and-forget realtime sync after notification insert.
+        if (dbShop) {
+            getShopWithToken(dbShop.account_id, String(shop_id))
+                .then((shop) => {
+                    if (['Order', 'Reverse', 'Fulfillment'].includes(notificationData.category)) {
+                        return syncOrders(shop, false);
+                    }
+                    if (notificationData.category === 'Product') {
+                        return syncProducts(shop, false);
+                    }
+                })
+                .catch((syncErr: any) => {
+                    console.error('[Webhook] Post-insert sync failed (non-fatal):', syncErr.message);
+                });
+        }
     }
 });
 

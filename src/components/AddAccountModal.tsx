@@ -20,28 +20,16 @@ export function AddAccountModal({ onAccountAdded }: AddAccountModalProps) {
         try {
             setLoading(true);
 
-            // Create the account
-            const { data: account, error: accountError } = await supabase
-                .from('accounts')
-                .insert({
-                    name: accountName.trim() || 'New Shop',
-                    tiktok_handle: tiktokHandle.trim() || null,
-                    status: 'active',
-                })
-                .select()
-                .single();
+            if (!profile?.id) throw new Error('You must be signed in to create an account.');
 
-            if (accountError) throw accountError;
+            const { data: account, error: rpcError } = await supabase.rpc('create_seller_account_for_user', {
+                p_name: accountName.trim() || 'New Shop',
+                p_email: profile?.email ?? null,
+                p_tiktok_handle: tiktokHandle.trim() || null,
+            });
 
-            // Link account to user
-            const { error: linkError } = await supabase
-                .from('user_accounts')
-                .insert({
-                    user_id: profile?.id,
-                    account_id: account.id,
-                });
-
-            if (linkError) throw linkError;
+            if (rpcError) throw rpcError;
+            if (!account) throw new Error('No account returned from create_seller_account_for_user');
 
             // Reset form and close modal
             setAccountName('');

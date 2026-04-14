@@ -3,14 +3,21 @@ import { tiktokShopApi } from '../services/tiktok-shop-api.service.js';
 import { supabase } from '../config/supabase.js';
 import { getTimezoneForRegion } from '../utils/timezoneMapping.js';
 import crypto from 'crypto';
+import {
+    enforceBodyAccountAccess,
+    enforceFinalizeAccountAccess,
+    verifyAccountIdParam,
+} from '../middleware/account-access.middleware.js';
 
 const router = Router();
+
+router.param('accountId', verifyAccountIdParam);
 
 /**
  * POST /api/tiktok-shop/auth/start
  * Initiate OAuth flow - generate authorization URL
  */
-router.post('/start', async (req: Request, res: Response) => {
+router.post('/start', enforceBodyAccountAccess, async (req: Request, res: Response) => {
     try {
         const { accountId } = req.body;
 
@@ -52,7 +59,7 @@ router.post('/start', async (req: Request, res: Response) => {
  * POST /api/tiktok-shop/auth/partner/start
  * Start the OAuth flow for Partner (Agency)
  */
-router.post('/partner/start', async (req: Request, res: Response) => {
+router.post('/partner/start', enforceBodyAccountAccess, async (req: Request, res: Response) => {
     try {
         const { accountId, accountName } = req.body;
 
@@ -140,8 +147,8 @@ async function processAuthCode(code: string, accountId: string) {
             throw error;
         }
 
-        // Update the main account record with the shop name and handle
-        const { error: updateError } = await supabase
+        // Update the account name and its parent tenant name to match the real shop
+        const { data: accountRow, error: updateError } = await supabase
             .from('accounts')
             .update({
                 name: shop.name,
@@ -149,10 +156,22 @@ async function processAuthCode(code: string, accountId: string) {
                 avatar_url: null,
                 updated_at: new Date().toISOString()
             })
-            .eq('id', accountId);
+            .eq('id', accountId)
+            .select('tenant_id')
+            .single();
 
         if (updateError) {
             console.error('Error updating account details:', updateError);
+        }
+
+        if (accountRow?.tenant_id) {
+            const { error: tenantErr } = await supabase
+                .from('tenants')
+                .update({ name: shop.name, updated_at: new Date().toISOString() })
+                .eq('id', accountRow.tenant_id);
+            if (tenantErr) {
+                console.error('Error updating tenant name:', tenantErr);
+            }
         }
     }
 
@@ -208,7 +227,7 @@ router.get('/callback', async (req: Request, res: Response) => {
  * POST /api/tiktok-shop/auth/finalize
  * Exchange code for tokens and save shop data
  */
-router.post('/finalize', async (req: Request, res: Response) => {
+router.post('/finalize', enforceFinalizeAccountAccess, async (req: Request, res: Response) => {
     try {
         const { code, accountId } = req.body;
 

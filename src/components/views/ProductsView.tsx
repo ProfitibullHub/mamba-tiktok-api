@@ -5,6 +5,7 @@ import { Account } from '../../lib/supabase';
 import { ProductCard } from '../ProductCard';
 import { ProductDetails } from '../ProductDetails';
 import { ProductManagementView } from './ProductManagementView';
+import { useShopAccessFlags } from '../../hooks/useShopMutationAccess';
 
 interface ProductsViewProps {
     account: Account;
@@ -12,6 +13,7 @@ interface ProductsViewProps {
 }
 
 export function ProductsView({ account, shopId }: ProductsViewProps) {
+    const { canMutateShop, canSyncShop } = useShopAccessFlags(account);
     const { products, orders, isLoading, syncData, cacheMetadata, dataVersion } = useShopStore();
     const [searchTerm, setSearchTerm] = useState('');
     const [statusFilter, setStatusFilter] = useState('all');
@@ -69,7 +71,7 @@ export function ProductsView({ account, shopId }: ProductsViewProps) {
     }, [products, searchTerm, statusFilter, dataVersion]);
 
     const handleSync = async () => {
-        if (!shopId) return;
+        if (!shopId || !canSyncShop) return;
         await syncData(account.id, shopId, 'products');
     };
 
@@ -80,6 +82,7 @@ export function ProductsView({ account, shopId }: ProductsViewProps) {
                 account={account}
                 shopId={shopId}
                 onBack={() => setShowManagement(false)}
+                readOnly={!canMutateShop}
             />
         );
     }
@@ -104,15 +107,20 @@ export function ProductsView({ account, shopId }: ProductsViewProps) {
                 </div>
                 <div className="flex gap-3">
                     <button
-                        onClick={() => setShowManagement(true)}
-                        className="flex items-center gap-2 px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg transition-colors font-medium"
+                        type="button"
+                        onClick={() => canMutateShop && setShowManagement(true)}
+                        disabled={!canMutateShop}
+                        title={!canMutateShop ? 'Read-only for your role' : undefined}
+                        className="flex items-center gap-2 px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg transition-colors font-medium disabled:opacity-40 disabled:pointer-events-none"
                     >
                         <Settings size={18} />
                         Product Management
                     </button>
                     <button
+                        type="button"
                         onClick={handleSync}
-                        disabled={cacheMetadata.isSyncing || isLoading}
+                        disabled={!canSyncShop || cacheMetadata.isSyncing || isLoading}
+                        title={!canSyncShop ? 'You do not have access to sync this shop' : undefined}
                         className="flex items-center space-x-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg transition-colors disabled:opacity-50"
                     >
                         <RefreshCw size={20} className={cacheMetadata.isSyncing ? "animate-spin" : ""} />
@@ -247,6 +255,7 @@ export function ProductsView({ account, shopId }: ProductsViewProps) {
                 <ProductDetails
                     product={selectedProduct}
                     accountId={account.id}
+                    readOnly={!canMutateShop}
                     onClose={() => setSelectedProduct(null)}
                     onCostsUpdate={(productId, costs) => {
                         // Update the product in local state

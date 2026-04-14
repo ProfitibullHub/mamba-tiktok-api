@@ -5,18 +5,10 @@ import {
 import { Order, Statement } from '../store/useShopStore';
 import { parseUTCDate, getShopDayStartTimestamp } from '../utils/dateUtils';
 import { calculateOrderGMV } from '../utils/gmvCalculations';
+import { isCancelledOrRefunded } from '../utils/orderFinancials';
 
 // Use paid_time for filtering/bucketing (matches backend which loads by paid_time)
 const getOrderTs = (o: Order): number => Number(o.paid_time || o.created_time);
-
-// Helper function to detect cancelled or refunded orders
-const isCancelledOrRefunded = (order: Order): boolean => {
-    return (
-        order.order_status === 'CANCELLED' ||
-        !!order.cancel_reason ||
-        !!order.cancellation_initiator
-    );
-};
 
 interface MetricsChartGridProps {
     orders: Order[];

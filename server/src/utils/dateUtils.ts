@@ -1,66 +1,111 @@
 /**
- * Backend date utilities for timezone-aware date calculations
+ * Backend date utilities for timezone-aware date calculations.
+ * Keep day-boundary logic aligned with `src/utils/dateUtils.ts` (client).
  */
 
 /**
- * Converts a YYYY-MM-DD date string to a Unix timestamp at the start of that day
- * in the specified timezone.
- * 
- * @param dateStr - Date string in YYYY-MM-DD format
- * @param timezone - IANA timezone identifier (e.g., 'America/Los_Angeles', 'Europe/London')
- * @returns Unix timestamp (seconds) at the start of the day in the specified timezone
+ * Formats date in YYYY-MM-DD in specified timezone (for calendar-day iteration).
  */
-export function getShopDayStartTimestamp(dateStr: string, timezone: string): number {
-    // Parse the date string
-    const [year, month, day] = dateStr.split('-').map(Number);
+export function formatShopDateISO(date: number | Date | string, timezone: string): string {
+    let d: Date;
+    if (typeof date === 'number') {
+        if (date < 10000000000) {
+            d = new Date(date * 1000);
+        } else {
+            d = new Date(date);
+        }
+    } else {
+        d = new Date(date);
+    }
 
-    // Create a date string that represents midnight on the given date
-    // We'll use the timezone to figure out what UTC timestamp corresponds to midnight in that timezone
-    const dateString = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}T00:00:00`;
+    if (isNaN(d.getTime())) return '';
 
-    // Parse this as a date in the target timezone
-    // We create a formatter that will give us the UTC offset for this specific date/time
-    const testDate = new Date(dateString + 'Z'); // Start with UTC
-
-    // Use Intl to format the date in the target timezone and extract components
     const formatter = new Intl.DateTimeFormat('en-US', {
-        timeZone: timezone,
         year: 'numeric',
         month: '2-digit',
         day: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        hour12: false,
-        timeZoneName: 'longOffset'
+        timeZone: timezone
     });
 
-    // Get the offset by comparing the same instant in UTC vs the target timezone
-    // We want to find the UTC timestamp that corresponds to midnight in the target timezone
+    const parts = formatter.formatToParts(d);
+    const year = parts.find(p => p.type === 'year')!.value;
+    const month = parts.find(p => p.type === 'month')!.value;
+    const day = parts.find(p => p.type === 'day')!.value;
 
-    // Strategy: Binary search or iterative approach to find the right UTC timestamp
-    // Simpler approach: Use the timezone offset
+    return `${year}-${month}-${day}`;
+}
 
-    // Create a date at noon on the target date in the target timezone to get the offset
-    const noonLocal = new Date(`${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}T12:00:00`);
+/**
+ * Converts a YYYY-MM-DD date string to a Unix timestamp at the start of that day
+ * in the specified timezone (same iterative strategy as the client).
+ */
+export function getShopDayStartTimestamp(dateStr: string, timezone: string): number {
+    if (!dateStr) return 0;
 
-    // Format it in the target timezone to see what time it shows
-    const parts = formatter.formatToParts(noonLocal);
-    const tzYear = parseInt(parts.find(p => p.type === 'year')!.value);
-    const tzMonth = parseInt(parts.find(p => p.type === 'month')!.value);
-    const tzDay = parseInt(parts.find(p => p.type === 'day')!.value);
-    const tzHour = parseInt(parts.find(p => p.type === 'hour')!.value);
+    const [year, month, day] = dateStr.split('-').map(Number);
 
-    // Calculate the offset: if we create a UTC date at noon and it shows a different hour in the TZ,
-    // that's our offset
-    const utcNoon = Date.UTC(year, month - 1, day, 12, 0, 0);
-    const tzNoon = Date.UTC(tzYear, tzMonth - 1, tzDay, tzHour, 0, 0);
-    const offsetMs = utcNoon - tzNoon;
+    let currentMs = Date.UTC(year, month - 1, day, 8, 0, 0, 0);
 
-    // Now calculate midnight in the target timezone
-    // Midnight in TZ = midnight UTC + offset
-    const midnightLocal = Date.UTC(year, month - 1, day, 0, 0, 0);
-    const midnightUTC = midnightLocal + offsetMs;
+    const fmt = new Intl.DateTimeFormat('en-US', {
+        timeZone: timezone,
+        year: 'numeric',
+        month: 'numeric',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: 'numeric',
+        second: 'numeric',
+        hour12: false
+    });
 
-    return Math.floor(midnightUTC / 1000);
+    for (let i = 0; i < 3; i++) {
+        const parts = fmt.formatToParts(currentMs);
+        const p = parts.reduce(
+            (acc, part) => {
+                acc[part.type] = part.value;
+                return acc;
+            },
+            {} as Record<string, string>
+        );
+
+        const hour = parseInt(p.hour);
+        const shopTimeAsUtc = Date.UTC(
+            parseInt(p.year),
+            parseInt(p.month) - 1,
+            parseInt(p.day),
+            hour === 24 ? 0 : hour,
+            parseInt(p.minute),
+            parseInt(p.second)
+        );
+
+        const targetTimeAsUtc = Date.UTC(year, month - 1, day, 0, 0, 0);
+
+        const diff = shopTimeAsUtc - targetTimeAsUtc;
+        if (diff === 0) {
+            return currentMs / 1000;
+        }
+
+        currentMs -= diff;
+    }
+
+    return currentMs / 1000;
+}
+
+export function previousCalendarDayISO(dateStr: string, timezone: string): string {
+    const startSec = getShopDayStartTimestamp(dateStr, timezone);
+    return formatShopDateISO((startSec - 1) * 1000, timezone);
+}
+
+export function nextCalendarDayISO(dateStr: string, timezone: string): string {
+    const startSec = getShopDayStartTimestamp(dateStr, timezone);
+    let probe = startSec + 1;
+    const maxProbe = startSec + 48 * 3600;
+    while (probe <= maxProbe && formatShopDateISO(probe * 1000, timezone) === dateStr) {
+        probe += 3600;
+    }
+    return formatShopDateISO(probe * 1000, timezone);
+}
+
+/** Exclusive upper bound for paid_time filters — same instant as client `getShopDayEndExclusiveTimestamp`. */
+export function getShopDayEndExclusiveTimestamp(dateStr: string, timezone: string): number {
+    return getShopDayStartTimestamp(nextCalendarDayISO(dateStr, timezone), timezone);
 }
