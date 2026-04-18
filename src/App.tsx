@@ -16,7 +16,9 @@ function detectPasswordFlow(): 'reset' | 'invite' | null {
     if (hash.includes('type=invite')) return 'invite';
     return null;
 }
-
+function AppTester (){
+    return null;
+}
 function AppContent() {
     const { user, loading } = useAuth();
     const location = useLocation();
