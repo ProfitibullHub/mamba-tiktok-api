@@ -10,6 +10,8 @@
 
 import { tiktokBusinessApi } from './tiktok-business-api.service.js';
 import { supabase } from '../config/supabase.js';
+import { randomUUID } from 'crypto';
+import { logSystemEvent } from './system-logger.js';
 
 export type PollRange = 'today' | '7d';
 
@@ -29,6 +31,73 @@ export interface PollResult {
     rows_upserted: number;
     error?: string;
     token_revoked?: boolean;
+}
+
+async function recordAdsPollActivity(range: PollRange, result: PollResult): Promise<void> {
+    if (!result.account_id) {
+        console.warn('[Ads Poll Activity] Missing account_id, skipping activity record', {
+            advertiser_id: result.advertiser_id,
+        });
+        return;
+    }
+
+    const nowIso = new Date().toISOString();
+    const syncType = `poll_all_${range}`;
+    const status = result.success ? 'succeeded' : 'failed';
+    const { data: job, error: jobErr } = await supabase
+        .from('ingestion_jobs')
+        .insert({
+            stream: 'ads',
+            provider: 'tiktok',
+            account_id: result.account_id,
+            sync_type: syncType,
+            payload: {
+                source: 'poll_all',
+                range,
+                advertiserId: result.advertiser_id,
+                tokenRevoked: !!result.token_revoked,
+            },
+            idempotency_key: randomUUID(),
+            status,
+            attempt_count: 1,
+            max_attempts: 1,
+            next_retry_at: nowIso,
+            completed_at: nowIso,
+            last_error: result.error ?? null,
+            updated_at: nowIso,
+        })
+        .select('id')
+        .single();
+    if (jobErr || !job?.id) {
+        console.error('[Ads Poll Activity] Failed to insert ingestion_jobs row', {
+            advertiser_id: result.advertiser_id,
+            account_id: result.account_id,
+            error: jobErr?.message,
+        });
+        return;
+    }
+
+    const { error: attemptErr } = await supabase.from('ingestion_job_attempts').insert({
+        job_id: job.id,
+        attempt_no: 1,
+        status,
+        started_at: nowIso,
+        finished_at: nowIso,
+        error: result.error ?? null,
+        result: {
+            rows_upserted: result.rows_upserted,
+            token_revoked: !!result.token_revoked,
+        },
+        worker_id: 'ads-poll',
+    });
+    if (attemptErr) {
+        console.error('[Ads Poll Activity] Failed to insert ingestion_job_attempts row', {
+            job_id: job.id,
+            advertiser_id: result.advertiser_id,
+            account_id: result.account_id,
+            error: attemptErr.message,
+        });
+    }
 }
 
 /**
@@ -76,6 +145,22 @@ export async function pollAdvertiserMetrics(
             if (e.message && e.message.includes('40105')) {
                 isRevoked = true;
             }
+            logSystemEvent({
+                level: 'error',
+                scope: 'ads',
+                event: 'ads.poll.fetch_failed',
+                stream: 'ads',
+                accountId: advertiser.account_id,
+                message: `${label}: ${e?.message || 'unknown error'}`,
+                data: {
+                    advertiserId: advertiser.advertiser_id,
+                    internalAdvertiserId: advertiser.id,
+                    range,
+                    startDate,
+                    endDate,
+                    tokenRevokedCode40105: !!(e?.message && String(e.message).includes('40105')),
+                },
+            });
             return [];
         };
 
@@ -107,6 +192,21 @@ export async function pollAdvertiserMetrics(
 
         if (isRevoked) {
             console.warn(`[Ads Poll] Token revoked for advertiser ${advertiser.advertiser_id}. Auto-deactivating in database.`);
+            logSystemEvent({
+                level: 'error',
+                scope: 'ads',
+                event: 'ads.token.revoked_detected',
+                stream: 'ads',
+                accountId: advertiser.account_id,
+                message: 'TikTok Ads token appears revoked (40105); advertiser auto-deactivated.',
+                data: {
+                    advertiserId: advertiser.advertiser_id,
+                    internalAdvertiserId: advertiser.id,
+                    range,
+                    startDate,
+                    endDate,
+                },
+            });
             const { error: deactivateError } = await supabase
                 .from('tiktok_advertisers')
                 .update({ is_active: false })
@@ -291,6 +391,8 @@ export async function pollAllAdvertisers(range: PollRange = 'today'): Promise<{
 
     const succeeded = results.filter((r) => r.success).length;
     const failed = results.filter((r) => !r.success).length;
+
+    await Promise.all(results.map((r) => recordAdsPollActivity(range, r)));
 
     console.log(`[Ads Poll] Done. ${succeeded} succeeded, ${failed} failed.`);
 

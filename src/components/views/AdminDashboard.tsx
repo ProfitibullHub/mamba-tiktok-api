@@ -113,6 +113,21 @@ async function adminPost(path: string): Promise<unknown> {
     return data.data;
 }
 
+async function adminPostJson(path: string, body: Record<string, unknown>): Promise<unknown> {
+    const headers = await authHeaders();
+    const res = await fetch(`${API_BASE_URL}${path}`, {
+        method: 'POST',
+        headers: {
+            ...headers,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error);
+    return data.data;
+}
+
 export function AdminDashboard({ onNavigateToTeamRoles }: { onNavigateToTeamRoles?: () => void }) {
     const { isPlatformSuperAdmin } = useTenantContext();
     const queryClient = useQueryClient();
@@ -137,6 +152,12 @@ export function AdminDashboard({ onNavigateToTeamRoles }: { onNavigateToTeamRole
         queryKey: ['admin-tenants'],
         queryFn: () => fetchApi('/api/admin/tenants'),
         enabled: isPlatformSuperAdmin && (drillView === 'agencies' || drillView === 'sellers'),
+    });
+
+    const { data: allTenants = [] } = useQuery<TenantRow[]>({
+        queryKey: ['admin-tenants-all'],
+        queryFn: () => fetchApi('/api/admin/tenants'),
+        enabled: isPlatformSuperAdmin,
     });
 
     const { data: storesPayload, isLoading: storesLoading } = useQuery({
@@ -383,7 +404,7 @@ export function AdminDashboard({ onNavigateToTeamRoles }: { onNavigateToTeamRole
                 ) : (
                     <>
                         {(drillView === 'users' || drillView === 'superadmins') && (
-                            <UsersTable users={filteredUsers} search={search} />
+                            <UsersTable users={filteredUsers} search={search} tenantOptions={allTenants} />
                         )}
                         {(drillView === 'agencies' || drillView === 'sellers') && (
                             <TenantsTable
@@ -399,7 +420,6 @@ export function AdminDashboard({ onNavigateToTeamRoles }: { onNavigateToTeamRole
                                 search={search}
                                 metricsWindow={storesMetricsWindow}
                                 onShowAllStores={setSelectedAccount}
-                                onShowPL={setSelectedShopForPL}
                             />
                         )}
                         {drillView === 'memberships' && (
@@ -422,12 +442,15 @@ export function AdminDashboard({ onNavigateToTeamRoles }: { onNavigateToTeamRole
 
 /* ═══════════════════ Users table ═══════════════════ */
 
-function UsersTable({ users, search }: { users: AdminUser[]; search: string }) {
+function UsersTable({ users, search, tenantOptions }: { users: AdminUser[]; search: string; tenantOptions: TenantRow[] }) {
     const { user: currentUser } = useAuth();
     const queryClient = useQueryClient();
     const [openMenuId, setOpenMenuId] = useState<string | null>(null);
     const menuRef = useRef<HTMLDivElement>(null);
     const [confirm, setConfirm] = useState<null | { type: 'delete' | 'revoke'; target: AdminUser }>(null);
+    const [transferTarget, setTransferTarget] = useState<AdminUser | null>(null);
+    const [transferTenantId, setTransferTenantId] = useState('');
+    const [transferRoleName, setTransferRoleName] = useState('');
     const [toast, setToast] = useState<null | { kind: 'ok' | 'err'; msg: string }>(null);
 
     useEffect(() => {
@@ -442,6 +465,7 @@ function UsersTable({ users, search }: { users: AdminUser[]; search: string }) {
         queryClient.invalidateQueries({ queryKey: ['admin-users'] });
         queryClient.invalidateQueries({ queryKey: ['admin-stats'] });
         queryClient.invalidateQueries({ queryKey: ['admin-tenants'] });
+        queryClient.invalidateQueries({ queryKey: ['admin-tenants-all'] });
         queryClient.invalidateQueries({ queryKey: ['admin-memberships'] });
         queryClient.invalidateQueries({ queryKey: ['admin-stores'] });
     };
@@ -495,6 +519,22 @@ function UsersTable({ users, search }: { users: AdminUser[]; search: string }) {
         onError: (e: Error) => setToast({ kind: 'err', msg: e.message }),
     });
 
+    const transferMut = useMutation({
+        mutationFn: (payload: { userId: string; targetTenantId: string; targetRoleName: string }) =>
+            adminPostJson(`/api/admin/users/${payload.userId}/reassign-tenant`, {
+                targetTenantId: payload.targetTenantId,
+                targetRoleName: payload.targetRoleName,
+            }),
+        onSuccess: () => {
+            invalidateAdmin();
+            setToast({ kind: 'ok', msg: 'Tenant membership transferred.' });
+            setTransferTarget(null);
+            setTransferTenantId('');
+            setTransferRoleName('');
+        },
+        onError: (e: Error) => setToast({ kind: 'err', msg: e.message }),
+    });
+
     useEffect(() => {
         if (!toast) return;
         const t = setTimeout(() => setToast(null), 5000);
@@ -503,7 +543,30 @@ function UsersTable({ users, search }: { users: AdminUser[]; search: string }) {
 
     const isSelf = (id: string) => currentUser?.id === id;
     const busy =
-        deleteMut.isPending || revokeMut.isPending || suspendMut.isPending || unsuspendMut.isPending || resetPwMut.isPending;
+        deleteMut.isPending || revokeMut.isPending || suspendMut.isPending || unsuspendMut.isPending || resetPwMut.isPending || transferMut.isPending;
+
+    const selectedTransferTenant = useMemo(
+        () => tenantOptions.find((t) => t.id === transferTenantId) ?? null,
+        [tenantOptions, transferTenantId]
+    );
+
+    const transferRoleOptions = useMemo(() => {
+        if (!selectedTransferTenant) return [] as string[];
+        if (selectedTransferTenant.type === 'agency') {
+            return ['Agency Admin', 'Account Manager', 'Account Coordinator'];
+        }
+        return ['Seller Admin', 'Seller User'];
+    }, [selectedTransferTenant]);
+
+    useEffect(() => {
+        if (!transferRoleOptions.length) {
+            setTransferRoleName('');
+            return;
+        }
+        if (!transferRoleOptions.includes(transferRoleName)) {
+            setTransferRoleName(transferRoleOptions[0]);
+        }
+    }, [transferRoleOptions, transferRoleName]);
 
     return (
         <div className="space-y-4">
@@ -638,6 +701,19 @@ function UsersTable({ users, search }: { users: AdminUser[]; search: string }) {
                                                         type="button"
                                                         onClick={() => {
                                                             setOpenMenuId(null);
+                                                            setTransferTarget(user);
+                                                            setTransferTenantId('');
+                                                            setTransferRoleName('');
+                                                        }}
+                                                        className="w-full flex items-center gap-2 px-4 py-2.5 text-left text-sm text-gray-200 hover:bg-white/10"
+                                                    >
+                                                        <Building2 className="w-4 h-4 text-blue-400" />
+                                                        Transfer tenant membership
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => {
+                                                            setOpenMenuId(null);
                                                             setConfirm({ type: 'revoke', target: user });
                                                         }}
                                                         className="w-full flex items-center gap-2 px-4 py-2.5 text-left text-sm text-gray-200 hover:bg-white/10"
@@ -722,6 +798,77 @@ function UsersTable({ users, search }: { users: AdminUser[]; search: string }) {
                                 className="px-4 py-2 rounded-xl bg-red-600 hover:bg-red-500 text-white text-sm font-semibold disabled:opacity-50"
                             >
                                 {confirm.type === 'delete' ? 'Delete' : 'Revoke'}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {transferTarget && (
+                <div className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
+                    <div className="bg-gray-950 border border-white/10 rounded-3xl w-full max-w-lg overflow-hidden shadow-2xl">
+                        <div className="px-6 py-5 border-b border-white/10">
+                            <h3 className="text-lg font-bold text-white">Transfer Tenant Membership</h3>
+                            <p className="text-sm text-gray-400 mt-2">
+                                Move <span className="text-white font-semibold">{transferTarget.full_name || transferTarget.email}</span> to one tenant context.
+                                Other active seller/agency memberships will be deactivated.
+                            </p>
+                        </div>
+                        <div className="px-6 py-5 space-y-4">
+                            <div>
+                                <label className="text-xs font-bold uppercase tracking-wider text-gray-500">Target tenant</label>
+                                <select
+                                    value={transferTenantId}
+                                    onChange={(e) => setTransferTenantId(e.target.value)}
+                                    className="mt-2 w-full px-4 py-3 bg-gray-900 border border-white/10 rounded-xl text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/40"
+                                >
+                                    <option value="">Select tenant…</option>
+                                    {tenantOptions
+                                        .filter((t) => t.type === 'agency' || t.type === 'seller')
+                                        .map((t) => (
+                                            <option key={t.id} value={t.id}>
+                                                {t.name} ({t.type})
+                                            </option>
+                                        ))}
+                                </select>
+                            </div>
+                            <div>
+                                <label className="text-xs font-bold uppercase tracking-wider text-gray-500">Target role</label>
+                                <select
+                                    value={transferRoleName}
+                                    onChange={(e) => setTransferRoleName(e.target.value)}
+                                    disabled={!transferTenantId}
+                                    className="mt-2 w-full px-4 py-3 bg-gray-900 border border-white/10 rounded-xl text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/40 disabled:opacity-50"
+                                >
+                                    {transferRoleOptions.map((role) => (
+                                        <option key={role} value={role}>
+                                            {role}
+                                        </option>
+                                    ))}
+                                </select>
+                            </div>
+                        </div>
+                        <div className="px-6 py-4 flex justify-end gap-3 border-t border-white/10">
+                            <button
+                                type="button"
+                                onClick={() => setTransferTarget(null)}
+                                className="px-4 py-2 rounded-xl border border-white/10 text-gray-300 hover:bg-white/5 text-sm font-semibold"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                type="button"
+                                disabled={transferMut.isPending || !transferTenantId || !transferRoleName}
+                                onClick={() =>
+                                    transferMut.mutate({
+                                        userId: transferTarget.id,
+                                        targetTenantId: transferTenantId,
+                                        targetRoleName: transferRoleName,
+                                    })
+                                }
+                                className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold disabled:opacity-50"
+                            >
+                                Transfer
                             </button>
                         </div>
                     </div>
@@ -1163,13 +1310,11 @@ function StoresTable({
     search,
     metricsWindow,
     onShowAllStores,
-    onShowPL,
 }: {
     accounts: any[];
     search: string;
     metricsWindow?: { kind: string; description: string };
     onShowAllStores: (a: any) => void;
-    onShowPL: (s: any) => void;
 }) {
     return (
         <div className="space-y-3">

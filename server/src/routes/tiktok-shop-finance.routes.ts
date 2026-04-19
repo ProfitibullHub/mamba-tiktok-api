@@ -4,13 +4,25 @@ import { getShopWithToken } from './tiktok-shop-data.routes.js';
 import { supabase } from '../config/supabase.js';
 import {
     enforceRequestAccountAccess,
+    resolveRequestUserId,
     verifyAccountIdParam,
 } from '../middleware/account-access.middleware.js';
+import { requireAuthorization } from '../middleware/authorize.middleware.js';
+import { applyFinancialFieldFiltering, getFinancialFieldAccess } from '../services/financial-visibility.service.js';
 
 const router = express.Router();
 
 router.use(enforceRequestAccountAccess);
 router.param('accountId', verifyAccountIdParam);
+
+router.use(
+    ['/pl-data/:accountId', '/daily-ad-spend/:accountId'],
+    requireAuthorization((req) => ({
+        action: 'view_pnl',
+        accountId: req.params.accountId,
+        denyAction: 'finance.permission_denied',
+    }))
+);
 
 // Helper to handle API errors
 const handleApiError = (res: express.Response, error: any) => {
@@ -263,6 +275,7 @@ router.get('/pl-data/:accountId', async (req, res) => {
     try {
         const { accountId } = req.params;
         const { shopId, startDate, endDate } = req.query;
+        const userId = await resolveRequestUserId(req);
 
         // Get shop IDs for this account
         let shopsQuery = supabase
@@ -354,19 +367,34 @@ router.get('/pl-data/:accountId', async (req, res) => {
             : 0;
         const statementsWithoutTransactions = settlements.length - statementsWithTransactions;
 
+        const payload = {
+            ...aggregated,
+            statement_totals: statementTotals,
+            meta: {
+                total_statements: settlements.length,
+                statements_with_transactions: statementsWithTransactions,
+                statements_without_transactions: statementsWithoutTransactions,
+                currency: settlements[0]?.currency || 'USD',
+                has_complete_data: statementsWithoutTransactions === 0,
+            },
+        };
+
+        let filteredPayload = payload;
+        if (userId) {
+            const { data: account } = await supabase
+                .from('accounts')
+                .select('tenant_id')
+                .eq('id', accountId)
+                .maybeSingle();
+            if (account?.tenant_id) {
+                const fieldAccess = await getFinancialFieldAccess(userId, account.tenant_id);
+                filteredPayload = applyFinancialFieldFiltering(payload as Record<string, unknown>, fieldAccess);
+            }
+        }
+
         res.json({
             success: true,
-            data: {
-                ...aggregated,
-                statement_totals: statementTotals,
-                meta: {
-                    total_statements: settlements.length,
-                    statements_with_transactions: statementsWithTransactions,
-                    statements_without_transactions: statementsWithoutTransactions,
-                    currency: settlements[0]?.currency || 'USD',
-                    has_complete_data: statementsWithoutTransactions === 0,
-                },
-            },
+            data: filteredPayload,
         });
     } catch (error) {
         handleApiError(res, error);

@@ -7,6 +7,7 @@
 
 import crypto from 'crypto';
 import { Agent, request } from 'undici';
+import { logSystemEvent } from './system-logger.js';
 
 // Global dispatcher to extend timeouts for long-running TikTok queries (like Audience)
 const customFetchDispatcher = new Agent({
@@ -45,13 +46,13 @@ class TikTokBusinessAPIService {
      * Without it, the access token will NOT carry those permissions even if
      * the app is approved for them.
      */
-    getAuthorizationUrl(accountId: string, redirectUri: string, returnUrl?: string): string {
+    getAuthorizationUrl(accountId: string, redirectUri: string, returnUrl?: string, stateOverride?: string): string {
         if (!this.appId) {
             throw new Error('TIKTOK_BUSINESS_APP_ID is not configured. Please set it in environment variables.');
         }
 
         // Include returnUrl in state so we can redirect back after OAuth
-        const state = Buffer.from(JSON.stringify({
+        const state = stateOverride || Buffer.from(JSON.stringify({
             accountId,
             timestamp: Date.now(),
             returnUrl: returnUrl || '/dashboard'
@@ -737,6 +738,20 @@ class TikTokBusinessAPIService {
                 // Log the full error — a 40002 usually means an invalid metric name.
                 // If ALL chunks fail here, a metric in the list above is invalid for this endpoint.
                 console.warn(`[Consolidated Overview] Chunk ${chunk.start}→${chunk.end} failed: ${e.message}`);
+                logSystemEvent({
+                    level: 'error',
+                    scope: 'ads',
+                    event: 'ads.consolidated_overview.chunk_failed',
+                    stream: 'ads',
+                    message: `Consolidated Overview chunk ${chunk.start}→${chunk.end} failed: ${e?.message || 'unknown error'}`,
+                    data: {
+                        advertiserId,
+                        startDate: chunk.start,
+                        endDate: chunk.end,
+                        requestedStartDate: startDate,
+                        requestedEndDate: endDate,
+                    },
+                });
             }
         }
 
@@ -887,9 +902,36 @@ class TikTokBusinessAPIService {
                         allRows.push(...normalizedRows);
                     } else {
                         console.warn(`[GMV Report] /gmv_max/report/get/ error code ${json.code}: ${json.message}`);
+                        logSystemEvent({
+                            level: 'error',
+                            scope: 'ads',
+                            event: 'ads.gmv_report.api_error',
+                            stream: 'ads',
+                            message: `GMV report API error code ${json.code}: ${json.message}`,
+                            data: {
+                                advertiserId,
+                                startDate: chunk.start,
+                                endDate: chunk.end,
+                                code: json.code,
+                                storeIdsCount: storeIds.length,
+                            },
+                        });
                     }
                 } catch (e: any) {
                     console.warn(`[GMV Report] /gmv_max/report/get/ chunk ${chunk.start}→${chunk.end} failed:`, e.message);
+                    logSystemEvent({
+                        level: 'error',
+                        scope: 'ads',
+                        event: 'ads.gmv_report.chunk_failed',
+                        stream: 'ads',
+                        message: `GMV report chunk ${chunk.start}→${chunk.end} failed: ${e?.message || 'unknown error'}`,
+                        data: {
+                            advertiserId,
+                            startDate: chunk.start,
+                            endDate: chunk.end,
+                            storeIdsCount: storeIds.length,
+                        },
+                    });
                 }
             }
 
@@ -931,6 +973,18 @@ class TikTokBusinessAPIService {
                 allRows.push(...rows);
             } catch (e: any) {
                 console.warn(`[GMV Report] Integrated chunk ${chunk.start}→${chunk.end} failed:`, e.message);
+                logSystemEvent({
+                    level: 'error',
+                    scope: 'ads',
+                    event: 'ads.gmv_report.integrated_chunk_failed',
+                    stream: 'ads',
+                    message: `Integrated GMV fallback chunk ${chunk.start}→${chunk.end} failed: ${e?.message || 'unknown error'}`,
+                    data: {
+                        advertiserId,
+                        startDate: chunk.start,
+                        endDate: chunk.end,
+                    },
+                });
             }
         }
 

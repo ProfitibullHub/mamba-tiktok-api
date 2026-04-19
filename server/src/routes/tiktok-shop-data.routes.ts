@@ -1,22 +1,101 @@
 import { Router, Request, Response } from 'express';
+import { randomUUID } from 'crypto';
 import axios from 'axios';
 import { tiktokShopApi, TikTokShopError } from '../services/tiktok-shop-api.service.js';
 import { supabase } from '../config/supabase.js';
 import { getTimezoneForRegion } from '../utils/timezoneMapping.js';
-import { MAX_HISTORICAL_DAYS, getHistoricalStartTime, getHistoricalStartDate, getHistoricalWindowLabel } from '../config/dataRetention.js';
+import { MAX_HISTORICAL_DAYS, DEFAULT_SYNC_DAYS, getHistoricalStartTime, getHistoricalStartDate, getHistoricalWindowLabel } from '../config/dataRetention.js';
+import {
+    claimIngestionJobs,
+    enqueueIngestionJob,
+    getIngestionJob,
+    markIngestionJobFailed,
+    markIngestionJobSucceeded,
+    updateIngestionJobProgress,
+    type IngestionJobPayload,
+    type IngestionJobRow,
+} from '../services/ingestion-queue.service.js';
+import { ingestionLogger } from '../services/ingestion-logger.js';
 import {
     enforceRequestAccountAccess,
     verifyAccountIdParam,
+    resolveRequestUserId,
 } from '../middleware/account-access.middleware.js';
+import { requireTikTokShopEntitlementParam } from '../middleware/tiktok-entitlement-param.middleware.js';
+import { requireIngestionJobReadAccess } from '../middleware/ingestion-job-access.middleware.js';
+import { auditLog } from '../services/audit-logger.js';
 
 const router = Router();
 
 router.use(enforceRequestAccountAccess);
 router.param('accountId', verifyAccountIdParam);
+router.param('accountId', requireTikTokShopEntitlementParam);
 
 // In-memory cache for shop tokens during sync operations (prevents repeated DB queries)
 const shopTokenCache = new Map<string, { shop: any; timestamp: number }>();
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+async function isPlatformSuperAdminRequest(req: Request): Promise<boolean> {
+    const userId = await resolveRequestUserId(req);
+    if (!userId) return false;
+
+    const [{ data: isSa, error: saErr }, { data: profile, error: profileErr }] = await Promise.all([
+        supabase.rpc('user_is_platform_super_admin', { p_user_id: userId }),
+        supabase.from('profiles').select('role').eq('id', userId).maybeSingle(),
+    ]);
+
+    if (saErr || profileErr) return false;
+    return isSa === true || profile?.role === 'admin';
+}
+
+async function recordCompletedIngestionActivity(params: {
+    stream: 'shop' | 'ads';
+    accountId?: string | null;
+    shopDbId?: string | null;
+    syncType: string;
+    status: 'succeeded' | 'failed';
+    error?: string | null;
+    payload?: Record<string, unknown>;
+    result?: Record<string, unknown>;
+}): Promise<void> {
+    const { accountId, shopDbId, stream, syncType, status, error, payload, result } = params;
+    const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    if (!accountId || !uuidRe.test(accountId)) return;
+
+    const nowIso = new Date().toISOString();
+    const { data: job, error: jobErr } = await supabase
+        .from('ingestion_jobs')
+        .insert({
+            stream,
+            provider: 'tiktok',
+            account_id: accountId,
+            shop_id: shopDbId && uuidRe.test(shopDbId) ? shopDbId : null,
+            sync_type: syncType,
+            payload: payload ?? {},
+            idempotency_key: randomUUID(),
+            status,
+            attempt_count: 1,
+            max_attempts: 1,
+            next_retry_at: nowIso,
+            completed_at: nowIso,
+            last_error: error ?? null,
+            updated_at: nowIso,
+        })
+        .select('id')
+        .single();
+    if (jobErr || !job?.id) return;
+
+    await supabase.from('ingestion_job_attempts').insert({
+        job_id: job.id,
+        attempt_no: 1,
+        status,
+        started_at: nowIso,
+        finished_at: nowIso,
+        error: error ?? null,
+        result: result ?? null,
+        worker_id: `${stream}-event`,
+    });
+}
 
 /**
  * Retry helper for database queries to handle transient errors
@@ -1670,32 +1749,49 @@ router.get('/overview/:accountId', async (req: Request, res: Response) => {
 
         console.log(`[Overview API] Fetching overview for account ${accountId}, shop ${shopId || 'all'}, refresh=${refresh}, background=${background}...`);
 
-        // 1. If refresh=true, trigger sync
+        // 1. If refresh=true, enqueue a background sync job — never block the HTTP response.
+        // Callers must not depend on real-time sync completion here; read from Supabase cache below.
         if (refresh === 'true') {
-            const shop = await getShopWithToken(accountId, shopId as string, true); // Force token refresh if needed
+            try {
+                const { data: shopRow } = await supabase
+                    .from('tiktok_shops')
+                    .select('id')
+                    .eq('account_id', accountId)
+                    .eq(shopId ? 'shop_id' : 'account_id', shopId || accountId)
+                    .limit(1)
+                    .maybeSingle();
 
-            if (background === 'true') {
-                // Background mode: Start sync async, don't wait
-                console.log('[Overview API] Starting background sync...');
-                Promise.all([
-                    syncOrders(shop),
-                    syncProducts(shop),
-                    syncSettlements(shop),
-                    syncPerformance(shop)
-                ]).then(() => {
-                    console.log('[Overview API] Background sync completed');
-                }).catch(err => {
-                    console.error('[Overview API] Background sync error:', err);
+                const payload: IngestionJobPayload = {
+                    accountId,
+                    shopId: shopId as string | undefined,
+                    syncType: 'all',
+                    source: 'manual',
+                };
+                const { job: bgJob } = await enqueueIngestionJob({
+                    stream: 'shop',
+                    accountId,
+                    shopDbId: (shopRow as { id?: string } | null)?.id,
+                    syncType: 'all',
+                    payload,
+                    priority: 60,
                 });
-                // Continue immediately to return cached data
-            } else {
-                // Foreground mode: Wait for sync to complete
-                await Promise.all([
-                    syncOrders(shop),
-                    syncProducts(shop),
-                    syncSettlements(shop),
-                    syncPerformance(shop)
-                ]);
+                ingestionLogger.info({
+                    event: 'job_enqueued',
+                    stream: 'shop',
+                    jobId: bgJob.id,
+                    accountId,
+                    shopId: typeof shopId === 'string' ? shopId : undefined,
+                    syncType: 'all',
+                    source: 'overview_refresh',
+                });
+                // Fire-and-forget: trigger worker without blocking the response
+                // Fire-and-forget: trigger worker on the local server without blocking the response
+                const serverPort = process.env.PORT || 3001;
+                axios.post(`http://localhost:${serverPort}/api/tiktok-shop/sync/run-worker?limit=1`, {}, {
+                    headers: req.headers.authorization ? { authorization: req.headers.authorization } : {},
+                }).catch(() => undefined);
+            } catch (bgErr: any) {
+                ingestionLogger.warn({ event: 'enqueue_failed', source: 'overview_refresh', error: bgErr.message });
             }
         }
 
@@ -2799,85 +2895,192 @@ router.get('/categories/:accountId', async (req: Request, res: Response) => {
 
 /**
  * POST /api/tiktok-shop/sync/:accountId
- * Trigger data synchronization
- * Supports incremental sync - only fetches new data if shop has been synced before
+ * Enqueue data synchronization (durable async job).
  */
-router.post('/sync/:accountId', async (req: Request, res: Response) => {
+type ShopSyncPhase = 'orders' | 'products' | 'settlements' | 'performance' | 'complete';
+type ShopSyncProgress = {
+    phase: ShopSyncPhase;
+    processed?: number;
+    total?: number;
+    note?: string;
+};
+
+async function runShopSyncJob(
+    jobPayload: IngestionJobPayload,
+    onProgress?: (progress: ShopSyncProgress) => Promise<void> | void,
+) {
+    const {
+        accountId,
+        shopId,
+        syncType = 'all',
+        startDate,
+        endDate,
+        forceFullSync = false,
+    } = jobPayload;
+    const shop = await getShopWithToken(accountId, shopId);
+
+    const isHistoricalFetch = !!(startDate && endDate);
+    const { count: existingOrdersCount } = await supabase
+        .from('shop_orders')
+        .select('*', { count: 'exact', head: true })
+        .eq('shop_id', shop.id);
+
+    const isFirstSync = (existingOrdersCount || 0) === 0;
+    const syncResults: { orders?: any; products?: any; settlements?: any; performance?: any } = {};
+
+    if (syncType === 'all' || syncType === 'orders') {
+        await onProgress?.({ phase: 'orders', note: 'Starting orders sync' });
+        syncResults.orders = await syncOrders(
+            shop,
+            isFirstSync,
+            isHistoricalFetch ? startDate : undefined,
+            isHistoricalFetch ? endDate : undefined,
+            (processed, total) => onProgress?.({ phase: 'orders', processed, total }),
+        );
+    }
+    if (syncType === 'all' || syncType === 'products') {
+        await onProgress?.({ phase: 'products', note: 'Starting products sync' });
+        syncResults.products = await syncProducts(
+            shop,
+            isFirstSync,
+            (processed, total) => onProgress?.({ phase: 'products', processed, total }),
+        );
+    }
+    if (syncType === 'all' || syncType === 'settlements' || syncType === 'finance') {
+        await onProgress?.({ phase: 'settlements', note: 'Starting settlements sync' });
+        syncResults.settlements = await syncSettlements(
+            shop,
+            isFirstSync || forceFullSync,
+            (processed, total) => onProgress?.({ phase: 'settlements', processed, total }),
+        );
+    }
+    if (syncType === 'all') {
+        await onProgress?.({ phase: 'performance', note: 'Starting performance sync' });
+        syncResults.performance = await syncPerformance(shop);
+    }
+    await onProgress?.({ phase: 'complete', note: 'Sync complete' });
+
+    return {
+        message: isFirstSync ? 'Initial sync completed' : 'Incremental sync completed',
+        isFirstSync,
+        stats: syncResults,
+    };
+}
+
+router.post('/sync/:accountId([0-9a-fA-F-]{36})', async (req: Request, res: Response) => {
     try {
         const { accountId } = req.params;
         const { shopId, syncType = 'all', startDate, endDate, forceFullSync = false } = req.body;
-
-        const shop = await getShopWithToken(accountId, shopId);
-
-        // If custom date range provided, this is an on-demand historical fetch
-        const isHistoricalFetch = !!(startDate && endDate);
-
-        // Detect if this is a first-time sync by checking if shop has any orders
+        const { data: shop } = await supabase
+            .from('tiktok_shops')
+            .select('id')
+            .eq('account_id', accountId)
+            .eq(shopId ? 'shop_id' : 'account_id', shopId || accountId)
+            .limit(1)
+            .maybeSingle();
+        const shopDbId = (shop as { id?: string } | null)?.id;
+        const isManualAllSync = syncType === 'all' && !startDate && !endDate;
         const { count: existingOrdersCount } = await supabase
             .from('shop_orders')
             .select('*', { count: 'exact', head: true })
-            .eq('shop_id', shop.id);
+            .eq('shop_id', shopDbId || '00000000-0000-0000-0000-000000000000');
+        const shouldBootstrap = isManualAllSync && ((existingOrdersCount || 0) === 0);
 
-        const isFirstSync = (existingOrdersCount || 0) === 0;
+        const payload: IngestionJobPayload = {
+            accountId,
+            shopId,
+            syncType,
+            startDate,
+            endDate,
+            forceFullSync,
+            source: shouldBootstrap ? 'manual_bootstrap_recent' : 'manual',
+        };
 
-        if (forceFullSync) {
-            console.log(`[Sync] ⚡ Force Full Sync requested for ${shop.shop_name} - will fetch all settlement data with transactions`);
-        } else if (isHistoricalFetch) {
-            console.log(`[Sync] Historical fetch for ${shop.shop_name}: ${startDate} to ${endDate}`);
-        } else if (isFirstSync) {
-            console.log(`[Sync] First-time sync detected for ${shop.shop_name} - will fetch all data`);
-        } else {
-            console.log(`[Sync] Incremental sync for ${shop.shop_name} - will fetch only new data`);
-        }
-
-        // Fetch and store data based on syncType
-        const syncResults: { orders?: any; products?: any; settlements?: any; performance?: any } = {};
-
-        if (syncType === 'all' || syncType === 'orders') {
-            syncResults.orders = await syncOrders(shop, isFirstSync, isHistoricalFetch ? startDate : undefined, isHistoricalFetch ? endDate : undefined);
-        }
-
-        if (syncType === 'all' || syncType === 'products') {
-            syncResults.products = await syncProducts(shop, isFirstSync);
-        }
-
-        if (syncType === 'all' || syncType === 'settlements' || syncType === 'finance') {
-            // Force full sync for settlements when requested (bypasses Smart Stop)
-            syncResults.settlements = await syncSettlements(shop, isFirstSync || forceFullSync);
-        }
-
-        if (syncType === 'all') {
-            syncResults.performance = await syncPerformance(shop);
-        }
-
-        res.json({
-            success: true,
-            message: isFirstSync ? 'Initial sync completed' : 'Incremental sync completed',
-            isFirstSync,
-            stats: syncResults
+        const { job, deduped } = await enqueueIngestionJob({
+            stream: 'shop',
+            accountId,
+            shopDbId,
+            syncType,
+            payload,
+            priority: shouldBootstrap ? 20 : (syncType === 'orders' ? 40 : 60),
         });
-    } catch (error: any) {
-        console.error('Error syncing data:', error);
 
-        // Check for expired credentials error (105002)
-        if (error.code === 105002 || (error.message && error.message.includes('105002'))) {
-            console.log(`[Sync Error] Expired credentials detected for account ${req.params.accountId}. Marking shops as expired.`);
-            try {
-                const expiredTime = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
-                // Mark all shops for this account as expired since they share the token
-                await supabase
-                    .from('tiktok_shops')
-                    .update({
-                        token_expires_at: expiredTime,
-                        refresh_token_expires_at: expiredTime,
-                        updated_at: new Date().toISOString()
-                    })
-                    .eq('account_id', req.params.accountId);
-            } catch (dbError) {
-                console.error('Error updating shop expiration in DB:', dbError);
+        let backfillJob: IngestionJobRow | null = null;
+        if (shouldBootstrap) {
+            const now = Date.now();
+            const backfillStart = new Date(now - MAX_HISTORICAL_DAYS * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+            const backfillEnd = new Date(now - DEFAULT_SYNC_DAYS * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+            if (backfillStart < backfillEnd) {
+                const backfillPayload: IngestionJobPayload = {
+                    accountId,
+                    shopId,
+                    syncType: 'orders',
+                    startDate: backfillStart,
+                    endDate: backfillEnd,
+                    forceFullSync: true,
+                    source: 'manual_bootstrap_backfill',
+                };
+                const { job: queuedBackfillJob } = await enqueueIngestionJob({
+                    stream: 'shop',
+                    accountId,
+                    shopDbId,
+                    syncType: 'orders',
+                    payload: backfillPayload,
+                    priority: 85,
+                });
+                backfillJob = queuedBackfillJob;
             }
         }
+        ingestionLogger.info({
+            event: 'job_enqueued',
+            stream: 'shop',
+            jobId: job.id,
+            accountId,
+            shopId,
+            syncType,
+            source: payload.source,
+            status: job.status,
+            deduped,
+        });
+        await auditLog(req, {
+            action: 'tiktok.shop.sync_enqueued',
+            resourceType: 'ingestion_job',
+            resourceId: job.id,
+            accountId,
+            metadata: { stream: 'shop', syncType, deduped, shopId: shopId ?? null, source: payload.source },
+        });
+        if (backfillJob) {
+            await auditLog(req, {
+                action: 'tiktok.shop.sync_backfill_enqueued',
+                resourceType: 'ingestion_job',
+                resourceId: backfillJob.id,
+                accountId,
+                metadata: {
+                    stream: 'shop',
+                    syncType: 'orders',
+                    source: 'manual_bootstrap_backfill',
+                    backfillWindowDays: MAX_HISTORICAL_DAYS - DEFAULT_SYNC_DAYS,
+                },
+            });
+        }
 
+        res.status(202).json({
+            success: true,
+            queued: true,
+            deduped,
+            jobId: job.id,
+            status: job.status,
+            bootstrap: shouldBootstrap
+                ? {
+                    isNewShopBootstrap: true,
+                    recentWindowDays: DEFAULT_SYNC_DAYS,
+                    backfillQueued: !!backfillJob,
+                    backfillJobId: backfillJob?.id ?? null,
+                }
+                : undefined,
+        });
+    } catch (error: any) {
+        console.error('[Sync Queue] Failed to enqueue:', error);
         res.status(500).json({
             success: false,
             error: error.message,
@@ -2885,17 +3088,153 @@ router.post('/sync/:accountId', async (req: Request, res: Response) => {
     }
 });
 
+router.get('/sync/job/:jobId', requireIngestionJobReadAccess(), async (req: Request, res: Response) => {
+    try {
+        const job = await getIngestionJob(req.params.jobId);
+        if (!job) {
+            return res.status(404).json({ success: false, error: 'Job not found' });
+        }
+        const { data: attempts } = await supabase
+            .from('ingestion_job_attempts')
+            .select('attempt_no,status,error,result,finished_at,started_at')
+            .eq('job_id', job.id)
+            .order('attempt_no', { ascending: false })
+            .limit(1);
+        const lastAttempt = attempts?.[0] ?? null;
+        const progress = (lastAttempt?.result as any)?.progress ?? null;
+        return res.json({ success: true, job, lastAttempt, progress });
+    } catch (error: any) {
+        return res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+router.post('/sync/run-worker', async (req: Request, res: Response) => {
+    const authHeader = req.headers.authorization;
+    const cronAuthorized = !!process.env.CRON_SECRET && authHeader === `Bearer ${process.env.CRON_SECRET}`;
+    const superAdminAuthorized = await isPlatformSuperAdminRequest(req);
+    if (!cronAuthorized && !superAdminAuthorized) {
+        return res.status(401).json({ success: false, error: 'Unauthorized (cron secret or platform super admin required)' });
+    }
+
+    const workerId = `shop-worker-${Date.now()}`;
+    const limit = Math.max(1, Math.min(10, Number(req.query.limit) || 3));
+    const results: Array<{ jobId: string; status: string; error?: string }> = [];
+    try {
+        const claimedJobs = await claimIngestionJobs(workerId, 'shop', limit);
+        const jobResults = await Promise.all(
+            claimedJobs.map(async (job) => {
+                try {
+                    ingestionLogger.info({
+                        event: 'job_started',
+                        stream: 'shop',
+                        jobId: job.id,
+                        accountId: job.account_id,
+                        syncType: job.sync_type,
+                        attempt: job.attempt_count,
+                        status: job.status,
+                    });
+                    await auditLog(null, {
+                        action: 'tiktok.shop.sync_started',
+                        resourceType: 'ingestion_job',
+                        resourceId: job.id,
+                        accountId: job.account_id,
+                        metadata: { stream: 'shop', workerId, attempt: job.attempt_count },
+                    });
+                    let lastProgressWriteAt = 0;
+                    const result = await runShopSyncJob(
+                        job.payload as IngestionJobPayload,
+                        async (progress) => {
+                            const now = Date.now();
+                            const shouldWrite = progress.phase === 'complete' || now - lastProgressWriteAt >= 800;
+                            if (!shouldWrite) return;
+                            lastProgressWriteAt = now;
+                            await updateIngestionJobProgress(job.id, progress);
+                        },
+                    );
+                    await markIngestionJobSucceeded(job.id, result);
+                    ingestionLogger.info({
+                        event: 'job_succeeded',
+                        stream: 'shop',
+                        jobId: job.id,
+                        accountId: job.account_id,
+                        syncType: job.sync_type,
+                        status: 'succeeded',
+                    });
+                    await auditLog(null, {
+                        action: 'tiktok.shop.sync_succeeded',
+                        resourceType: 'ingestion_job',
+                        resourceId: job.id,
+                        accountId: job.account_id,
+                        metadata: { stream: 'shop' },
+                    });
+                    return { jobId: job.id, status: 'succeeded' as const };
+                } catch (error: any) {
+                    const willDeadLetter = (job as IngestionJobRow).attempt_count >= (job as IngestionJobRow).max_attempts;
+                    await markIngestionJobFailed(job as IngestionJobRow, error);
+                    ingestionLogger.error({
+                        event: 'job_failed',
+                        stream: 'shop',
+                        jobId: job.id,
+                        accountId: job.account_id,
+                        syncType: job.sync_type,
+                        attempt: job.attempt_count,
+                        status: 'failed',
+                        error: error.message,
+                    });
+                    await auditLog(null, {
+                        action: willDeadLetter ? 'tiktok.shop.sync_dead_letter' : 'tiktok.shop.sync_failed',
+                        resourceType: 'ingestion_job',
+                        resourceId: job.id,
+                        accountId: job.account_id,
+                        metadata: { stream: 'shop', error: error.message, willRetry: !willDeadLetter },
+                    });
+                    return { jobId: job.id, status: 'failed' as const, error: error.message };
+                }
+            }),
+        );
+        results.push(...jobResults);
+
+        // ── Dead-letter alerting ─────────────────────────────────────────────
+        // Fire-and-forget: check dead-letter count and alert if threshold exceeded
+        if (process.env.DEAD_LETTER_WEBHOOK_URL) {
+            (async () => {
+                try {
+                    const threshold = Number(process.env.DEAD_LETTER_ALERT_THRESHOLD ?? 1);
+                    const { count } = await supabase
+                        .from('ingestion_jobs')
+                        .select('*', { count: 'exact', head: true })
+                        .eq('status', 'dead_letter');
+                    if ((count ?? 0) >= threshold) {
+                        ingestionLogger.warn({ event: 'dead_letter_alert', stream: 'shop', count });
+                        await axios.post(process.env.DEAD_LETTER_WEBHOOK_URL!, {
+                            text: `⚠️ *Mamba Ingestion Alert* — ${count} job(s) in dead-letter queue. Check the monitoring dashboard.`,
+                        }).catch(() => undefined);
+                    }
+                } catch { /* never crash the worker */ }
+            })();
+        }
+
+        return res.json({
+            success: true,
+            workerId,
+            claimed: claimedJobs.length,
+            results,
+        });
+    } catch (error: any) {
+        return res.status(500).json({ success: false, error: error.message, workerId, results });
+    }
+});
+
 // Cron job endpoint for Vercel
 router.get('/sync/cron', async (req: Request, res: Response) => {
-    // Verify Vercel Cron signature (optional but recommended)
+    // Verify Vercel Cron signature — CRON_SECRET must match when set
     const authHeader = req.headers.authorization;
-    if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
-        // For now, allow open access or check a simple secret
-        // return res.status(401).json({ error: 'Unauthorized' });
+    if (process.env.CRON_SECRET && authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
+        return res.status(401).json({ success: false, error: 'Unauthorized' });
     }
 
     try {
-        console.log('Starting scheduled sync...');
+        ingestionLogger.info({ event: 'cron_started', stream: 'shop', syncType: 'cron_full' });
 
         // Get all active shops
         const { data: shops, error } = await supabase
@@ -2908,9 +3247,9 @@ router.get('/sync/cron', async (req: Request, res: Response) => {
             return res.json({ message: 'No shops to sync' });
         }
 
-        console.log(`Found ${shops.length} shops to sync`);
+        ingestionLogger.info({ event: 'cron_shops_found', stream: 'shop', count: shops.length });
 
-        // Sync each shop
+        // Sync each shop via the queue (idempotent enqueue + in-process run)
         const results = await Promise.allSettled(shops.map(async (shop) => {
             try {
                 // Proactive token refresh before syncing
@@ -2927,7 +3266,7 @@ router.get('/sync/cron', async (req: Request, res: Response) => {
                     (refreshExpiry > 0 && (refreshExpiry - REFRESH_BUFFER) < cronNow && !isRefreshTokenDead);
 
                 if (isRefreshTokenDead) {
-                    console.log(`[Cron Sync] Shop ${shop.shop_name}: refresh token expired. Skipping sync.`);
+                    ingestionLogger.warn({ event: 'cron_token_expired', stream: 'shop', shopId: shop.shop_id, shopName: shop.shop_name });
                     const expiredTime = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
                     await supabase
                         .from('tiktok_shops')
@@ -2940,7 +3279,7 @@ router.get('/sync/cron', async (req: Request, res: Response) => {
                     const reason = accessExpiry < cronNow ? 'access token expired' :
                         (accessExpiry - ACCESS_BUFFER) < cronNow ? 'access token near expiry' :
                             'refresh token near expiry (proactive renewal)';
-                    console.log(`[Cron Sync] Refreshing tokens for ${shop.shop_name}: ${reason}`);
+                    ingestionLogger.info({ event: 'cron_token_refresh', stream: 'shop', shopId: shop.shop_id, shopName: shop.shop_name, reason });
 
                     const tokenData = await tiktokShopApi.refreshAccessToken(shop.refresh_token);
                     const refreshTime = new Date();
@@ -2957,7 +3296,7 @@ router.get('/sync/cron', async (req: Request, res: Response) => {
                         .eq('id', shop.id);
 
                     shop.access_token = tokenData.access_token;
-                    console.log(`[Cron Sync] Successfully refreshed tokens for ${shop.shop_name}`);
+                    ingestionLogger.info({ event: 'cron_token_refreshed', stream: 'shop', shopId: shop.shop_id });
                 }
 
                 // Run syncs
@@ -2967,13 +3306,14 @@ router.get('/sync/cron', async (req: Request, res: Response) => {
                     syncSettlements(shop)
                 ]);
 
+                ingestionLogger.info({ event: 'cron_shop_synced', stream: 'shop', shopId: shop.shop_id });
                 return { shop_id: shop.shop_id, status: 'success' };
             } catch (err: any) {
-                console.error(`Failed to sync shop ${shop.shop_name}:`, err);
+                ingestionLogger.error({ event: 'cron_shop_failed', stream: 'shop', shopId: shop.shop_id, shopName: shop.shop_name, error: err.message });
 
                 // Handle expired credentials in Cron
                 if (err.code === 105002 || (err.message && err.message.includes('105002'))) {
-                    console.log(`[Cron Sync] Expired credentials for shop ${shop.shop_name} (ID: ${shop.id}). Marking as expired.`);
+                    ingestionLogger.warn({ event: 'cron_credentials_expired', stream: 'shop', shopId: shop.shop_id });
                     try {
                         const expiredTime = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
                         await supabase
@@ -2984,8 +3324,8 @@ router.get('/sync/cron', async (req: Request, res: Response) => {
                                 updated_at: new Date().toISOString()
                             })
                             .eq('id', shop.id);
-                    } catch (dbError) {
-                        console.error('[Cron Sync] Failed to update expiration:', dbError);
+                    } catch (dbError: any) {
+                        ingestionLogger.error({ event: 'cron_db_update_failed', stream: 'shop', shopId: shop.shop_id, error: dbError.message });
                     }
                 }
 
@@ -2993,15 +3333,17 @@ router.get('/sync/cron', async (req: Request, res: Response) => {
             }
         }));
 
+        ingestionLogger.info({ event: 'cron_finished', stream: 'shop', syncType: 'cron_full', shopCount: shops.length });
         res.json({
             success: true,
             results
         });
     } catch (error: any) {
-        console.error('Cron sync failed:', error);
+        ingestionLogger.error({ event: 'cron_fatal_error', stream: 'shop', error: error.message });
         res.status(500).json({ error: error.message });
     }
 });
+
 
 /**
  * GET /api/tiktok-shop/sync/cron-settlements
@@ -3019,7 +3361,7 @@ router.get('/sync/cron-settlements', async (req: Request, res: Response) => {
     }
 
     try {
-        console.log('[Cron Settlements] Starting incremental statement sync for all shops...');
+        ingestionLogger.info({ event: 'cron_settlements_started', stream: 'shop', syncType: 'cron_settlements' });
 
         const { data: shops, error } = await supabase.from('tiktok_shops').select('*');
         if (error) throw error;
@@ -3044,7 +3386,7 @@ router.get('/sync/cron-settlements', async (req: Request, res: Response) => {
                         (refreshExpiry > 0 && refreshExpiry - REFRESH_BUFFER < cronNow && !isRefreshTokenDead);
 
                     if (isRefreshTokenDead) {
-                        console.log(`[Cron Settlements] Shop ${shop.shop_name}: refresh token expired — skipping.`);
+                        ingestionLogger.warn({ event: 'cron_settlements_token_expired', stream: 'shop', shopId: shop.shop_id, shopName: shop.shop_name });
                         const expiredTime = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
                         await supabase
                             .from('tiktok_shops')
@@ -3054,11 +3396,20 @@ router.get('/sync/cron-settlements', async (req: Request, res: Response) => {
                                 updated_at: new Date().toISOString(),
                             })
                             .eq('id', shop.id);
+                        await recordCompletedIngestionActivity({
+                            stream: 'shop',
+                            accountId: shop.account_id,
+                            shopDbId: shop.id,
+                            syncType: 'cron_settlements',
+                            status: 'failed',
+                            error: 'Refresh token expired',
+                            payload: { source: 'cron_settlements' },
+                        });
                         return { shop_id: shop.shop_id, status: 'expired', error: 'Refresh token expired' };
                     }
 
                     if (needsTokenRefresh && shop.refresh_token) {
-                        console.log(`[Cron Settlements] Refreshing tokens for ${shop.shop_name}`);
+                        ingestionLogger.info({ event: 'cron_settlements_token_refresh', stream: 'shop', shopId: shop.shop_id });
                         const tokenData = await tiktokShopApi.refreshAccessToken(shop.refresh_token);
                         const refreshTime = new Date();
                         await supabase
@@ -3079,6 +3430,19 @@ router.get('/sync/cron-settlements', async (req: Request, res: Response) => {
                     }
 
                     const syncResult = await syncSettlements(shop, false);
+                    await recordCompletedIngestionActivity({
+                        stream: 'shop',
+                        accountId: shop.account_id,
+                        shopDbId: shop.id,
+                        syncType: 'cron_settlements',
+                        status: 'succeeded',
+                        payload: { source: 'cron_settlements' },
+                        result: {
+                            fetched: syncResult.fetched,
+                            stoppedEarly: syncResult.stoppedEarly,
+                            partial: syncResult.partial,
+                        },
+                    });
                     return {
                         shop_id: shop.shop_id,
                         status: 'success',
@@ -3087,7 +3451,7 @@ router.get('/sync/cron-settlements', async (req: Request, res: Response) => {
                         partial: syncResult.partial,
                     };
                 } catch (err: any) {
-                    console.error(`[Cron Settlements] Shop ${shop.shop_name}:`, err.message);
+                    ingestionLogger.error({ event: 'cron_settlements_shop_failed', stream: 'shop', shopId: shop.shop_id, error: err.message });
                     if (err.code === 105002 || (err.message && err.message.includes('105002'))) {
                         const expiredTime = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
                         await supabase
@@ -3099,6 +3463,15 @@ router.get('/sync/cron-settlements', async (req: Request, res: Response) => {
                             })
                             .eq('id', shop.id);
                     }
+                    await recordCompletedIngestionActivity({
+                        stream: 'shop',
+                        accountId: shop.account_id,
+                        shopDbId: shop.id,
+                        syncType: 'cron_settlements',
+                        status: 'failed',
+                        error: err.message,
+                        payload: { source: 'cron_settlements' },
+                    });
                     return { shop_id: shop.shop_id, status: 'failed', error: err.message };
                 }
             })
@@ -3107,7 +3480,7 @@ router.get('/sync/cron-settlements', async (req: Request, res: Response) => {
         const payload = results.map((r) => (r.status === 'fulfilled' ? r.value : { status: 'failed', error: String(r.reason) }));
         res.json({ success: true, results: payload });
     } catch (error: any) {
-        console.error('[Cron Settlements] Fatal:', error);
+        ingestionLogger.error({ event: 'cron_settlements_fatal', stream: 'shop', error: error.message });
         res.status(500).json({ success: false, error: error.message });
     }
 });
@@ -3132,11 +3505,11 @@ router.get('/sync/refresh-tokens', async (req: Request, res: Response) => {
     }
 
     try {
-        console.log('[Token Cron] Starting proactive token refresh check...');
+        ingestionLogger.info({ event: 'token_cron_started', stream: 'shop', syncType: 'token_refresh' });
 
         const { data: allShops, error } = await supabase
             .from('tiktok_shops')
-            .select('id, shop_id, shop_name, access_token, refresh_token, token_expires_at, refresh_token_expires_at');
+            .select('id, account_id, shop_id, shop_name, access_token, refresh_token, token_expires_at, refresh_token_expires_at');
 
         if (error) throw error;
         if (!allShops || allShops.length === 0) {
@@ -3155,6 +3528,24 @@ router.get('/sync/refresh-tokens', async (req: Request, res: Response) => {
 
             // Skip shops without refresh tokens (can't do anything)
             if (!shop.refresh_token) {
+                await supabase
+                    .from('tiktok_shops')
+                    .update({
+                        token_status: 'warning',
+                        token_warning_level: 'critical',
+                        last_token_error: 'No refresh token available',
+                        token_last_checked_at: new Date().toISOString(),
+                    })
+                    .eq('id', shop.id);
+                await recordCompletedIngestionActivity({
+                    stream: 'shop',
+                    accountId: shop.account_id,
+                    shopDbId: shop.id,
+                    syncType: 'token_refresh',
+                    status: 'failed',
+                    error: 'No refresh token available',
+                    payload: { source: 'refresh_tokens' },
+                });
                 results.push({ shop_id: shop.shop_id, shop_name: shop.shop_name, action: 'skip', status: 'no_refresh_token' });
                 continue;
             }
@@ -3166,9 +3557,26 @@ router.get('/sync/refresh-tokens', async (req: Request, res: Response) => {
                     const expiredTime = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
                     await supabase
                         .from('tiktok_shops')
-                        .update({ token_expires_at: expiredTime, refresh_token_expires_at: expiredTime, updated_at: new Date().toISOString() })
+                        .update({
+                            token_expires_at: expiredTime,
+                            refresh_token_expires_at: expiredTime,
+                            token_status: 'reauth_required',
+                            token_warning_level: 'critical',
+                            last_token_error: 'Refresh token expired',
+                            token_last_checked_at: new Date().toISOString(),
+                            updated_at: new Date().toISOString()
+                        })
                         .eq('id', shop.id);
                 }
+                await recordCompletedIngestionActivity({
+                    stream: 'shop',
+                    accountId: shop.account_id,
+                    shopDbId: shop.id,
+                    syncType: 'token_refresh',
+                    status: 'failed',
+                    error: 'Refresh token expired',
+                    payload: { source: 'refresh_tokens' },
+                });
                 results.push({ shop_id: shop.shop_id, shop_name: shop.shop_name, action: 'mark_expired', status: 'refresh_token_dead' });
                 continue;
             }
@@ -3180,6 +3588,23 @@ router.get('/sync/refresh-tokens', async (req: Request, res: Response) => {
 
             if (!isAccessExpired && !isAccessNearExpiry && !isRefreshNearExpiry) {
                 const refreshDaysLeft = refreshExpiry > 0 ? Math.floor((refreshExpiry - now) / (1000 * 60 * 60 * 24)) : '?';
+                await supabase
+                    .from('tiktok_shops')
+                    .update({
+                        token_status: 'active',
+                        token_warning_level: null,
+                        last_token_error: null,
+                        token_last_checked_at: new Date().toISOString(),
+                    })
+                    .eq('id', shop.id);
+                await recordCompletedIngestionActivity({
+                    stream: 'shop',
+                    accountId: shop.account_id,
+                    shopDbId: shop.id,
+                    syncType: 'token_refresh',
+                    status: 'succeeded',
+                    payload: { source: 'refresh_tokens', action: 'healthy' },
+                });
                 results.push({ shop_id: shop.shop_id, shop_name: shop.shop_name, action: 'skip', status: 'healthy', details: `refresh token expires in ${refreshDaysLeft} days` });
                 continue;
             }
@@ -3191,7 +3616,7 @@ router.get('/sync/refresh-tokens', async (req: Request, res: Response) => {
                     ? 'access token expires within 1 hour'
                     : `refresh token expires within ${Math.floor((refreshExpiry - now) / (1000 * 60 * 60 * 24))} days`;
 
-            console.log(`[Token Cron] ${shop.shop_name}: ${reason}. Refreshing...`);
+            ingestionLogger.info({ event: 'token_cron_refreshing', stream: 'shop', shopId: shop.shop_id, reason });
 
             try {
                 const tokenData = await tiktokShopApi.refreshAccessToken(shop.refresh_token);
@@ -3206,11 +3631,27 @@ router.get('/sync/refresh-tokens', async (req: Request, res: Response) => {
                         refresh_token: tokenData.refresh_token,
                         token_expires_at: newAccessExpiry.toISOString(),
                         refresh_token_expires_at: newRefreshExpiry.toISOString(),
+                        token_status: 'active',
+                        token_warning_level: null,
+                        last_token_error: null,
+                        token_last_checked_at: new Date().toISOString(),
                         updated_at: refreshTime.toISOString()
                     })
                     .eq('id', shop.id);
+                await recordCompletedIngestionActivity({
+                    stream: 'shop',
+                    accountId: shop.account_id,
+                    shopDbId: shop.id,
+                    syncType: 'token_refresh',
+                    status: 'succeeded',
+                    payload: { source: 'refresh_tokens', action: 'refreshed' },
+                    result: {
+                        reason,
+                        newRefreshTokenExpiresAt: newRefreshExpiry.toISOString(),
+                    },
+                });
 
-                console.log(`[Token Cron] Successfully refreshed ${shop.shop_name}. New refresh token expires: ${newRefreshExpiry.toISOString()}`);
+                ingestionLogger.info({ event: 'token_cron_refreshed', stream: 'shop', shopId: shop.shop_id, newRefreshExpiry: newRefreshExpiry.toISOString() });
                 results.push({
                     shop_id: shop.shop_id,
                     shop_name: shop.shop_name,
@@ -3220,15 +3661,50 @@ router.get('/sync/refresh-tokens', async (req: Request, res: Response) => {
                 });
             } catch (refreshError: any) {
                 if (refreshError instanceof TikTokShopError && refreshError.code === 105002) {
-                    console.error(`[Token Cron] TikTok rejected refresh for ${shop.shop_name} (105002). Marking as expired.`);
+                    ingestionLogger.warn({ event: 'token_cron_expired_by_tiktok', stream: 'shop', shopId: shop.shop_id });
                     const expiredTime = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
                     await supabase
                         .from('tiktok_shops')
-                        .update({ token_expires_at: expiredTime, refresh_token_expires_at: expiredTime, updated_at: new Date().toISOString() })
+                        .update({
+                            token_expires_at: expiredTime,
+                            refresh_token_expires_at: expiredTime,
+                            token_status: 'reauth_required',
+                            token_warning_level: 'critical',
+                            last_token_error: refreshError.message,
+                            token_last_checked_at: new Date().toISOString(),
+                            updated_at: new Date().toISOString()
+                        })
                         .eq('id', shop.id);
+                    await recordCompletedIngestionActivity({
+                        stream: 'shop',
+                        accountId: shop.account_id,
+                        shopDbId: shop.id,
+                        syncType: 'token_refresh',
+                        status: 'failed',
+                        error: refreshError.message,
+                        payload: { source: 'refresh_tokens', action: 'tiktok_rejected' },
+                    });
                     results.push({ shop_id: shop.shop_id, shop_name: shop.shop_name, action: 'mark_expired', status: 'tiktok_rejected', details: refreshError.message });
                 } else {
-                    console.error(`[Token Cron] Error refreshing ${shop.shop_name}:`, refreshError.message);
+                    ingestionLogger.error({ event: 'token_cron_refresh_error', stream: 'shop', shopId: shop.shop_id, error: refreshError.message });
+                    await supabase
+                        .from('tiktok_shops')
+                        .update({
+                            token_status: 'warning',
+                            token_warning_level: 'critical',
+                            last_token_error: refreshError.message,
+                            token_last_checked_at: new Date().toISOString(),
+                        })
+                        .eq('id', shop.id);
+                    await recordCompletedIngestionActivity({
+                        stream: 'shop',
+                        accountId: shop.account_id,
+                        shopDbId: shop.id,
+                        syncType: 'token_refresh',
+                        status: 'failed',
+                        error: refreshError.message,
+                        payload: { source: 'refresh_tokens', action: 'refresh_failed' },
+                    });
                     results.push({ shop_id: shop.shop_id, shop_name: shop.shop_name, action: 'error', status: 'refresh_failed', details: refreshError.message });
                 }
             }
@@ -3238,7 +3714,7 @@ router.get('/sync/refresh-tokens', async (req: Request, res: Response) => {
         const expired = results.filter(r => r.action === 'mark_expired').length;
         const healthy = results.filter(r => r.status === 'healthy').length;
 
-        console.log(`[Token Cron] Complete. ${refreshed} refreshed, ${expired} expired, ${healthy} healthy, ${allShops.length} total.`);
+        ingestionLogger.info({ event: 'token_cron_complete', stream: 'shop', syncType: 'token_refresh', total: allShops.length, refreshed, expired, healthy });
 
         res.json({
             success: true,
@@ -3247,7 +3723,403 @@ router.get('/sync/refresh-tokens', async (req: Request, res: Response) => {
         });
     } catch (error: any) {
         console.error('[Token Cron] Failed:', error);
+        ingestionLogger.error({ event: 'token_cron_fatal', stream: 'shop', error: error.message });
         res.status(500).json({ error: error.message });
+    }
+});
+
+/**
+ * GET /api/tiktok-shop/sync/monitoring/log-stream
+ *
+ * Server-Sent Events endpoint that streams system_logs rows to the browser
+ * in real-time. The browser connects when the user presses "LIVE" and
+ * disconnects when they press it again.
+ *
+ * Protocol:
+ *   - Polls system_logs every 800 ms for rows newer than `?since=<ISO>`
+ *   - Each new row is pushed as a `data: <JSON>\n\n` SSE frame
+ *   - A `: heartbeat\n\n` comment is sent every 15 s to keep proxies alive
+ *   - After 240 s the connection is closed; EventSource reconnects automatically
+ *
+ * Auth: platform super-admin JWT required.
+ */
+router.get('/sync/monitoring/log-stream', async (req: Request, res: Response) => {
+    const reqId = req.headers['x-request-id'] || 'no-id';
+    console.log(`[SSE:log-stream] ▶ request received  requestId=${reqId}  ip=${req.ip}`);
+
+    const authorized = await isPlatformSuperAdminRequest(req);
+    console.log(`[SSE:log-stream] auth=${authorized}  requestId=${reqId}`);
+
+    if (!authorized) {
+        console.warn(`[SSE:log-stream] ✗ 401 — not a platform super admin  requestId=${reqId}`);
+        return res.status(401).json({ success: false, error: 'Platform super admin required' });
+    }
+
+    // ── SSE headers ──────────────────────────────────────────────────────────
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // Disable Nginx proxy buffering
+    res.flushHeaders();
+    console.log(`[SSE:log-stream] ✓ headers flushed — stream open  requestId=${reqId}`);
+
+    // ── Helper to push one SSE frame ─────────────────────────────────────────
+    // (res as any).flush() is provided by the `compression` middleware to
+    // force-flush the gzip buffer. Falls back to no-op if not present.
+    const flush = () => { if (typeof (res as any).flush === 'function') (res as any).flush(); };
+
+    const send = (data: unknown) => {
+        if (!res.writableEnded) {
+            res.write(`data: ${JSON.stringify(data)}\n\n`);
+            flush();
+        }
+    };
+
+    const heartbeat = () => {
+        if (!res.writableEnded) {
+            res.write(': heartbeat\n\n');
+            flush();
+        }
+    };
+
+    // ── Determine starting cursor ─────────────────────────────────────────────
+    // ?since=<ISO> lets the client resume from where it left off after reconnect
+    const sinceParam = typeof req.query.since === 'string' ? req.query.since : null;
+    let cursor: Date = sinceParam ? new Date(sinceParam) : new Date(Date.now() - 60_000); // default: last 60s
+
+    // ── Send initial burst of recent logs (last 60 s or since client's cursor) ─
+    try {
+        const { data: initialRows, error: initErr } = await supabase
+            .from('system_logs')
+            .select('*')
+            .gt('created_at', cursor.toISOString())
+            .order('created_at', { ascending: true })
+            .limit(200);
+
+        if (initErr) {
+            console.error(`[SSE:log-stream] initial query error: ${initErr.message}  requestId=${reqId}`);
+        } else {
+            console.log(`[SSE:log-stream] initial burst: ${initialRows?.length ?? 0} rows  requestId=${reqId}`);
+        }
+
+        for (const row of initialRows ?? []) {
+            send(row);
+            const rowTs = new Date(row.created_at);
+            if (rowTs > cursor) cursor = rowTs;
+        }
+    } catch (e: any) {
+        console.error(`[SSE:log-stream] initial burst threw: ${e?.message}  requestId=${reqId}`);
+    }
+
+    // ── Poll loop ─────────────────────────────────────────────────────────────
+    const POLL_MS = 800;
+    const MAX_OPEN_MS = 240_000; // 4 min — Vercel function maxDuration is 300 s
+    const HEARTBEAT_INTERVAL_MS = 15_000;
+
+    let pollTimer: ReturnType<typeof setInterval>;
+    let heartbeatTimer: ReturnType<typeof setInterval>;
+    const deadline = setTimeout(() => close('max_duration'), MAX_OPEN_MS);
+
+    function close(reason: string) {
+        clearInterval(pollTimer);
+        clearInterval(heartbeatTimer);
+        clearTimeout(deadline);
+        if (!res.writableEnded) {
+            // Tell the client to reconnect immediately with the latest cursor
+            send({ __control: 'reconnect', since: cursor.toISOString(), reason });
+            res.end();
+        }
+    }
+
+    // Poll for new rows
+    pollTimer = setInterval(async () => {
+        if (res.writableEnded) {
+            close('client_disconnected');
+            return;
+        }
+        try {
+            const { data: rows } = await supabase
+                .from('system_logs')
+                .select('*')
+                .gt('created_at', cursor.toISOString())
+                .order('created_at', { ascending: true })
+                .limit(50);
+
+            for (const row of rows ?? []) {
+                send(row);
+                const rowTs = new Date(row.created_at);
+                if (rowTs > cursor) cursor = rowTs;
+            }
+        } catch { /* ignore transient DB errors */ }
+    }, POLL_MS);
+
+    // Heartbeat to prevent proxy timeouts
+    heartbeatTimer = setInterval(heartbeat, HEARTBEAT_INTERVAL_MS);
+
+    // Cleanup when client disconnects (browser tab closed / button unpressed)
+    req.on('close', () => close('client_closed'));
+    req.on('error', () => close('request_error'));
+});
+
+/**
+ * GET /api/tiktok-shop/sync/monitoring/status
+ * Lightweight ingestion monitoring snapshot for dashboards/alerts.
+ */
+router.get('/sync/monitoring/status', async (req: Request, res: Response) => {
+    // Only platform super-admins may view ingestion health
+    const authorized = await isPlatformSuperAdminRequest(req);
+    if (!authorized) {
+        return res.status(401).json({ success: false, error: 'Platform super admin required' });
+    }
+    try {
+        const nowIso = new Date().toISOString();
+        const window24hIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+        const [jobsResult, jobs24hResult, staleResult, tokenResult, recentAttemptsResult, systemLogsResult, auditResult, perfResult] = await Promise.all([
+            supabase
+                .from('ingestion_jobs')
+                .select('id,status,created_at,updated_at,last_error,stream,sync_type,payload,account_id')
+                .in('status', ['queued', 'running', 'dead_letter'])
+                .order('updated_at', { ascending: false })
+                .limit(200),
+            supabase
+                .from('ingestion_jobs')
+                .select('id,status,created_at,updated_at,completed_at,stream,sync_type,payload,attempt_count,last_error')
+                .gte('created_at', window24hIso)
+                .order('created_at', { ascending: false })
+                .limit(1000),
+            supabase
+                .from('tiktok_shops')
+                .select('id,shop_id,shop_name,orders_last_synced_at,products_last_synced_at,settlements_last_synced_at')
+                .or(`orders_last_synced_at.lt.${new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString()},orders_last_synced_at.is.null`),
+            supabase
+                .from('tiktok_shops')
+                .select('id,shop_id,shop_name,token_status,token_warning_level,last_token_error,token_last_checked_at')
+                .in('token_status', ['warning', 'reauth_required']),
+            supabase
+                .from('ingestion_job_attempts')
+                .select('job_id,attempt_no,status,error,started_at,finished_at,result')
+                .order('started_at', { ascending: false })
+                // Fetch more than needed — routine poll jobs are filtered out below
+                .limit(100),
+            supabase
+                .from('system_logs')
+                .select('id,level,scope,event,message,stream,job_id,account_id,shop_id,data,created_at')
+                .gte('created_at', window24hIso)
+                .order('created_at', { ascending: false })
+                .limit(500),
+            supabase
+                .from('audit_logs')
+                .select('id,created_at,action,resource_type,resource_id,actor_user_id,actor_email,tenant_id,account_id,metadata,ip_address')
+                .order('created_at', { ascending: false })
+                .limit(200),
+            supabase
+                .from('system_logs')
+                .select('created_at,data,message,level')
+                .eq('scope', 'http')
+                .eq('event', 'request.completed')
+                .gte('created_at', window24hIso)
+                .order('created_at', { ascending: false })
+                .limit(1000),
+        ]);
+
+        const recentJobIds = Array.from(new Set((recentAttemptsResult.data || []).map((a: any) => a.job_id)));
+        const recentJobMeta = recentJobIds.length > 0
+            ? await supabase
+                .from('ingestion_jobs')
+                .select('id,stream,sync_type,account_id,shop_id,payload')
+                .in('id', recentJobIds)
+            : { data: [], error: null };
+
+        const metaById = new Map<string, any>((recentJobMeta.data || []).map((j: any) => [j.id, j]));
+        const recentShopIds = Array.from(new Set(
+            (recentJobMeta.data || [])
+                .map((j: any) => j.shop_id)
+                .filter((id: string | null) => !!id)
+        ));
+        const recentShopsResult = recentShopIds.length > 0
+            ? await supabase
+                .from('tiktok_shops')
+                .select('id,shop_id,shop_name')
+                .in('id', recentShopIds)
+            : { data: [], error: null };
+        const shopById = new Map<string, any>((recentShopsResult.data || []).map((s: any) => [s.id, s]));
+
+        const recentAdvertiserIds = Array.from(
+            new Set(
+                (recentJobMeta.data || [])
+                    .map((j: any) => j?.payload?.advertiserId)
+                    .filter((id: string | undefined) => typeof id === 'string' && id.length > 0)
+            )
+        );
+        const recentAdvertisersResult = recentAdvertiserIds.length > 0
+            ? await supabase
+                .from('tiktok_advertisers')
+                .select('advertiser_id,advertiser_name')
+                .in('advertiser_id', recentAdvertiserIds)
+            : { data: [], error: null };
+        const advertiserByExternalId = new Map<string, any>(
+            (recentAdvertisersResult.data || []).map((a: any) => [a.advertiser_id, a])
+        );
+
+        // Sync types that fire very frequently and produce no actionable signal when
+        // successful. They still appear when they FAIL so errors remain visible.
+        const NOISY_POLL_TYPES = /^poll_/i;
+
+        const recentActivity = (recentAttemptsResult.data || [])
+            .map((a: any) => {
+                const meta = metaById.get(a.job_id);
+                const shop = meta?.shop_id ? shopById.get(meta.shop_id) : null;
+                const advertiserId = meta?.payload?.advertiserId ?? null;
+                const advertiser = advertiserId ? advertiserByExternalId.get(advertiserId) : null;
+                return {
+                    job_id: a.job_id,
+                    stream: meta?.stream || 'shop',
+                    sync_type: meta?.sync_type || 'unknown',
+                    source: meta?.payload?.source || 'unknown',
+                    account_id: meta?.account_id || null,
+                    shop_id: shop?.shop_id || null,
+                    shop_name: shop?.shop_name || null,
+                    advertiser_id: advertiserId,
+                    advertiser_name: advertiser?.advertiser_name || null,
+                    attempt_no: a.attempt_no,
+                    status: a.status,
+                    error: a.error,
+                    started_at: a.started_at,
+                    finished_at: a.finished_at,
+                    result: a.result || null,
+                };
+            })
+            .filter((r) => {
+                // Hide successful routine polls — they're high-frequency background noise.
+                // Failed/errored polls still surface so issues remain visible.
+                const isNoisyPoll = NOISY_POLL_TYPES.test(r.sync_type);
+                const isSucceeded = r.status === 'succeeded';
+                return !(isNoisyPoll && isSucceeded);
+            })
+            .slice(0, 50); // Cap the final list at 50 after filtering
+
+        const systemLogs = systemLogsResult.data || [];
+        const recentErrors = systemLogs.filter((l: any) => l.level === 'error').slice(0, 100);
+        const recentWarnings = systemLogs.filter((l: any) => l.level === 'warn').slice(0, 100);
+
+        const perfRows = perfResult.data || [];
+        const durations = perfRows
+            .map((r: any) => Number(r?.data?.durationMs))
+            .filter((n: number) => Number.isFinite(n) && n >= 0)
+            .sort((a: number, b: number) => a - b);
+        const pct = (p: number) => durations.length ? durations[Math.min(durations.length - 1, Math.floor((durations.length - 1) * p))] : null;
+        const perfSummary = {
+            requests24h: perfRows.length,
+            error5xx24h: perfRows.filter((r: any) => Number(r?.data?.status) >= 500).length,
+            warn4xx24h: perfRows.filter((r: any) => Number(r?.data?.status) >= 400 && Number(r?.data?.status) < 500).length,
+            p50Ms: pct(0.5),
+            p95Ms: pct(0.95),
+            p99Ms: pct(0.99),
+            maxMs: durations.length ? durations[durations.length - 1] : null,
+            recent: perfRows.slice(0, 100),
+        };
+
+        const billingOrPermissionAudit = (auditResult.data || []).filter((a: any) => {
+            const action = String(a?.action || '').toLowerCase();
+            const resource = String(a?.resource_type || '').toLowerCase();
+            return action.startsWith('plan.')
+                || action.startsWith('billing.')
+                || action.includes('permission')
+                || action.startsWith('role.')
+                || action.startsWith('member.')
+                || resource.includes('entitlement')
+                || resource.includes('authorization')
+                || resource.includes('tenant_membership');
+        });
+
+        const ingestionAudit = recentActivity.map((a: any) => {
+            const resultObj = a?.result || null;
+            const stats = resultObj?.stats || null;
+            return {
+                ...a,
+                result: resultObj,
+                stats,
+            };
+        });
+
+        const activeJobs = (jobsResult.data || []).filter((j: any) => j.status !== 'dead_letter');
+        const queuedJobs = activeJobs.filter((j: any) => j.status === 'queued');
+        const runningJobs = activeJobs.filter((j: any) => j.status === 'running');
+        const deadLetterJobs = (jobsResult.data || []).filter((j: any) => j.status === 'dead_letter');
+        const oldestQueuedMs = queuedJobs.length > 0
+            ? Math.max(...queuedJobs.map((j: any) => Date.now() - new Date(j.created_at).getTime()))
+            : null;
+
+        const jobs24h = jobs24hResult.data || [];
+        const sourceCounts: Record<string, number> = {};
+        const syncTypeCounts: Record<string, number> = {};
+        const streamCounts: Record<string, number> = {};
+        let completed24h = 0;
+        let failed24h = 0;
+        let deadLetter24h = 0;
+        let retries24h = 0;
+        for (const job of jobs24h) {
+            const source = String(job?.payload?.source || 'unknown');
+            const syncType = String(job?.sync_type || 'unknown');
+            const stream = String(job?.stream || 'unknown');
+            sourceCounts[source] = (sourceCounts[source] || 0) + 1;
+            syncTypeCounts[syncType] = (syncTypeCounts[syncType] || 0) + 1;
+            streamCounts[stream] = (streamCounts[stream] || 0) + 1;
+            if (job?.status === 'succeeded') completed24h += 1;
+            if (job?.status === 'failed') failed24h += 1;
+            if (job?.status === 'dead_letter') deadLetter24h += 1;
+            if (Number(job?.attempt_count || 0) > 1) retries24h += 1;
+        }
+
+        res.json({
+            success: true,
+            asOf: nowIso,
+            jobs: {
+                queuedOrRunning: activeJobs.length,
+                queued: queuedJobs.length,
+                running: runningJobs.length,
+                deadLetter: deadLetterJobs.length,
+                rows: jobsResult.data || [],
+                insights24h: {
+                    enqueuedTotal: jobs24h.length,
+                    completed: completed24h,
+                    failed: failed24h,
+                    deadLetter: deadLetter24h,
+                    retried: retries24h,
+                    oldestQueuedMs,
+                    bySource: sourceCounts,
+                    bySyncType: syncTypeCounts,
+                    byStream: streamCounts,
+                },
+            },
+            staleness: {
+                staleOrUnknown: staleResult.data?.length || 0,
+                rows: staleResult.data || [],
+            },
+            tokenHealth: {
+                warnings: tokenResult.data?.length || 0,
+                rows: tokenResult.data || [],
+            },
+            recentActivity,
+            observability: {
+                systemLogs24h: {
+                    total: systemLogs.length,
+                    errors: recentErrors.length,
+                    warnings: recentWarnings.length,
+                    rows: systemLogs,
+                    errorsRows: recentErrors,
+                    warningRows: recentWarnings,
+                },
+                performance: perfSummary,
+                audit: {
+                    totalFetched: (auditResult.data || []).length,
+                    billingAndPermissionRows: billingOrPermissionAudit,
+                },
+                ingestionAudit,
+            },
+        });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
@@ -3408,7 +4280,13 @@ export async function syncSingleOrder(shop: any, orderId: string): Promise<any> 
     return null;
 }
 
-export async function syncOrders(shop: any, isFirstSync: boolean = true, customStartDate?: string, customEndDate?: string): Promise<{ fetched: number; upserted: number; isIncremental: boolean; stoppedEarly?: boolean; partial?: boolean; syncedOrders?: any[] }> {
+export async function syncOrders(
+    shop: any,
+    isFirstSync: boolean = true,
+    customStartDate?: string,
+    customEndDate?: string,
+    onProgress?: (processed: number, total?: number) => Promise<void> | void,
+): Promise<{ fetched: number; upserted: number; isIncremental: boolean; stoppedEarly?: boolean; partial?: boolean; syncedOrders?: any[] }> {
     const isHistorical = !!(customStartDate && customEndDate);
     const syncMode = isHistorical ? 'HISTORICAL' : (isFirstSync ? 'FULL' : 'INCREMENTAL');
     console.log(`[${syncMode}] Syncing orders for shop ${shop.shop_name}...`);
@@ -3605,6 +4483,7 @@ export async function syncOrders(shop: any, isFirstSync: boolean = true, customS
                     }
                 }
 
+                await onProgress?.(totalFetched);
                 page++;
 
                 // Safety limit on pages
@@ -3868,7 +4747,11 @@ function detectFbtStatus(fullDetails: any, basicProduct: any, fbtWarehouseIds: S
 
 // Products are always fully refreshed since they can be updated anytime
 // But we accept isFirstSync for consistency with the API
-export async function syncProducts(shop: any, isFirstSync: boolean = true): Promise<{ fetched: number; upserted: number; isIncremental: boolean; syncedProducts?: any[] }> {
+export async function syncProducts(
+    shop: any,
+    isFirstSync: boolean = true,
+    onProgress?: (processed: number, total?: number) => Promise<void> | void,
+): Promise<{ fetched: number; upserted: number; isIncremental: boolean; syncedProducts?: any[] }> {
     // Products are always fully refreshed since they can be updated anytime
     // We accept isFirstSync for consistency but we always fetch all to update stock/price
     const syncMode = isFirstSync ? 'FULL' : 'REFRESH';
@@ -3878,6 +4761,7 @@ export async function syncProducts(shop: any, isFirstSync: boolean = true): Prom
         let page = 1;
         let hasMore = true;
         let nextPageToken = '';
+        let discoveredTotal: number | undefined;
         let fetchError: Error | null = null;
 
         try {
@@ -3907,11 +4791,21 @@ export async function syncProducts(shop: any, isFirstSync: boolean = true): Prom
                 );
 
                 const products = response.products || response.product_list || [];
+                const totalFromApi = Number(
+                    response.total_count ??
+                    response.total ??
+                    response.data?.total_count ??
+                    response.data?.total,
+                );
+                if (Number.isFinite(totalFromApi) && totalFromApi > 0) {
+                    discoveredTotal = totalFromApi;
+                }
                 console.log(`Page ${page} returned ${products.length} products`);
 
                 if (products.length > 0) {
                     allProducts = [...allProducts, ...products];
                 }
+                await onProgress?.(allProducts.length, discoveredTotal);
 
                 // Check if we need to fetch more
                 // API might return next_page_token or we check count vs total
@@ -4165,7 +5059,11 @@ export async function syncProducts(shop: any, isFirstSync: boolean = true): Prom
  * @param isFirstSync - If true, fetch all historical data; if false, use Smart Stop
  * @returns Sync statistics including fetched count, upserted count, and mode
  */
-export async function syncSettlements(shop: any, isFirstSync: boolean = true): Promise<{ fetched: number; upserted: number; isIncremental: boolean; stoppedEarly?: boolean; partial?: boolean; syncedSettlements?: any[] }> {
+export async function syncSettlements(
+    shop: any,
+    isFirstSync: boolean = true,
+    onProgress?: (processed: number, total?: number) => Promise<void> | void,
+): Promise<{ fetched: number; upserted: number; isIncremental: boolean; stoppedEarly?: boolean; partial?: boolean; syncedSettlements?: any[] }> {
     const syncMode = isFirstSync ? 'FULL' : 'INCREMENTAL';
     console.log(`[${syncMode}] Syncing settlements for shop ${shop.shop_name}...`);
     try {
@@ -4353,6 +5251,7 @@ export async function syncSettlements(shop: any, isFirstSync: boolean = true): P
                     }
                     allSettlements.push(...currentBatch);
                 }
+                await onProgress?.(totalUpserted + allSettlements.length);
 
                 if (existingInPage > 0) {
                     break;
@@ -4406,6 +5305,7 @@ export async function syncSettlements(shop: any, isFirstSync: boolean = true): P
                         allSettlementsForResponse = [...allSettlementsForResponse, ...allSettlements];
                         allSettlements = [];
                         pagesSinceLastWrite = 0;
+                        await onProgress?.(totalUpserted);
                     } catch (writeError: any) {
                         console.error('[Progressive Write] Failed to write batch:', writeError.message);
                     }
@@ -4472,6 +5372,7 @@ export async function syncSettlements(shop: any, isFirstSync: boolean = true): P
                 totalUpserted += allSettlements.length;
                 console.log(`[Final Write] ✅ Wrote ${allSettlements.length} settlements. Grand total: ${totalUpserted}`);
                 allSettlementsForResponse = [...allSettlementsForResponse, ...allSettlements];
+                await onProgress?.(totalUpserted);
             } catch (writeError: any) {
                 console.error('[Final Write] Failed:', writeError.message);
                 throw writeError;

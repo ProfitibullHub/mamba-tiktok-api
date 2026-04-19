@@ -4,16 +4,36 @@
  */
 
 import express from 'express';
+import axios from 'axios';
 import { tiktokBusinessApi } from '../services/tiktok-business-api.service.js';
 import { supabase } from '../config/supabase.js';
 import { pollAllAdvertisers, type PollRange } from '../services/ads-polling.service.js';
+import crypto from 'crypto';
 import {
     enforceRequestAccountAccess,
     verifyAccountIdParam,
     enforceBodyAccountAccess,
+    resolveRequestUserId,
 } from '../middleware/account-access.middleware.js';
+import { requireTikTokAdsEntitlementParam } from '../middleware/tiktok-entitlement-param.middleware.js';
+import { requireIngestionJobReadAccess } from '../middleware/ingestion-job-access.middleware.js';
+import { requireAuthorization } from '../middleware/authorize.middleware.js';
+import {
+    claimIngestionJobs,
+    enqueueIngestionJob,
+    getIngestionJob,
+    markIngestionJobFailed,
+    markIngestionJobSucceeded,
+    type IngestionJobPayload,
+    type IngestionJobRow,
+} from '../services/ingestion-queue.service.js';
+import { ingestionLogger } from '../services/ingestion-logger.js';
+import { auditLog } from '../services/audit-logger.js';
+import { runTikTokAdsFullSync, AdsSyncAdvertiserNotFoundError } from '../services/tiktok-ads-sync.service.js';
+import { ACTION_TIKTOK_AUTH, FEATURE_TIKTOK_ADS } from '../constants/tiktok-entitlements.js';
 
 const router = express.Router();
+const FRONTEND_URL = (process.env.FRONTEND_URL || '').replace(/\/$/, '');
 
 /** OAuth browser callback and cron poll have no Supabase user JWT. */
 function skipAccountAccessForPublicAdsRoutes(req: express.Request, res: express.Response, next: express.NextFunction) {
@@ -25,6 +45,7 @@ function skipAccountAccessForPublicAdsRoutes(req: express.Request, res: express.
 
 router.use(skipAccountAccessForPublicAdsRoutes);
 router.param('accountId', verifyAccountIdParam);
+router.param('accountId', requireTikTokAdsEntitlementParam);
 
 // Helper to handle API errors
 const handleApiError = (res: express.Response, error: any) => {
@@ -35,15 +56,75 @@ const handleApiError = (res: express.Response, error: any) => {
     });
 };
 
+async function isPlatformSuperAdminRequest(req: express.Request): Promise<boolean> {
+    const userId = await resolveRequestUserId(req);
+    if (!userId) return false;
+
+    const [{ data: isSa, error: saErr }, { data: profile, error: profileErr }] = await Promise.all([
+        supabase.rpc('user_is_platform_super_admin', { p_user_id: userId }),
+        supabase.from('profiles').select('role').eq('id', userId).maybeSingle(),
+    ]);
+
+    if (saErr || profileErr) return false;
+    return isSa === true || profile?.role === 'admin';
+}
+
+async function createOauthState(params: {
+    accountId: string;
+    actorUserId: string;
+    returnUrl?: string | null;
+}) {
+    const stateToken = crypto.randomBytes(32).toString('hex');
+    const { error } = await supabase.from('oauth_request_states').insert({
+        state_token: stateToken,
+        provider: 'tiktok_ads',
+        actor_user_id: params.actorUserId,
+        account_id: params.accountId,
+        return_url: params.returnUrl ?? null,
+    });
+    if (error) throw error;
+    return stateToken;
+}
+
+async function consumeOauthState(stateToken: string) {
+    const { data, error } = await supabase
+        .from('oauth_request_states')
+        .select('id, account_id, return_url, expires_at, consumed_at')
+        .eq('state_token', stateToken)
+        .eq('provider', 'tiktok_ads')
+        .maybeSingle();
+    if (error) throw error;
+    if (!data) throw new Error('OAuth state not found');
+    if (data.consumed_at) throw new Error('OAuth state already used');
+    if (new Date(data.expires_at).getTime() < Date.now()) throw new Error('OAuth state expired');
+
+    const { error: consumeError } = await supabase
+        .from('oauth_request_states')
+        .update({ consumed_at: new Date().toISOString() })
+        .eq('id', data.id)
+        .is('consumed_at', null);
+    if (consumeError) throw consumeError;
+    return data;
+}
+
 /**
  * POST /api/tiktok-ads/auth/start
  * Generate authorization URL for user to connect TikTok Ads account
  */
-router.post('/auth/start', enforceBodyAccountAccess, async (req, res) => {
+router.post(
+    '/auth/start',
+    enforceBodyAccountAccess,
+    requireAuthorization((req) => ({
+        action: ACTION_TIKTOK_AUTH,
+        featureKey: FEATURE_TIKTOK_ADS,
+        accountId: typeof req.body?.accountId === 'string' ? req.body.accountId : undefined,
+    })),
+    async (req, res) => {
     try {
         const { accountId, returnUrl } = req.body;
+        const actorId = await resolveRequestUserId(req);
 
-        if (!accountId) {
+        if (!accountId || !actorId) {
             return res.status(400).json({ success: false, error: 'accountId is required' });
         }
 
@@ -61,14 +142,25 @@ router.post('/auth/start', enforceBodyAccountAccess, async (req, res) => {
 
         console.log('[TikTok Ads] Generating auth URL with redirect:', redirectUri);
 
-        // Pass returnUrl to the auth URL generator so it's preserved in state
-        const authUrl = tiktokBusinessApi.getAuthorizationUrl(accountId, redirectUri, returnUrl);
+        const stateToken = await createOauthState({
+            accountId,
+            actorUserId: actorId,
+            returnUrl: typeof returnUrl === 'string' ? returnUrl : null,
+        });
+
+        const authUrl = tiktokBusinessApi.getAuthorizationUrl(
+            accountId,
+            redirectUri,
+            typeof returnUrl === 'string' ? returnUrl : undefined,
+            stateToken
+        );
 
         res.json({ success: true, authUrl });
     } catch (error) {
         handleApiError(res, error);
     }
-});
+    },
+);
 
 /**
  * GET /api/tiktok-ads/auth/callback
@@ -91,9 +183,9 @@ router.get('/auth/callback', async (req, res) => {
 
         console.log('[TikTok Ads Callback] Received:', { authCode, state });
 
-        // Decode state to get accountId and returnUrl
-        const stateData = JSON.parse(Buffer.from(state as string, 'base64').toString());
-        const { accountId, returnUrl } = stateData;
+        const oauthState = await consumeOauthState(String(state));
+        const accountId = oauthState.account_id as string;
+        const returnUrl = (oauthState.return_url as string | null) || '/dashboard';
 
         console.log('[TikTok Ads Callback] Account ID:', accountId, 'Return URL:', returnUrl);
 
@@ -174,18 +266,22 @@ router.get('/auth/callback', async (req, res) => {
 
         // Redirect back to the page the user came from (or dashboard as fallback)
         const finalReturnUrl = returnUrl || '/dashboard';
-        const redirectUrl = `${process.env.FRONTEND_URL}${finalReturnUrl}?tiktok_ads_connected=true`;
+        const redirectUrl = `${FRONTEND_URL}${finalReturnUrl}?tiktok_ads_connected=true`;
         res.redirect(redirectUrl);
     } catch (error: any) {
         console.error('[TikTok Ads Callback] Error:', error);
 
-        // Get returnUrl from state if available (for error redirect)
         let finalReturnUrl = '/dashboard';
         try {
             const { state } = req.query;
             if (state) {
-                const stateData = JSON.parse(Buffer.from(state as string, 'base64').toString());
-                finalReturnUrl = stateData.returnUrl || '/dashboard';
+                const { data } = await supabase
+                    .from('oauth_request_states')
+                    .select('return_url')
+                    .eq('state_token', String(state))
+                    .eq('provider', 'tiktok_ads')
+                    .maybeSingle();
+                finalReturnUrl = (data?.return_url as string | null) || '/dashboard';
             }
         } catch (e) {
             // If state parsing fails, use default
@@ -193,7 +289,7 @@ router.get('/auth/callback', async (req, res) => {
 
         // Instead of just JSON error, redirect to frontend with error
         const errorMessage = encodeURIComponent(error.message || 'Failed to connect TikTok Ads account');
-        const redirectUrl = `${process.env.FRONTEND_URL}${finalReturnUrl}?tiktok_ads_error=${errorMessage}`;
+        const redirectUrl = `${FRONTEND_URL}${finalReturnUrl}?tiktok_ads_error=${errorMessage}`;
         res.redirect(redirectUrl);
     }
 });
@@ -410,699 +506,191 @@ router.post('/switch-advertiser/:accountId', async (req, res) => {
 
 /**
  * POST /api/tiktok-ads/sync/:accountId
- * Sync ad campaigns, ad groups, ads, and metrics
+ * Enqueue durable ads sync (same ingestion_jobs pipeline as Shop).
  */
 router.post('/sync/:accountId', async (req, res) => {
     try {
         const { accountId } = req.params;
         const { startDate, endDate } = req.body;
 
-        // Get advertiser
-        const { data: advertiser, error: advError } = await supabase
-            .from('tiktok_advertisers')
-            .select('*')
-            .eq('account_id', accountId)
-            .eq('is_active', true)
-            .order('last_synced_at', { ascending: false })
-            .limit(1)
-            .maybeSingle();
+        const payload: IngestionJobPayload = {
+            accountId,
+            startDate,
+            endDate,
+            source: 'manual',
+        };
 
-        if (advError || !advertiser) {
-            return res.status(404).json({ success: false, error: 'Advertiser not found' });
-        }
-
-        const { access_token, advertiser_id, id: advertiserId } = advertiser;
-
-        console.log(`[Ads Sync] Starting sync for advertiser ${advertiser_id}...`);
-
-        // Diagnostic: log ALL advertiser IDs available under this access token
-        // This helps identify if GMV Max campaigns are under a different advertiser ID
-        try {
-            const allAdvertisers = await tiktokBusinessApi.getAdvertisers(access_token);
-            console.log(`[Ads Sync] All advertiser IDs available under this token:`);
-            allAdvertisers.forEach((a: any) => {
-                const id = a.advertiser_id || a;
-                const name = a.advertiser_name || a.name || '(no name)';
-                const isCurrent = String(id) === String(advertiser_id);
-                console.log(`  ${isCurrent ? '→ CURRENT' : '         '} ${id}  ${name}`);
-            });
-        } catch (e: any) {
-            console.warn(`[Ads Sync] Could not list advertiser IDs:`, e.message);
-        }
-
-        // Refresh advertiser info (name, currency, balance) on each sync
-        try {
-            const advInfo = await tiktokBusinessApi.getAdvertiserInfo(access_token, advertiser_id);
-            if (advInfo?.list?.[0]) {
-                const info = advInfo.list[0];
-                const updates: Record<string, any> = {};
-                if (info.name) updates.advertiser_name = info.name;
-                if (info.currency) updates.currency = info.currency;
-                if (info.balance != null) updates.balance = parseFloat(info.balance) || 0;
-                if (Object.keys(updates).length > 0) {
-                    await supabase.from('tiktok_advertisers').update(updates).eq('id', advertiserId);
-                    console.log(`[Ads Sync] Updated advertiser info:`, updates);
-                }
-            }
-        } catch (infoErr: any) {
-            console.warn(`[Ads Sync] Could not refresh advertiser info:`, infoErr.message);
-        }
-
-        // 1. Sync Campaigns (fetch all pages)
-        let allCampaigns: any[] = [];
-        let campaignPage = 1;
-        while (true) {
-            const campaigns = await tiktokBusinessApi.getCampaigns(access_token, advertiser_id, { page: campaignPage, page_size: 100 });
-            allCampaigns = allCampaigns.concat(campaigns.list || []);
-            console.log(`[Ads Sync] Campaigns page ${campaignPage}: ${campaigns.list?.length || 0} items (total so far: ${allCampaigns.length})`);
-            if (!campaigns.page_info || campaignPage >= campaigns.page_info.total_page) break;
-            campaignPage++;
-        }
-        console.log(`[Ads Sync] Found ${allCampaigns.length} campaigns total`);
-
-        // Log campaign status distribution (compact summary instead of per-campaign logging)
-        const campaignStatusCounts: Record<string, number> = {};
-        allCampaigns.forEach((c: any) => {
-            const s = c.secondary_status || c.operation_status || 'UNKNOWN';
-            campaignStatusCounts[s] = (campaignStatusCounts[s] || 0) + 1;
-        });
-        console.log(`[Ads Sync] Campaign status distribution:`, campaignStatusCounts);
-
-        for (const campaign of allCampaigns) {
-            // Prefer secondary_status (more descriptive, e.g. CAMPAIGN_STATUS_ENABLE)
-            // Fall back to operation_status (simple ENABLE/DISABLE)
-            await supabase.from('tiktok_ad_campaigns').upsert({
-                advertiser_id: advertiserId,
-                campaign_id: campaign.campaign_id,
-                campaign_name: campaign.campaign_name,
-                objective_type: campaign.objective_type,
-                status: campaign.secondary_status || campaign.operation_status || 'UNKNOWN',
-                budget: campaign.budget,
-                budget_mode: campaign.budget_mode,
-                raw_data: campaign,
-                last_synced_at: new Date().toISOString()
-            });
-        }
-
-
-
-        // 2. Sync Ad Groups (all pages, parallel upserts)
-        let allAdGroups: any[] = [];
-        try {
-            let adGroupPage = 1;
-            while (true) {
-                const adGroups = await tiktokBusinessApi.getAdGroups(access_token, advertiser_id, { page: adGroupPage, page_size: 100 });
-                allAdGroups = allAdGroups.concat(adGroups.list || []);
-                if (!adGroups.page_info || adGroupPage >= adGroups.page_info.total_page) break;
-                adGroupPage++;
-            }
-            console.log(`[Ads Sync] Found ${allAdGroups.length} ad groups — upserting...`);
-
-            // Build a campaign_id → UUID map to avoid N+1 DB lookups
-            const { data: campaignRows } = await supabase
-                .from('tiktok_ad_campaigns')
-                .select('id, campaign_id')
-                .eq('advertiser_id', advertiserId);
-            const campaignMap = new Map((campaignRows || []).map((c: any) => [c.campaign_id, c.id]));
-
-            const adGroupRecords = allAdGroups
-                .filter(ag => campaignMap.has(ag.campaign_id))
-                .map(ag => ({
-                    advertiser_id: advertiserId,
-                    campaign_id: campaignMap.get(ag.campaign_id),
-                    adgroup_id: ag.adgroup_id,
-                    adgroup_name: ag.adgroup_name,
-                    status: ag.secondary_status || ag.operation_status || 'UNKNOWN',
-                    budget: ag.budget,
-                    budget_mode: ag.budget_mode,
-                    bid_type: ag.bid_type,
-                    bid_price: ag.bid_price,
-                    optimization_goal: ag.optimization_goal,
-                    raw_data: ag,
-                    last_synced_at: new Date().toISOString()
-                }));
-
-            for (let i = 0; i < adGroupRecords.length; i += 1000) {
-                const batch = adGroupRecords.slice(i, i + 1000);
-                const { error } = await supabase.from('tiktok_ad_groups').upsert(batch, { onConflict: 'adgroup_id' });
-                if (error) console.error('[Ads Sync] Ad Group batch upsert error:', error);
-            }
-
-            const adGroupStatusCounts: Record<string, number> = {};
-            allAdGroups.forEach((ag: any) => {
-                const s = ag.secondary_status || ag.operation_status || 'UNKNOWN';
-                adGroupStatusCounts[s] = (adGroupStatusCounts[s] || 0) + 1;
-            });
-            console.log(`[Ads Sync] Ad Groups upserted. Status distribution:`, adGroupStatusCounts);
-        } catch (e: any) {
-            console.error(`[Ads Sync] Ad Group sync failed:`, e.message);
-        }
-
-
-        // 3. Sync Ads (all pages, parallel upserts)
-        let allAds: any[] = [];
-        try {
-            let adPage = 1;
-            while (true) {
-                const ads = await tiktokBusinessApi.getAds(access_token, advertiser_id, { page: adPage, page_size: 100 });
-                allAds = allAds.concat(ads.list || []);
-                if (!ads.page_info || adPage >= ads.page_info.total_page) break;
-                adPage++;
-            }
-            console.log(`[Ads Sync] Found ${allAds.length} ads — upserting...`);
-
-            // Build adgroup_id → UUID map to avoid N+1 DB lookups
-            const { data: adGroupRows } = await supabase
-                .from('tiktok_ad_groups')
-                .select('id, adgroup_id')
-                .eq('advertiser_id', advertiserId);
-            const adGroupMap = new Map((adGroupRows || []).map((ag: any) => [ag.adgroup_id, ag.id]));
-
-            const adRecords = allAds
-                .filter(ad => adGroupMap.has(ad.adgroup_id))
-                .map(ad => ({
-                    advertiser_id: advertiserId,
-                    adgroup_id: adGroupMap.get(ad.adgroup_id),
-                    ad_id: ad.ad_id,
-                    ad_name: ad.ad_name,
-                    ad_format: ad.ad_format,
-                    ad_text: ad.ad_text,
-                    call_to_action: ad.call_to_action,
-                    landing_page_url: ad.landing_page_url,
-                    video_id: ad.video_id,
-                    image_ids: ad.image_ids,
-                    status: ad.secondary_status || ad.operation_status || 'UNKNOWN',
-                    raw_data: ad,
-                    last_synced_at: new Date().toISOString()
-                }));
-
-            for (let i = 0; i < adRecords.length; i += 1000) {
-                const batch = adRecords.slice(i, i + 1000);
-                const { error } = await supabase.from('tiktok_ads').upsert(batch, { onConflict: 'ad_id' });
-                if (error) console.error('[Ads Sync] Ads batch upsert error:', error);
-            }
-
-            const adStatusCounts: Record<string, number> = {};
-            allAds.forEach((a: any) => {
-                const s = a.secondary_status || a.operation_status || 'UNKNOWN';
-                adStatusCounts[s] = (adStatusCounts[s] || 0) + 1;
-            });
-            console.log(`[Ads Sync] Ads upserted. Status distribution:`, adStatusCounts);
-        } catch (e: any) {
-            console.error(`[Ads Sync] Ads sync failed:`, e.message);
-        }
-
-        // 4. Sync Metrics (or requested range)
-        // Default to 30 days of history for ALL data types to avoid excessive API calls and long sync times.
-        const syncEndDate = endDate ? new Date(endDate) : new Date();
-        const syncStartDate = startDate
-            ? new Date(startDate)
-            : new Date(Date.now() - 90 * 24 * 60 * 60 * 1000); // Default to 90 days ago
-
-        console.log(`[Ads Sync] Starting Unified Sync from ${syncStartDate.toISOString().split('T')[0]} to ${syncEndDate.toISOString().split('T')[0]}...`);
-
-        // Fetch store IDs for GMV Max syncing
-        const { data: shops } = await supabase.from('tiktok_shops').select('shop_id').eq('account_id', accountId);
-        const storeIds: string[] = (shops || []).map((s: any) => s.shop_id).filter(Boolean);
-
-        const fullAdMetrics: any[] = [];
-        const fullCampaignMetrics: any[] = [];
-        const fullDailySpend: any[] = [];
-        const fullGmvSpend: any[] = [];
-
-        let currentChunkStart = new Date(syncStartDate);
-
-        while (currentChunkStart <= syncEndDate) {
-            let currentChunkEnd = new Date(currentChunkStart);
-            currentChunkEnd.setDate(currentChunkEnd.getDate() + 29); // 30 day window
-            if (currentChunkEnd > syncEndDate) currentChunkEnd = syncEndDate;
-
-            const sDate = currentChunkStart.toISOString().split('T')[0];
-            const eDate = currentChunkEnd.toISOString().split('T')[0];
-
-            console.log(`[Ads Sync] Fetching chunk: ${sDate} to ${eDate}`);
-
-            try {
-                // Fetch all 4 types in parallel for this time chunk
-                const [chunkAdMetrics, chunkCampaignMetrics, chunkDailySpend, chunkGmvSpend] = await Promise.all([
-                    tiktokBusinessApi.getAdMetrics(
-                        access_token,
-                        advertiser_id,
-                        sDate,
-                        eDate,
-                        undefined
-                    ).catch(e => {
-                        console.error(`[Ads Sync] Error fetching ad metrics for ${sDate}:`, e.message);
-                        return [];
-                    }),
-                    tiktokBusinessApi.getCampaignMetrics(
-                        access_token,
-                        advertiser_id,
-                        sDate,
-                        eDate
-                    ).catch(e => {
-                        console.error(`[Ads Sync] Error fetching campaign metrics for ${sDate}:`, e.message);
-                        return [];
-                    }),
-                    tiktokBusinessApi.getConsolidatedOverview(
-                        access_token,
-                        advertiser_id,
-                        sDate,
-                        eDate
-                    )
-                        .then(res => res.list || [])
-                        .catch(e => {
-                            console.error(`[Ads Sync] Error fetching daily spend for ${sDate}:`, e.message);
-                            return [];
-                        }),
-                    storeIds.length > 0
-                        ? tiktokBusinessApi.getGmvMaxReport(
-                            access_token,
-                            advertiser_id,
-                            sDate,
-                            eDate,
-                            storeIds
-                        ).then(res => res.list || []).catch(e => {
-                            console.error(`[Ads Sync] Error fetching GMV Max for ${sDate}:`, e.message);
-                            return [];
-                        })
-                        : Promise.resolve([])
-                ]);
-
-                if (chunkAdMetrics?.length) fullAdMetrics.push(...chunkAdMetrics);
-                if (chunkCampaignMetrics?.length) fullCampaignMetrics.push(...chunkCampaignMetrics);
-                if (chunkDailySpend?.length) fullDailySpend.push(...chunkDailySpend);
-                if (chunkGmvSpend?.length) fullGmvSpend.push(...chunkGmvSpend);
-
-                console.log(`[Ads Sync] Chunk results: ${chunkAdMetrics?.length || 0} ads, ${chunkCampaignMetrics?.length || 0} campaigns, ${chunkDailySpend?.length || 0} spend, ${chunkGmvSpend?.length || 0} GMV`);
-
-            } catch (err: any) {
-                console.error(`[Ads Sync] Critical error in chunk ${sDate}-${eDate}:`, err.message);
-            }
-
-            // Move to next day
-            currentChunkStart.setDate(currentChunkStart.getDate() + 30);
-        }
-
-        // Process Daily Spend
-        console.log(`[Ads Sync] Total daily spend records: ${fullDailySpend.length}, GMV Max records: ${fullGmvSpend.length}`);
-
-        // Merge GMV Max into Daily Spend
-        const spendMap = new Map<string, any>();
-
-        fullDailySpend.forEach(day => {
-            const dateStr = day.dimensions?.stat_time_day;
-            if (dateStr) spendMap.set(dateStr, day);
+        const { job, deduped } = await enqueueIngestionJob({
+            stream: 'ads',
+            accountId,
+            syncType: 'full',
+            payload,
+            priority: 55,
         });
 
-        fullGmvSpend.forEach(gmvDay => {
-            const dateStr = gmvDay.dimensions?.stat_time_day || gmvDay.metrics?.stat_time_day;
-            if (!dateStr) return;
-
-            const gm = gmvDay.metrics || {};
-            const costToAdd = parseFloat(gm.cost || gm.spend || '0');
-            const ordersToAdd = parseInt(gm.orders || gm.complete_payment || '0');
-            const roiVal = parseFloat(gm.roi || '0');
-            const conversionValueToAdd = costToAdd * roiVal;
-
-            const existing = spendMap.get(dateStr);
-            if (existing) {
-                if (!existing._gmvFlag) {
-                    existing._gmvFlag = true;
-                    const m = existing.metrics || {};
-                    existing.metrics = {
-                        ...m,
-                        spend: parseFloat(m.spend || m.cost || '0'),
-                        cost: parseFloat(m.cost || m.spend || '0'),
-                        complete_payment: parseInt(m.complete_payment || '0'),
-                        impressions: parseInt(m.impressions || '0'),
-                        clicks: parseInt(m.clicks || '0'),
-                        _gmv_revenue: 0
-                    };
-                }
-
-                existing.metrics.spend += costToAdd;
-                existing.metrics.cost += costToAdd;
-                existing.metrics.complete_payment += ordersToAdd;
-                existing.metrics.impressions += parseInt(gm.impressions || '0');
-                existing.metrics.clicks += parseInt(gm.clicks || '0');
-                existing.metrics._gmv_revenue += conversionValueToAdd;
-
-                if (existing.metrics.spend > 0) {
-                    existing.metrics.roi = String(existing.metrics._gmv_revenue / existing.metrics.spend);
-                }
-            } else {
-                spendMap.set(dateStr, {
-                    dimensions: { stat_time_day: dateStr },
-                    metrics: {
-                        spend: costToAdd,
-                        cost: costToAdd,
-                        complete_payment: ordersToAdd,
-                        roi: roiVal ? String(roiVal) : '0',
-                        _gmv_revenue: conversionValueToAdd
-                    },
-                    _gmvFlag: true
-                });
-            }
+        ingestionLogger.info({
+            event: 'job_enqueued',
+            stream: 'ads',
+            jobId: job.id,
+            accountId,
+            syncType: 'full',
+            status: job.status,
+            deduped,
         });
 
-        const mergedDailySpend = Array.from(spendMap.values());
+        await auditLog(req, {
+            action: 'tiktok.ads.sync_enqueued',
+            resourceType: 'ingestion_job',
+            resourceId: job.id,
+            accountId,
+            metadata: { stream: 'ads', deduped },
+        });
 
-        if (mergedDailySpend.length > 0) {
-            const spendRecords = mergedDailySpend.map(day => {
-                const dimensions = day.dimensions || {};
-                const metrics = day.metrics || {};
-                const statDate = dimensions.stat_time_day || metrics.stat_time_day;
-
-                const spend = parseFloat(String(metrics.spend || metrics.cost || '0'));
-                const conversionVal = metrics._gmv_revenue !== undefined
-                    ? metrics._gmv_revenue
-                    : metrics.roi
-                        ? spend * parseFloat(metrics.roi || '0')
-                        : parseFloat(metrics.value_per_complete_payment || '0') * parseInt(metrics.complete_payment || '0');
-
-                return {
-                    advertiser_id: advertiserId,
-                    account_id: accountId,
-                    spend_date: statDate,
-                    total_spend: spend,
-                    total_impressions: parseInt(metrics.impressions || '0'),
-                    total_clicks: parseInt(metrics.clicks || '0'),
-                    total_conversions: parseInt(metrics.complete_payment || metrics.orders || '0'),
-                    conversion_value: conversionVal,
-                    currency: advertiser.currency
-                };
-            });
-
-            // Upsert in batches of 1000 to be safe
-            for (let i = 0; i < spendRecords.length; i += 1000) {
-                const batch = spendRecords.slice(i, i + 1000);
-                const { error } = await supabase
-                    .from('tiktok_ad_spend_daily')
-                    .upsert(batch, { onConflict: 'advertiser_id, spend_date' });
-
-                if (error) console.error('[Ads Sync] Error upserting daily spend batch:', error);
-            }
-            console.log(`[Ads Sync] Upserted ${spendRecords.length} daily spend records`);
-
-            // NEW: Upsert same data into tiktok_ad_metrics under ADVERTISER dimension 
-            // This ensures pure top-level data (including Reach, Video, and GMV Max) is safely queryable for the Dashboard.
-            const advertiserMetricsRecords = mergedDailySpend.map(day => {
-                const dimensions = day.dimensions || {};
-                const metrics = day.metrics || {};
-                const statDate = dimensions.stat_time_day || metrics.stat_time_day;
-
-                // Derive pure GMV revenue if native values are missing
-                const spend = parseFloat(String(metrics.spend || metrics.cost || '0'));
-                const conversionVal = metrics._gmv_revenue !== undefined
-                    ? metrics._gmv_revenue
-                    : metrics.roi
-                        ? spend * parseFloat(metrics.roi || '0')
-                        : parseFloat(metrics.value_per_complete_payment || '0') * parseInt(metrics.complete_payment || '0');
-
-                return {
-                    advertiser_id: advertiserId,
-                    dimension_type: 'ADVERTISER',
-                    dimension_id: advertiserId, // The advertiser IS the dimension
-                    stat_date: statDate,
-                    stat_datetime: new Date(statDate).toISOString(),
-                    impressions: parseInt(metrics.impressions || '0'),
-                    clicks: parseInt(metrics.clicks || '0'),
-                    reach: parseInt(metrics.reach || '0'),
-                    frequency: parseFloat(metrics.frequency || '0'),
-                    likes: parseInt(metrics.likes || '0'),
-                    comments: parseInt(metrics.comments || '0'),
-                    shares: parseInt(metrics.shares || '0'),
-                    follows: parseInt(metrics.follows || '0'),
-                    profile_visits: parseInt(metrics.profile_visits || '0'),
-                    video_views: parseInt(metrics.video_play_actions || '0'),
-                    video_watched_2s: parseInt(metrics.engaged_view || metrics.video_watched_2s || '0'),
-                    video_watched_6s: parseInt(metrics.video_watched_6s || '0'),
-                    video_views_p25: parseInt(metrics.video_views_p25 || '0'),
-                    video_views_p50: parseInt(metrics.video_views_p50 || '0'),
-                    video_views_p75: parseInt(metrics.video_views_p75 || '0'),
-                    video_views_p100: parseInt(metrics.video_views_p100 || '0'),
-                    spend: spend,
-                    cpc: parseFloat(metrics.cpc || '0'),
-                    cpm: parseFloat(metrics.cpm || '0'),
-                    conversions: parseInt(metrics.complete_payment || metrics.orders || '0'),
-                    conversion_rate: parseFloat(metrics.complete_payment_rate || '0'),
-                    cost_per_conversion: parseFloat(metrics.cost_per_complete_payment || '0'),
-                    conversion_value: conversionVal,
-                    ctr: parseFloat(metrics.ctr || '0'),
-                    currency: advertiser.currency
-                };
-            });
-
-            for (let i = 0; i < advertiserMetricsRecords.length; i += 1000) {
-                const batch = advertiserMetricsRecords.slice(i, i + 1000);
-                const { error } = await supabase
-                    .from('tiktok_ad_metrics')
-                    .upsert(batch, { onConflict: 'advertiser_id, dimension_type, dimension_id, stat_date' });
-
-                if (error) {
-                    // If profile_visits column doesn't exist yet, retry without it
-                    if (error.message?.includes('profile_visits')) {
-                        console.warn('[Ads Sync] profile_visits column missing — retrying ADVERTISER batch without it...');
-                        const cleanBatch = batch.map(({ profile_visits, ...rest }: any) => rest);
-                        const { error: retryErr } = await supabase
-                            .from('tiktok_ad_metrics')
-                            .upsert(cleanBatch, { onConflict: 'advertiser_id, dimension_type, dimension_id, stat_date' });
-                        if (retryErr) console.error('[Ads Sync] Retry ADVERTISER upsert also failed:', retryErr);
-                    } else {
-                        console.error('[Ads Sync] Error upserting ADVERTISER metrics batch:', error);
-                    }
-                }
-            }
-            console.log(`[Ads Sync] Upserted ${advertiserMetricsRecords.length} ADVERTISER metric records`);
-        }
-
-        // Process Campaign Metrics
-        console.log(`[Ads Sync] Total campaign metrics records: ${fullCampaignMetrics.length}`);
-
-        if (fullCampaignMetrics.length > 0) {
-            // Create a map of campaign_id -> id to avoid individual DB lookups
-            const campaignIds = [...new Set(fullCampaignMetrics.map(m => m.dimensions.campaign_id))];
-            const { data: campaigns } = await supabase
-                .from('tiktok_ad_campaigns')
-                .select('id, campaign_id')
-                .in('campaign_id', campaignIds);
-
-            const campaignMap = new Map();
-            if (campaigns) {
-                campaigns.forEach(c => campaignMap.set(c.campaign_id, c.id));
-            }
-
-            const campaignMetricsRecords = [];
-            for (const metric of fullCampaignMetrics) {
-                const dimensions = metric.dimensions;
-                const metricsData = metric.metrics;
-                const internalId = campaignMap.get(dimensions.campaign_id);
-
-                if (internalId) {
-                    campaignMetricsRecords.push({
-                        advertiser_id: advertiserId,
-                        dimension_type: 'CAMPAIGN',
-                        dimension_id: internalId,
-                        stat_date: dimensions.stat_time_day,
-                        stat_datetime: new Date(dimensions.stat_time_day).toISOString(),
-                        impressions: parseInt(metricsData.impressions || '0'),
-                        clicks: parseInt(metricsData.clicks || '0'),
-                        reach: parseInt(metricsData.reach || '0'),
-                        frequency: parseFloat(metricsData.frequency || '0'),
-                        likes: parseInt(metricsData.likes || '0'),
-                        comments: parseInt(metricsData.comments || '0'),
-                        shares: parseInt(metricsData.shares || '0'),
-                        follows: parseInt(metricsData.follows || '0'),
-                        profile_visits: parseInt(metricsData.profile_visits || '0'),
-                        video_views: parseInt(metricsData.video_play_actions || '0'),
-                        video_watched_2s: parseInt(metricsData.engaged_view || '0'),
-                        video_watched_6s: parseInt(metricsData.video_watched_6s || '0'),
-                        video_views_p25: parseInt(metricsData.video_views_p25 || '0'),
-                        video_views_p50: parseInt(metricsData.video_views_p50 || '0'),
-                        video_views_p75: parseInt(metricsData.video_views_p75 || '0'),
-                        video_views_p100: parseInt(metricsData.video_views_p100 || '0'),
-                        spend: parseFloat(metricsData.spend || '0'),
-                        cpc: parseFloat(metricsData.cpc || '0'),
-                        cpm: parseFloat(metricsData.cpm || '0'),
-                        conversions: parseInt(metricsData.complete_payment || '0'),
-                        conversion_rate: parseFloat(metricsData.complete_payment_rate || '0'),
-                        cost_per_conversion: parseFloat(metricsData.cost_per_complete_payment || '0'),
-                        conversion_value: parseFloat(metricsData.value_per_complete_payment || '0') * parseInt(metricsData.complete_payment || '0'),
-                        ctr: parseFloat(metricsData.ctr || '0'),
-                        currency: advertiser.currency
-                    });
-                }
-            }
-
-            // Upsert in batches
-            for (let i = 0; i < campaignMetricsRecords.length; i += 1000) {
-                const batch = campaignMetricsRecords.slice(i, i + 1000);
-                const { error } = await supabase.from('tiktok_ad_metrics').upsert(batch, { onConflict: 'advertiser_id, dimension_type, dimension_id, stat_date' });
-                if (error) {
-                    // If profile_visits column doesn't exist yet, retry without it
-                    if (error.message?.includes('profile_visits')) {
-                        console.warn('[Ads Sync] profile_visits column missing — retrying CAMPAIGN batch without it...');
-                        const cleanBatch = batch.map(({ profile_visits, ...rest }: any) => rest);
-                        const { error: retryErr } = await supabase.from('tiktok_ad_metrics').upsert(cleanBatch, { onConflict: 'advertiser_id, dimension_type, dimension_id, stat_date' });
-                        if (retryErr) console.error('[Ads Sync] Retry CAMPAIGN upsert also failed:', retryErr);
-                    } else {
-                        console.error('[Ads Sync] Error upserting campaign metrics batch:', error);
-                    }
-                }
-            }
-            console.log(`[Ads Sync] Upserted ${campaignMetricsRecords.length} campaign metrics records`);
-        }
-
-        console.log(`[Ads Sync] Total ad metrics records: ${fullAdMetrics.length}`);
-
-        if (fullAdMetrics.length > 0) {
-            // Create a map of ad_id -> id to avoid individual DB lookups
-            const adIds = [...new Set(fullAdMetrics.map(m => m.dimensions.ad_id))];
-
-            // Fetch ads in chunks to avoid query length limits if too many ads
-            const adMap = new Map();
-            for (let i = 0; i < adIds.length; i += 1000) {
-                const chunk = adIds.slice(i, i + 1000);
-                const { data: ads } = await supabase
-                    .from('tiktok_ads')
-                    .select('id, ad_id')
-                    .in('ad_id', chunk);
-
-                if (ads) {
-                    ads.forEach(a => adMap.set(a.ad_id, a.id));
-                }
-            }
-
-            const adMetricsRecords = [];
-            for (const metric of fullAdMetrics) {
-                const dimensions = metric.dimensions;
-                const metricsData = metric.metrics;
-                const internalId = adMap.get(dimensions.ad_id);
-
-                if (internalId) {
-                    adMetricsRecords.push({
-                        advertiser_id: advertiserId,
-                        dimension_type: 'AD',
-                        dimension_id: internalId,
-                        stat_date: dimensions.stat_time_day,
-                        stat_datetime: new Date(dimensions.stat_time_day).toISOString(),
-                        // Spend & Cost
-                        spend: parseFloat(metricsData.spend || '0'),
-                        cpc: parseFloat(metricsData.cpc || '0'),
-                        cpm: parseFloat(metricsData.cpm || '0'),
-                        cost_per_conversion: parseFloat(metricsData.cost_per_complete_payment || '0'),
-                        // Impressions & Reach
-                        impressions: parseInt(metricsData.impressions || '0'),
-                        reach: parseInt(metricsData.reach || '0'),
-                        frequency: parseFloat(metricsData.frequency || '0'),
-                        // Engagement
-                        clicks: parseInt(metricsData.clicks || '0'),
-                        ctr: parseFloat(metricsData.ctr || '0'),
-                        likes: parseInt(metricsData.likes || '0'),
-                        comments: parseInt(metricsData.comments || '0'),
-                        shares: parseInt(metricsData.shares || '0'),
-                        follows: parseInt(metricsData.follows || '0'),
-                        // Video Performance
-                        video_views: parseInt(metricsData.video_play_actions || '0'),
-                        video_watched_2s: parseInt(metricsData.engaged_view || '0'),
-                        video_watched_6s: parseInt(metricsData.video_watched_6s || '0'),
-                        video_views_p25: parseInt(metricsData.video_views_p25 || '0'),
-                        video_views_p50: parseInt(metricsData.video_views_p50 || '0'),
-                        video_views_p75: parseInt(metricsData.video_views_p75 || '0'),
-                        video_views_p100: parseInt(metricsData.video_views_p100 || '0'),
-                        // Conversions
-                        conversions: parseInt(metricsData.complete_payment || '0'),
-                        conversion_rate: parseFloat(metricsData.complete_payment_rate || '0'),
-                        conversion_value: parseFloat(metricsData.value_per_complete_payment || '0') * parseInt(metricsData.complete_payment || '0'),
-                        currency: advertiser.currency
-                    });
-                }
-            }
-
-            // Upsert in batches
-            for (let i = 0; i < adMetricsRecords.length; i += 1000) {
-                const batch = adMetricsRecords.slice(i, i + 1000);
-                const { error } = await supabase
-                    .from('tiktok_ad_metrics')
-                    .upsert(batch, { onConflict: 'advertiser_id, dimension_type, dimension_id, stat_date' });
-
-                if (error) console.error('[Ads Sync] Error upserting ad metrics batch:', error);
-            }
-            console.log(`[Ads Sync] Upserted ${adMetricsRecords.length} ad metrics records`);
-        }
-
-
-        // Update last synced
-        await supabase
-            .from('tiktok_advertisers')
-            .update({ last_synced_at: new Date().toISOString() })
-            .eq('id', advertiserId);
-
-        console.log('[Ads Sync] Sync completed successfully');
-
-        // Hydrate GMV Max campaign metadata from already-fetched data (no re-fetch needed)
-        if (fullGmvSpend.length > 0) {
-            const uniqueGmvCampaignIds = Array.from(new Set(fullGmvSpend.map((r: any) => r.dimensions?.campaign_id).filter(Boolean))) as string[];
-            console.log(`[Ads Sync] Found ${uniqueGmvCampaignIds.length} unique GMV Max campaign IDs. Hydrating...`);
-
-            if (uniqueGmvCampaignIds.length > 0) {
-                try {
-                    const sessions = await tiktokBusinessApi.getGmvMaxSessions(
-                        access_token,
-                        advertiser_id,
-                        uniqueGmvCampaignIds
-                    );
-                    console.log(`[Ads Sync] Fetched ${sessions.length} GMV Max sessions for hydration`);
-
-                    const campaignUpserts: any[] = [];
-                    for (const s of sessions) {
-                        const cid = s._campaign_id || s.campaign_id;
-                        if (!cid) continue;
-                        // Deduplicate by campaign_id — keep first seen
-                        if (campaignUpserts.find(c => c.campaign_id === cid)) continue;
-
-                        const campaign = {
-                            advertiser_id: advertiserId,
-                            campaign_id: cid,
-                            campaign_name: s.campaign_name || s.session_name || `GMV Max Campaign ${cid}`,
-                            objective_type: 'SHOP_PURCHASES',
-                            status: s.status || 'UNKNOWN',
-                            budget: s.budget || 0,
-                            budget_mode: s.budget_mode || 'BUDGET_MODE_DAY',
-                            raw_data: s,
-                            last_synced_at: new Date().toISOString()
-                        };
-                        campaignUpserts.push(campaign);
-
-                        if (!allCampaigns.find(c => c.campaign_id === cid)) {
-                            allCampaigns.push(campaign);
-                        }
-                    }
-
-                    // Batch upsert all GMV Max campaigns at once
-                    if (campaignUpserts.length > 0) {
-                        const { error } = await supabase.from('tiktok_ad_campaigns').upsert(campaignUpserts, { onConflict: 'campaign_id' });
-                        if (error) console.error('[Ads Sync] GMV campaign upsert error:', error);
-                        else console.log(`[Ads Sync] Upserted ${campaignUpserts.length} GMV Max campaigns`);
-                    }
-                } catch (err: any) {
-                    console.warn(`[Ads Sync] Failed to hydrate GMV Max campaigns:`, err.message);
-                }
-            }
-        }
-
-        res.json({
+        res.status(202).json({
             success: true,
-            summary: {
-                campaigns: allCampaigns.length,
-                adGroups: allAdGroups.length,
-                ads: allAds.length,
-                metricsRecords: fullDailySpend.length + fullCampaignMetrics.length + fullAdMetrics.length
-            }
+            queued: true,
+            deduped,
+            jobId: job.id,
+            status: job.status,
         });
-    } catch (error) {
-        handleApiError(res, error);
+    } catch (error: any) {
+        console.error('[TikTok Ads Sync Queue] Failed to enqueue:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message,
+        });
+    }
+});
+
+router.get('/sync/job/:jobId', requireIngestionJobReadAccess(), async (req, res) => {
+    try {
+        const job = await getIngestionJob(req.params.jobId);
+        if (!job) {
+            return res.status(404).json({ success: false, error: 'Job not found' });
+        }
+        const { data: attempts } = await supabase
+            .from('ingestion_job_attempts')
+            .select('attempt_no,status,error,result,finished_at,started_at')
+            .eq('job_id', job.id)
+            .order('attempt_no', { ascending: false })
+            .limit(1);
+        const lastAttempt = attempts?.[0] ?? null;
+        const progress = (lastAttempt?.result as any)?.progress ?? null;
+        return res.json({ success: true, job, lastAttempt, progress });
+    } catch (error: any) {
+        return res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+router.post('/sync/run-worker', async (req, res) => {
+    const authHeader = req.headers.authorization;
+    const cronAuthorized = !!process.env.CRON_SECRET && authHeader === `Bearer ${process.env.CRON_SECRET}`;
+    const superAdminAuthorized = await isPlatformSuperAdminRequest(req);
+    if (!cronAuthorized && !superAdminAuthorized) {
+        return res.status(401).json({ success: false, error: 'Unauthorized (cron secret or platform super admin required)' });
+    }
+
+    const workerId = `ads-worker-${Date.now()}`;
+    const limit = Math.max(1, Math.min(10, Number(req.query.limit) || 3));
+    const results: Array<{ jobId: string; status: string; error?: string }> = [];
+    try {
+        const claimedJobs = await claimIngestionJobs(workerId, 'ads', limit);
+        const jobResults = await Promise.all(
+            claimedJobs.map(async (job) => {
+                try {
+                    ingestionLogger.info({
+                        event: 'job_started',
+                        stream: 'ads',
+                        jobId: job.id,
+                        accountId: job.account_id,
+                        syncType: job.sync_type,
+                        attempt: job.attempt_count,
+                        status: job.status,
+                    });
+                    await auditLog(null, {
+                        action: 'tiktok.ads.sync_started',
+                        resourceType: 'ingestion_job',
+                        resourceId: job.id,
+                        accountId: job.account_id,
+                        metadata: { stream: 'ads', workerId, attempt: job.attempt_count },
+                    });
+                    const payload = job.payload as IngestionJobPayload;
+                    const result = await runTikTokAdsFullSync({
+                        accountId: payload.accountId,
+                        startDate: payload.startDate,
+                        endDate: payload.endDate,
+                    });
+                    await markIngestionJobSucceeded(job.id, result);
+                    ingestionLogger.info({
+                        event: 'job_succeeded',
+                        stream: 'ads',
+                        jobId: job.id,
+                        accountId: job.account_id,
+                        syncType: job.sync_type,
+                        status: 'succeeded',
+                    });
+                    await auditLog(null, {
+                        action: 'tiktok.ads.sync_succeeded',
+                        resourceType: 'ingestion_job',
+                        resourceId: job.id,
+                        accountId: job.account_id,
+                        metadata: { stream: 'ads', summary: result.summary },
+                    });
+                    return { jobId: job.id, status: 'succeeded' as const };
+                } catch (error: any) {
+                    const forceDl = error instanceof AdsSyncAdvertiserNotFoundError;
+                    const willDeadLetter = forceDl || (job as IngestionJobRow).attempt_count >= (job as IngestionJobRow).max_attempts;
+                    await markIngestionJobFailed(job as IngestionJobRow, error, { forceDeadLetter: forceDl });
+                    ingestionLogger.error({
+                        event: 'job_failed',
+                        stream: 'ads',
+                        jobId: job.id,
+                        accountId: job.account_id,
+                        syncType: job.sync_type,
+                        attempt: job.attempt_count,
+                        status: 'failed',
+                        error: error.message,
+                    });
+                    await auditLog(null, {
+                        action: willDeadLetter ? 'tiktok.ads.sync_dead_letter' : 'tiktok.ads.sync_failed',
+                        resourceType: 'ingestion_job',
+                        resourceId: job.id,
+                        accountId: job.account_id,
+                        metadata: { stream: 'ads', error: error.message, willRetry: !willDeadLetter },
+                    });
+                    return { jobId: job.id, status: 'failed' as const, error: error.message };
+                }
+            }),
+        );
+        results.push(...jobResults);
+
+        if (process.env.DEAD_LETTER_WEBHOOK_URL) {
+            (async () => {
+                try {
+                    const threshold = Number(process.env.DEAD_LETTER_ALERT_THRESHOLD ?? 1);
+                    const { count } = await supabase
+                        .from('ingestion_jobs')
+                        .select('*', { count: 'exact', head: true })
+                        .eq('status', 'dead_letter')
+                        .eq('stream', 'ads');
+                    if ((count ?? 0) >= threshold) {
+                        ingestionLogger.warn({ event: 'dead_letter_alert', stream: 'ads', count });
+                        await axios.post(process.env.DEAD_LETTER_WEBHOOK_URL!, {
+                            text: `⚠️ *Mamba Ads Ingestion* — ${count} job(s) in dead-letter queue.`,
+                        }).catch(() => undefined);
+                    }
+                } catch { /* never crash */ }
+            })();
+        }
+
+        return res.json({
+            success: true,
+            workerId,
+            claimed: claimedJobs.length,
+            results,
+        });
+    } catch (error: any) {
+        return res.status(500).json({ success: false, error: error.message, workerId, results });
     }
 });
 
@@ -1218,6 +806,25 @@ router.post('/poll-all', async (req, res) => {
         return res.json({ success: true, ...summary });
     } catch (err: any) {
         console.error('[Ads Poll] /poll-all error:', err.message);
+        return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+router.get('/poll-all', async (req, res) => {
+    const cronSecret = process.env.CRON_SECRET;
+    if (cronSecret) {
+        const authHeader = req.headers.authorization || '';
+        const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+        if (token !== cronSecret) {
+            return res.status(401).json({ success: false, error: 'Unauthorized' });
+        }
+    }
+
+    const range = (req.query.range as PollRange) === '7d' ? '7d' : 'today';
+    try {
+        const summary = await pollAllAdvertisers(range);
+        return res.json({ success: true, ...summary });
+    } catch (err: any) {
         return res.status(500).json({ success: false, error: err.message });
     }
 });
@@ -2059,7 +1666,7 @@ router.get('/dashboard/:accountId', async (req, res) => {
         const { startDate, endDate } = req.query as { startDate?: string; endDate?: string };
         console.log(`[Dashboard] v2 Entry: accountId=${accountId} startDate=${startDate} endDate=${endDate}`);
 
-        const { data: advertiser, error: advError } = await supabase
+        const { data: advertiserRaw, error: advError } = await supabase
             .from('tiktok_advertisers')
             .select('access_token, advertiser_id, advertiser_name, currency, balance, last_synced_at, granted_scopes')
             .eq('account_id', accountId)
@@ -2068,12 +1675,129 @@ router.get('/dashboard/:accountId', async (req, res) => {
             .limit(1)
             .maybeSingle();
 
-        if (advError || !advertiser) {
+        if (advError || !advertiserRaw) {
             return res.json({ success: true, data: { connected: false } });
         }
+        const advertiser: any = advertiserRaw;
 
         const end = endDate || new Date().toISOString().split('T')[0];
         const start = startDate || (() => { const d = new Date(); d.setDate(d.getDate() - 90); return d.toISOString().split('T')[0]; })();
+
+        {
+        // DB-first dashboard mode: never block dashboard on live TikTok APIs.
+        const { data: spendRows, error: spendErr } = await supabase
+            .from('tiktok_ad_spend_daily')
+            .select('spend_date,total_spend,total_impressions,total_clicks,total_conversions,conversion_value')
+            .eq('account_id', accountId)
+            .gte('spend_date', start)
+            .lte('spend_date', end)
+            .order('spend_date', { ascending: true });
+        if (spendErr) throw spendErr;
+
+        const { data: metricRows, error: metricErr } = await supabase
+            .from('tiktok_ad_metrics')
+            .select('impressions,clicks,reach,likes,comments,shares,follows,video_views,video_watched_2s,video_watched_6s,video_views_p25,video_views_p50,video_views_p75,video_views_p100,conversion_value')
+            .eq('advertiser_id', (advertiser as any).id)
+            .gte('stat_date', start)
+            .lte('stat_date', end);
+        if (metricErr) throw metricErr;
+
+        const spendTotals = (spendRows || []).reduce((acc: any, row: any) => ({
+            spend: acc.spend + Number(row.total_spend || 0),
+            impressions: acc.impressions + Number(row.total_impressions || 0),
+            clicks: acc.clicks + Number(row.total_clicks || 0),
+            conversions: acc.conversions + Number(row.total_conversions || 0),
+            revenue: acc.revenue + Number(row.conversion_value || 0),
+        }), { spend: 0, impressions: 0, clicks: 0, conversions: 0, revenue: 0 });
+
+        const engagementTotals = (metricRows || []).reduce((acc: any, row: any) => ({
+            reach: acc.reach + Number(row.reach || 0),
+            likes: acc.likes + Number(row.likes || 0),
+            comments: acc.comments + Number(row.comments || 0),
+            shares: acc.shares + Number(row.shares || 0),
+            follows: acc.follows + Number(row.follows || 0),
+            video_play_actions: acc.video_play_actions + Number(row.video_views || 0),
+            video_watched_2s: acc.video_watched_2s + Number(row.video_watched_2s || 0),
+            video_watched_6s: acc.video_watched_6s + Number(row.video_watched_6s || 0),
+            video_views_p25: acc.video_views_p25 + Number(row.video_views_p25 || 0),
+            video_views_p50: acc.video_views_p50 + Number(row.video_views_p50 || 0),
+            video_views_p75: acc.video_views_p75 + Number(row.video_views_p75 || 0),
+            video_views_p100: acc.video_views_p100 + Number(row.video_views_p100 || 0),
+        }), {
+            reach: 0, likes: 0, comments: 0, shares: 0, follows: 0,
+            video_play_actions: 0, video_watched_2s: 0, video_watched_6s: 0,
+            video_views_p25: 0, video_views_p50: 0, video_views_p75: 0, video_views_p100: 0
+        });
+
+        const ctr = spendTotals.impressions > 0 ? (spendTotals.clicks / spendTotals.impressions) * 100 : 0;
+        const cpc = spendTotals.clicks > 0 ? spendTotals.spend / spendTotals.clicks : 0;
+        const cpm = spendTotals.impressions > 0 ? (spendTotals.spend / spendTotals.impressions) * 1000 : 0;
+        const roas = spendTotals.spend > 0 ? spendTotals.revenue / spendTotals.spend : 0;
+        const conversion_rate = spendTotals.clicks > 0 ? (spendTotals.conversions / spendTotals.clicks) * 100 : 0;
+        const cost_per_conversion = spendTotals.conversions > 0 ? spendTotals.spend / spendTotals.conversions : 0;
+        const frequency = engagementTotals.reach > 0 ? spendTotals.impressions / engagementTotals.reach : 0;
+
+        const daily = (spendRows || []).map((row: any) => ({
+            date: row.spend_date,
+            spend: String(Number(row.total_spend || 0)),
+        }));
+
+        return res.json({
+            success: true,
+            data: {
+                connected: true,
+                advertiser: {
+                    name: advertiser.advertiser_name,
+                    currency: advertiser.currency,
+                    balance: advertiser.balance || 0,
+                    advertiser_id: advertiser.advertiser_id,
+                    granted_scopes: advertiser.granted_scopes || '',
+                },
+                kpis: {
+                    spend: spendTotals.spend,
+                    gmv_max_spend: 0,
+                    revenue: spendTotals.revenue,
+                    gmv_max_revenue: 0,
+                    roas,
+                    impressions: spendTotals.impressions,
+                    clicks: spendTotals.clicks,
+                    ctr,
+                    cpc,
+                    cpm,
+                    conversions: spendTotals.conversions,
+                    conversion_rate,
+                    cost_per_conversion,
+                    reach: engagementTotals.reach,
+                    frequency,
+                },
+                engagement: {
+                    likes: engagementTotals.likes,
+                    comments: engagementTotals.comments,
+                    shares: engagementTotals.shares,
+                    follows: engagementTotals.follows,
+                    profile_visits: 0,
+                },
+                video: {
+                    video_play_actions: engagementTotals.video_play_actions,
+                    video_watched_2s: engagementTotals.video_watched_2s,
+                    video_watched_6s: engagementTotals.video_watched_6s,
+                    video_views_p25: engagementTotals.video_views_p25,
+                    video_views_p50: engagementTotals.video_views_p50,
+                    video_views_p75: engagementTotals.video_views_p75,
+                    video_views_p100: engagementTotals.video_views_p100,
+                    engaged_view: 0,
+                    retention_2s: engagementTotals.video_play_actions > 0 ? (engagementTotals.video_watched_2s / engagementTotals.video_play_actions) * 100 : 0,
+                    retention_6s: engagementTotals.video_play_actions > 0 ? (engagementTotals.video_watched_6s / engagementTotals.video_play_actions) * 100 : 0,
+                    completion_rate: engagementTotals.video_play_actions > 0 ? (engagementTotals.video_views_p100 / engagementTotals.video_play_actions) * 100 : 0,
+                },
+                campaigns: { active: 0, total: 0 },
+                daily,
+                last_synced: advertiser.last_synced_at,
+                date_range: { start, end },
+                _source: 'db_only',
+            }
+        });
+        }
 
         // ── Fetch shop store IDs (needed for GMV Max API) ──────────────────────
         const { data: shops } = await supabase
@@ -2115,7 +1839,7 @@ router.get('/dashboard/:accountId', async (req, res) => {
             }
         }
 
-        const [standardResult, gmvResult, allCampaignsResp, activeCampaignsResp, advertiserInfoResp] = await Promise.all([
+        const [standardResult, gmvResult, allCampaignsResp, activeCampaignsResp, advertiserInfoResp]: any = await Promise.all([
             // Standard API at ADVERTISER level — one row per day with all metrics aggregated
             (async () => {
                 const allRows: any[] = [];

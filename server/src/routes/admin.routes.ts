@@ -2,6 +2,13 @@ import express from 'express';
 import { createClient } from '@supabase/supabase-js';
 import { adminMiddleware } from '../middleware/admin.middleware.js';
 import { TikTokShopApiService, TikTokShopError } from '../services/tiktok-shop-api.service.js';
+import { auditLog } from '../services/audit-logger.js';
+import {
+    deactivateAgencyLifecycle,
+    deactivateSellerLifecycle,
+    unlinkSellerFromAgencyLifecycle,
+    tenantStatusTriggersLifecycle,
+} from '../services/tenant-lifecycle.service.js';
 import {
     formatShopDateISO,
     getShopDayEndExclusiveTimestamp,
@@ -80,14 +87,17 @@ async function removeUserFromTenantsWithOrphanCleanup(targetUserId: string): Pro
         }
 
         if (tType === 'agency') {
-            const { count: childCount, error: chErr } = await supabase
+            const { data: childSellers, count: childCount, error: chErr } = await supabase
                 .from('tenants')
-                .select('*', { count: 'exact', head: true })
+                .select('id', { count: 'exact' })
                 .eq('parent_tenant_id', tenantId)
                 .eq('type', 'seller');
 
             if (chErr) throw chErr;
             if ((childCount ?? 0) > 0) {
+                for (const child of childSellers || []) {
+                    await unlinkSellerFromAgencyLifecycle(tenantId, (child as any).id);
+                }
                 const { error: delMemErr } = await supabase
                     .from('tenant_memberships')
                     .delete()
@@ -272,6 +282,14 @@ router.delete('/users/:id', async (req, res) => {
             return res.status(400).json({ success: false, error: delAuthErr.message });
         }
 
+        // Audit: permanent user deletion — irreversible
+        auditLog(req, {
+            action: 'admin.user_wipe',
+            resourceType: 'user',
+            resourceId: targetId,
+            metadata: { tenantsDeleted, deletedBy: actorId },
+        }).catch(() => undefined);
+
         res.json({
             success: true,
             data: { deletedUserId: targetId, tenantsDeleted },
@@ -299,12 +317,72 @@ router.post('/users/:id/revoke-memberships', async (req, res) => {
         const { error: wipeErr } = await supabase.from('tenant_memberships').delete().eq('user_id', targetId);
         if (wipeErr) throw wipeErr;
 
+        // Audit: all memberships revoked — permission-sensitive
+        auditLog(req, {
+            action: 'member.remove',
+            resourceType: 'tenant_membership',
+            resourceId: targetId,
+            metadata: { tenantsDeleted, revokedBy: actorId, scope: 'all_memberships' },
+        }).catch(() => undefined);
+
         res.json({
             success: true,
             data: { userId: targetId, tenantsDeleted },
         });
     } catch (error: any) {
         console.error('[Admin API] revoke-memberships error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// POST /api/admin/users/:id/reassign-tenant
+router.post('/users/:id/reassign-tenant', async (req, res) => {
+    try {
+        const targetId = req.params.id;
+        const actorId = getActorId(req);
+        const { targetTenantId, targetRoleName } = req.body ?? {};
+        if (!UUID_RE.test(targetId)) {
+            return res.status(400).json({ success: false, error: 'Invalid user id' });
+        }
+        if (!UUID_RE.test(targetTenantId)) {
+            return res.status(400).json({ success: false, error: 'Valid targetTenantId is required' });
+        }
+        if (!actorId || targetId === actorId) {
+            return res.status(403).json({ success: false, error: 'You cannot transfer your own tenant membership' });
+        }
+        const roleName = String(targetRoleName || '').trim();
+        if (!roleName) {
+            return res.status(400).json({ success: false, error: 'targetRoleName is required' });
+        }
+
+        const { data: membershipId, error } = await supabase.rpc('reassign_user_tenant_for_actor', {
+            p_actor_id: actorId,
+            p_user_id: targetId,
+            p_target_tenant_id: targetTenantId,
+            p_target_role_name: roleName,
+        });
+        if (error) {
+            return res.status(400).json({ success: false, error: error.message });
+        }
+
+        auditLog(req, {
+            action: 'member.reassign_tenant',
+            resourceType: 'tenant_membership',
+            resourceId: targetId,
+            metadata: {
+                targetTenantId,
+                targetRoleName: roleName,
+                membershipId,
+                reassignedBy: actorId,
+            },
+        }).catch(() => undefined);
+
+        return res.json({
+            success: true,
+            data: { userId: targetId, targetTenantId, targetRoleName: roleName, membershipId },
+        });
+    } catch (error: any) {
+        console.error('[Admin API] reassign-tenant error:', error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
@@ -327,6 +405,15 @@ router.post('/users/:id/suspend', async (req, res) => {
         if (error) {
             return res.status(400).json({ success: false, error: error.message });
         }
+
+        auditLog(req, {
+            action: 'admin.user_wipe',
+            resourceType: 'user',
+            resourceId: targetId,
+            afterState: { suspended: true },
+            metadata: { suspendedBy: actorId },
+        }).catch(() => undefined);
+
         res.json({ success: true, data: { userId: targetId, suspended: true } });
     } catch (error: any) {
         console.error('[Admin API] suspend user error:', error);
@@ -538,6 +625,16 @@ router.patch('/tenants/:id', async (req, res) => {
         const { data: row, error: uErr } = await supabase.from('tenants').update(updates).eq('id', id).select().single();
         if (uErr) throw uErr;
 
+        const lifecycle = tenantStatusTriggersLifecycle(
+            (tenant as any).type,
+            (updates.status as string | undefined) ?? null
+        );
+        if (lifecycle.deactivateAgency) {
+            await deactivateAgencyLifecycle(id);
+        } else if (lifecycle.deactivateSeller) {
+            await deactivateSellerLifecycle(id);
+        }
+
         res.json({ success: true, data: row });
     } catch (error: any) {
         console.error('[Admin API] PATCH tenant error:', error);
@@ -564,10 +661,26 @@ router.delete('/tenants/:id', async (req, res) => {
         }
 
         if (tType === 'agency') {
-            const { error: unlinkErr } = await supabase.from('tenants').update({ parent_tenant_id: null }).eq('parent_tenant_id', id);
-            if (unlinkErr) throw unlinkErr;
+            const { data: linkedSellers, error: linkedErr } = await supabase
+                .from('tenants')
+                .select('id')
+                .eq('parent_tenant_id', id)
+                .eq('type', 'seller');
+            if (linkedErr) throw linkedErr;
+
+            for (const seller of linkedSellers || []) {
+                await unlinkSellerFromAgencyLifecycle(id, (seller as any).id);
+            }
             const { error: delErr } = await supabase.from('tenants').delete().eq('id', id);
             if (delErr) throw delErr;
+            auditLog(req, {
+                action: 'admin.tenant_delete',
+                resourceType: 'tenant',
+                resourceId: id,
+                tenantId: id,
+                beforeState: { type: 'agency' },
+                metadata: { unlinkedSellers: true },
+            }).catch(() => undefined);
             return res.json({ success: true, data: { deletedId: id, type: 'agency', unlinkedSellers: true } });
         }
 
@@ -576,6 +689,14 @@ router.delete('/tenants/:id', async (req, res) => {
             if (accErr) throw accErr;
             const { error: delErr } = await supabase.from('tenants').delete().eq('id', id);
             if (delErr) throw delErr;
+            auditLog(req, {
+                action: 'admin.tenant_delete',
+                resourceType: 'tenant',
+                resourceId: id,
+                tenantId: id,
+                beforeState: { type: 'seller' },
+                metadata: { accountsDeleted: true },
+            }).catch(() => undefined);
             return res.json({ success: true, data: { deletedId: id, type: 'seller' } });
         }
 

@@ -24,6 +24,7 @@ export function TimezoneSelector({
 }: TimezoneSelectorProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [search, setSearch] = useState('');
+  const [searchMode, setSearchMode] = useState(false);
   const [saving, setSaving] = useState(false);
   
   // Modal state
@@ -44,24 +45,27 @@ export function TimezoneSelector({
       if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
         setIsOpen(false);
         setSearch('');
+        setSearchMode(false);
       }
     };
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
-  // Auto-focus search on open
+  // Focus search only when user explicitly opens search mode
   useEffect(() => {
-    if (isOpen && searchRef.current && !pendingTimezone) {
-      searchRef.current.focus();
+    if (isOpen && searchMode && searchRef.current && !pendingTimezone) {
+      const t = requestAnimationFrame(() => searchRef.current?.focus());
+      return () => cancelAnimationFrame(t);
     }
-  }, [isOpen, pendingTimezone]);
+  }, [isOpen, searchMode, pendingTimezone]);
 
   const handleSelect = (timezone: string) => {
     if (readOnly) return;
     if (timezone === currentTimezone) {
       setIsOpen(false);
       setSearch('');
+      setSearchMode(false);
       return;
     }
 
@@ -91,6 +95,7 @@ export function TimezoneSelector({
       setPendingTimezone(null);
       setIsOpen(false);
       setSearch('');
+      setSearchMode(false);
     }
   };
   
@@ -135,7 +140,19 @@ export function TimezoneSelector({
       <div className="relative shrink-0 min-w-0" ref={dropdownRef}>
         <button
           type="button"
-          onClick={() => !readOnly && setIsOpen(!isOpen)}
+          aria-haspopup="dialog"
+          aria-expanded={isOpen}
+          onClick={() => {
+            if (readOnly) return;
+            setIsOpen((open) => {
+              const next = !open;
+              if (!next) {
+                setSearch('');
+                setSearchMode(false);
+              }
+              return next;
+            });
+          }}
           disabled={saving || readOnly}
           className={`flex items-center bg-gray-800/60 hover:bg-gray-700/60 border border-gray-700/50 hover:border-gray-600/50 rounded-lg transition-all duration-200 disabled:opacity-50 min-w-0 max-w-full ${
             compact
@@ -156,21 +173,66 @@ export function TimezoneSelector({
         </button>
 
         {isOpen && !pendingTimezone && (
-          <div className="absolute top-full right-0 mt-2 w-80 bg-gray-800 border border-gray-700 rounded-xl shadow-2xl z-50 overflow-hidden">
-            {/* Search */}
-            <div className="p-2 border-b border-gray-700/50">
-              <div className="relative">
-                <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" />
-                <input
-                  ref={searchRef}
-                  type="text"
-                  value={search}
-                  onChange={(e) => setSearch(e.target.value)}
-                  placeholder="Search timezones..."
-                  className="w-full pl-8 pr-3 py-2 bg-gray-900/50 border border-gray-700/50 rounded-lg text-sm text-white placeholder-gray-500 focus:outline-none focus:border-indigo-500/50"
-                />
+          <div
+            className="absolute top-full right-0 mt-2 w-80 bg-gray-800 border border-gray-700 rounded-xl shadow-2xl z-50 overflow-hidden"
+            aria-label="Shop timezone"
+          >
+            <div className="flex items-center justify-between gap-2 px-3 py-2 border-b border-gray-700/50 bg-gray-800/90">
+              <span className="text-xs font-medium text-gray-400 truncate">Select timezone</span>
+              <div className="flex items-center gap-1 shrink-0">
+                <button
+                  type="button"
+                  title={searchMode ? 'Hide search' : 'Search timezones'}
+                  aria-pressed={searchMode}
+                  onClick={() => {
+                    setSearchMode((m) => {
+                      const next = !m;
+                      if (!next) setSearch('');
+                      return next;
+                    });
+                  }}
+                  className={`p-1.5 rounded-lg border transition-colors ${
+                    searchMode
+                      ? 'border-indigo-500/50 bg-indigo-500/15 text-indigo-300'
+                      : 'border-gray-700/80 bg-gray-900/40 text-gray-400 hover:text-white hover:border-gray-600'
+                  }`}
+                >
+                  <Search size={15} />
+                </button>
+                {searchMode && search.trim() !== '' && (
+                  <button
+                    type="button"
+                    title="Clear search"
+                    onClick={() => setSearch('')}
+                    className="p-1.5 rounded-lg border border-gray-700/80 bg-gray-900/40 text-gray-400 hover:text-white hover:border-gray-600"
+                  >
+                    <X size={15} />
+                  </button>
+                )}
               </div>
             </div>
+
+            {searchMode && (
+              <div className="p-2 border-b border-gray-700/50">
+                <div className="relative">
+                  <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500 pointer-events-none" />
+                  <input
+                    ref={searchRef}
+                    type="text"
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Escape') {
+                        setSearch('');
+                        setSearchMode(false);
+                      }
+                    }}
+                    placeholder="Filter by city or region…"
+                    className="w-full pl-8 pr-3 py-2 bg-gray-900/50 border border-gray-700/50 rounded-lg text-sm text-white placeholder-gray-500 focus:outline-none focus:border-indigo-500/50"
+                  />
+                </div>
+              </div>
+            )}
 
             {/* Options */}
             <div className="max-h-72 overflow-y-auto">

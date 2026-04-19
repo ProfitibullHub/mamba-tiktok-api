@@ -6,37 +6,100 @@ import crypto from 'crypto';
 import {
     enforceBodyAccountAccess,
     enforceFinalizeAccountAccess,
+    resolveRequestUserId,
     verifyAccountIdParam,
 } from '../middleware/account-access.middleware.js';
+import { requireAuthorization } from '../middleware/authorize.middleware.js';
+import { auditLog } from '../services/audit-logger.js';
+import { ACTION_TIKTOK_AUTH, FEATURE_TIKTOK_SHOP } from '../constants/tiktok-entitlements.js';
 
 const router = Router();
+const FRONTEND_URL = (process.env.FRONTEND_URL || '').replace(/\/$/, '');
 
 router.param('accountId', verifyAccountIdParam);
+
+async function createOauthState(params: {
+    provider: string;
+    accountId: string;
+    actorUserId: string;
+    returnUrl?: string | null;
+    metadata?: Record<string, unknown>;
+}) {
+    const stateToken = crypto.randomBytes(32).toString('hex');
+    const { error } = await supabase.from('oauth_request_states').insert({
+        state_token: stateToken,
+        provider: params.provider,
+        actor_user_id: params.actorUserId,
+        account_id: params.accountId,
+        return_url: params.returnUrl ?? null,
+        metadata: params.metadata ?? {},
+    });
+    if (error) throw error;
+    return stateToken;
+}
+
+async function consumeOauthState(stateToken: string, provider: string) {
+    const { data, error } = await supabase
+        .from('oauth_request_states')
+        .select('id, account_id, actor_user_id, return_url, expires_at, consumed_at, metadata')
+        .eq('state_token', stateToken)
+        .eq('provider', provider)
+        .maybeSingle();
+
+    if (error) throw error;
+    if (!data) throw new Error('OAuth state not found');
+    if (data.consumed_at) throw new Error('OAuth state already used');
+    if (new Date(data.expires_at).getTime() < Date.now()) throw new Error('OAuth state expired');
+
+    const { error: consumeError } = await supabase
+        .from('oauth_request_states')
+        .update({ consumed_at: new Date().toISOString() })
+        .eq('id', data.id)
+        .is('consumed_at', null);
+
+    if (consumeError) throw consumeError;
+    return data;
+}
 
 /**
  * POST /api/tiktok-shop/auth/start
  * Initiate OAuth flow - generate authorization URL
  */
-router.post('/start', enforceBodyAccountAccess, async (req: Request, res: Response) => {
+router.post(
+    '/start',
+    enforceBodyAccountAccess,
+    requireAuthorization((req) => ({
+        action: ACTION_TIKTOK_AUTH,
+        featureKey: FEATURE_TIKTOK_SHOP,
+        accountId: typeof req.body?.accountId === 'string' ? req.body.accountId : undefined,
+    })),
+    async (req: Request, res: Response) => {
     try {
         const { accountId } = req.body;
+        const actorId = await resolveRequestUserId(req);
 
-        if (!accountId) {
+        if (!accountId || !actorId) {
             return res.status(400).json({
                 success: false,
-                error: 'Account ID is required',
+                error: 'Account ID and authenticated user are required',
             });
         }
 
-        // Generate random state for CSRF protection
-        const state = crypto.randomBytes(32).toString('hex');
+        const stateToken = await createOauthState({
+            provider: 'tiktok_shop',
+            accountId,
+            actorUserId: actorId,
+        });
 
-        // Store state temporarily (you might want to use Redis or session storage in production)
-        // For now, we'll encode accountId in the state
-        const stateData = Buffer.from(JSON.stringify({ accountId, random: state })).toString('base64');
+        const authUrl = tiktokShopApi.generateAuthUrl(stateToken);
 
-        const authUrl = tiktokShopApi.generateAuthUrl(stateData);
-        console.log('Generated Auth URL:', authUrl);
+        // Audit: record that the user initiated a TikTok Shop OAuth flow
+        auditLog(req, {
+            action: 'shop.auth_start',
+            resourceType: 'shop',
+            accountId,
+            metadata: { flow: 'standard' },
+        }).catch(() => undefined);
 
         res.json({
             success: true,
@@ -53,33 +116,42 @@ router.post('/start', enforceBodyAccountAccess, async (req: Request, res: Respon
             error: error.message || 'Internal Server Error',
         });
     }
-});
+    },
+);
 
 /**
  * POST /api/tiktok-shop/auth/partner/start
  * Start the OAuth flow for Partner (Agency)
  */
-router.post('/partner/start', enforceBodyAccountAccess, async (req: Request, res: Response) => {
+router.post(
+    '/partner/start',
+    enforceBodyAccountAccess,
+    requireAuthorization((req) => ({
+        action: ACTION_TIKTOK_AUTH,
+        featureKey: FEATURE_TIKTOK_SHOP,
+        accountId: typeof req.body?.accountId === 'string' ? req.body.accountId : undefined,
+    })),
+    async (req: Request, res: Response) => {
     try {
         const { accountId, accountName } = req.body;
+        const actorId = await resolveRequestUserId(req);
 
-        if (!accountId) {
+        if (!accountId || !actorId) {
             return res.status(400).json({
                 success: false,
-                error: 'Account ID is required',
+                error: 'Account ID and authenticated user are required',
             });
         }
 
-        // Generate state parameter to prevent CSRF and pass context
-        const state = Buffer.from(JSON.stringify({
+        const stateToken = await createOauthState({
+            provider: 'tiktok_shop',
             accountId,
-            accountName,
-            nonce: Math.random().toString(36).substring(7),
-            type: 'partner' // Mark as partner flow
-        })).toString('base64');
+            actorUserId: actorId,
+            metadata: { accountName, type: 'partner' },
+        });
 
         // Generate Partner Authorization URL
-        const authUrl = tiktokShopApi.generateServiceAuthUrl(state);
+        const authUrl = tiktokShopApi.generateServiceAuthUrl(stateToken);
 
         res.json({
             success: true,
@@ -92,7 +164,8 @@ router.post('/partner/start', enforceBodyAccountAccess, async (req: Request, res
             error: error.message,
         });
     }
-});
+    },
+);
 
 /**
  * GET /api/tiktok-shop/auth/callback
@@ -192,33 +265,22 @@ router.get('/callback', async (req: Request, res: Response) => {
             );
         }
 
-        // If state is missing or invalid, redirect to frontend to finalize
-        let accountId: string | null = null;
-        if (state) {
-            try {
-                const stateData = JSON.parse(Buffer.from(state as string, 'base64').toString());
-                accountId = stateData.accountId;
-            } catch (e) {
-                console.warn('Failed to parse state:', e);
-            }
+        if (!state || typeof state !== 'string') {
+            return res.redirect(`${FRONTEND_URL}?tiktok_error=${encodeURIComponent('Authorization failed - missing state')}`);
         }
 
-        if (!accountId) {
-            // Redirect to frontend to let user select account
-            return res.redirect(
-                `${process.env.FRONTEND_URL}?tiktok_code=${code}&action=finalize_auth`
-            );
-        }
+        const oauthState = await consumeOauthState(state, 'tiktok_shop');
+        const accountId = oauthState.account_id as string;
 
         // Process auth code
         await processAuthCode(code as string, accountId);
 
         // Redirect back to frontend with success
-        res.redirect(`${process.env.FRONTEND_URL}?tiktok_connected=true&account_id=${accountId}`);
+        res.redirect(`${FRONTEND_URL}?tiktok_connected=true&account_id=${accountId}`);
     } catch (error: any) {
         console.error('Error in TikTok Shop callback:', error);
         res.redirect(
-            `${process.env.FRONTEND_URL}?tiktok_error=${encodeURIComponent(error.message)}`
+            `${FRONTEND_URL}?tiktok_error=${encodeURIComponent(error.message)}`
         );
     }
 });
@@ -392,7 +454,6 @@ router.delete('/disconnect/:accountId/:shopId', async (req: Request, res: Respon
         }
 
         const { id: internalId, shop_name: shopName } = shop;
-        console.log(`[Disconnect] Removing shop "${shopName}" (${shopId}) — wiping all associated data...`);
 
         // Delete all customer data in parallel, then remove the shop record
         const [ordersResult, productsResult, settlementsResult] = await Promise.all([
@@ -405,8 +466,6 @@ router.delete('/disconnect/:accountId/:shopId', async (req: Request, res: Respon
         if (productsResult.error) console.error(`[Disconnect] Products deletion error:`, productsResult.error);
         if (settlementsResult.error) console.error(`[Disconnect] Settlements deletion error:`, settlementsResult.error);
 
-        console.log(`[Disconnect] Customer data wiped — removing shop record...`);
-
         // Remove the shop record itself (tokens, cipher, etc.)
         const { error: shopDeleteError } = await supabase
             .from('tiktok_shops')
@@ -415,7 +474,15 @@ router.delete('/disconnect/:accountId/:shopId', async (req: Request, res: Respon
 
         if (shopDeleteError) throw shopDeleteError;
 
-        console.log(`[Disconnect] ✅ Shop "${shopName}" and all associated data successfully removed`);
+        // Audit: billing-sensitive — shop data and tokens irrevocably wiped
+        auditLog(req, {
+            action: 'shop.disconnect',
+            resourceType: 'shop',
+            resourceId: shopId,
+            accountId,
+            beforeState: { shop_name: shopName, shop_id: shopId, internal_id: internalId },
+            metadata: { dataWiped: true },
+        }).catch(() => undefined);
 
         res.json({
             success: true,

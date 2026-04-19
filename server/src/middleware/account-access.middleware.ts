@@ -3,6 +3,22 @@ import { supabase } from '../config/supabase.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+export type RequestTenantContext = {
+    userId: string;
+    tenantId: string;
+    tenantType: 'seller' | 'agency';
+    assignedSellerIds: string[];
+};
+
+export async function userIsPlatformSuperAdmin(userId: string): Promise<boolean> {
+    const [{ data: isSa, error: saErr }, { data: profile, error: profileErr }] = await Promise.all([
+        supabase.rpc('user_is_platform_super_admin', { p_user_id: userId }),
+        supabase.from('profiles').select('role').eq('id', userId).maybeSingle(),
+    ]);
+    if (saErr || profileErr) return false;
+    return isSa === true || profile?.role === 'admin';
+}
+
 export async function resolveRequestUserId(req: Request): Promise<string | null> {
     const auth = req.headers.authorization;
     if (!auth?.startsWith('Bearer ')) return null;
@@ -21,6 +37,37 @@ export async function resolveRequestUserId(req: Request): Promise<string | null>
         console.warn('[resolveRequestUserId] getUser failed:', lastError.message);
     }
     return null;
+}
+
+function uniqueIds(values: unknown): string[] {
+    if (!Array.isArray(values)) return [];
+    return [...new Set(values.filter((v): v is string => typeof v === 'string' && UUID_RE.test(v)))];
+}
+
+export async function resolveRequestTenantContext(req: Request): Promise<RequestTenantContext | null> {
+    const userId = await resolveRequestUserId(req);
+    if (!userId) return null;
+
+    const { data, error } = await supabase.rpc('get_request_tenant_context', {
+        p_user_id: userId,
+    });
+
+    if (error) {
+        console.error('[account-access] get_request_tenant_context', error.message);
+        return null;
+    }
+
+    const row = Array.isArray(data) ? data[0] : data;
+    if (!row?.tenant_id || (row.tenant_type !== 'seller' && row.tenant_type !== 'agency')) {
+        return null;
+    }
+
+    return {
+        userId,
+        tenantId: row.tenant_id,
+        tenantType: row.tenant_type,
+        assignedSellerIds: uniqueIds(row.assigned_seller_ids),
+    };
 }
 
 function accountAccessUsesWriteCheck(method: string): boolean {
@@ -63,44 +110,15 @@ function rpcBooleanTrue(data: unknown): boolean {
  * was never migrated, and to avoid strict `data === true` mismatches on some clients.
  */
 async function userCanWriteShopAccount(userId: string, accountId: string): Promise<boolean> {
-    const { data: readOk, error: readErr } = await supabase.rpc('check_user_account_access', {
+    const { data: readOk, error: readErr } = await supabase.rpc('check_user_account_write_access', {
         p_account_id: accountId,
         p_user_id: userId,
     });
     if (readErr) {
-        console.error('[account-access] check_user_account_access (write path)', readErr.message);
+        console.error('[account-access] check_user_account_write_access', readErr.message);
         return false;
     }
-    if (!rpcBooleanTrue(readOk)) return false;
-
-    const { data: acc, error: accErr } = await supabase
-        .from('accounts')
-        .select('tenant_id')
-        .eq('id', accountId)
-        .maybeSingle();
-    if (accErr) {
-        console.error('[account-access] accounts lookup (write path)', accErr.message);
-        return false;
-    }
-    if (!acc?.tenant_id) return false;
-
-    const { data: tm, error: tmErr } = await supabase
-        .from('tenant_memberships')
-        .select('roles!inner(name)')
-        .eq('tenant_id', acc.tenant_id)
-        .eq('user_id', userId)
-        .eq('status', 'active')
-        .maybeSingle();
-
-    if (tmErr) {
-        console.error('[account-access] tenant_memberships (write path)', tmErr.message);
-        return false;
-    }
-    if (!tm) return true;
-
-    const roleName = (tm as { roles?: { name?: string } | null }).roles?.name;
-    if (roleName === 'Seller User') return false;
-    return true;
+    return rpcBooleanTrue(readOk);
 }
 
 export async function userCanAccessAccount(
@@ -109,6 +127,11 @@ export async function userCanAccessAccount(
     method: string = 'GET',
     req?: Pick<Request, 'method' | 'baseUrl' | 'path'>
 ): Promise<boolean> {
+    // Platform super admins can view/manage all accounts irrespective of tenant-local membership.
+    if (await userIsPlatformSuperAdmin(userId)) {
+        return true;
+    }
+
     const m = method.toUpperCase();
     if (accountAccessUsesWriteCheck(m) && !(req && isShopOrAdsSyncPostRequest(req))) {
         return userCanWriteShopAccount(userId, accountId);
@@ -138,13 +161,13 @@ export async function enforceRequestAccountAccess(req: Request, res: Response, n
     }
 
     try {
-        const userId = await resolveRequestUserId(req);
-        if (!userId) {
+        const ctx = await resolveRequestTenantContext(req);
+        if (!ctx) {
             res.status(401).json({ success: false, error: 'Authorization required' });
             return;
         }
         for (const accountId of ids) {
-            const ok = await userCanAccessAccount(userId, accountId, req.method, req);
+            const ok = await userCanAccessAccount(ctx.userId, accountId, req.method, req);
             if (!ok) {
                 res.status(403).json({
                     success: false,
@@ -169,12 +192,12 @@ export function verifyAccountIdParam(req: Request, res: Response, next: NextFunc
                 next();
                 return;
             }
-            const userId = await resolveRequestUserId(req);
-            if (!userId) {
+            const ctx = await resolveRequestTenantContext(req);
+            if (!ctx) {
                 res.status(401).json({ success: false, error: 'Authorization required' });
                 return;
             }
-            const ok = await userCanAccessAccount(userId, accountId, req.method, req);
+            const ok = await userCanAccessAccount(ctx.userId, accountId, req.method, req);
             if (!ok) {
                 res.status(403).json({
                     success: false,
@@ -199,12 +222,12 @@ export async function enforceBodyAccountAccess(req: Request, res: Response, next
             res.status(400).json({ success: false, error: 'Valid accountId is required' });
             return;
         }
-        const userId = await resolveRequestUserId(req);
-        if (!userId) {
+        const ctx = await resolveRequestTenantContext(req);
+        if (!ctx) {
             res.status(401).json({ success: false, error: 'Authorization required' });
             return;
         }
-        const ok = await userCanAccessAccount(userId, accountId, req.method, req);
+        const ok = await userCanAccessAccount(ctx.userId, accountId, req.method, req);
         if (!ok) {
             res.status(403).json({
                 success: false,

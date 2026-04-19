@@ -3,10 +3,96 @@ import { calculateOrderGMV } from '../utils/gmvCalculations';
 import { DEFAULT_SYNC_DAYS, getInitialLoadDaysWithBuffer, DEFAULT_LOAD_DAYS } from '../config/dataRetention';
 import { supabase, AffiliateSettlement, AgencyFee } from '../lib/supabase';
 import { getAccessTokenForApi } from '../lib/apiClient';
+import { reportClientError } from '../lib/observability';
 import { getUtcCalendarRangeExclusiveUnix, nextCalendarDayISO, previousCalendarDayISO } from '../utils/dateUtils';
 import { mapDbOrderToStore } from '../utils/mapDbOrderToStore';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001';
+
+async function sleep(ms: number): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+type SyncJobProgress = {
+    phase?: 'orders' | 'products' | 'settlements' | 'performance' | 'complete';
+    processed?: number;
+    total?: number;
+    note?: string;
+};
+
+async function enqueueAndWaitSync(
+    accountId: string,
+    body: Record<string, unknown>,
+    onProgress?: (progress: SyncJobProgress) => void,
+    signal?: AbortSignal
+): Promise<any> {
+    const enqueueResp = await shopApi(`${API_BASE_URL}/api/tiktok-shop/sync/${accountId}`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+        signal,
+    });
+    const enqueueJson = await enqueueResp.json();
+    if (!enqueueJson.success || !enqueueJson.jobId) {
+        throw new Error(enqueueJson.error || 'Failed to enqueue sync job');
+    }
+
+    // Trigger worker immediately in interactive flows (cron still runs independently in production).
+    await shopApi(`${API_BASE_URL}/api/tiktok-shop/sync/run-worker?limit=1`, {
+        method: 'POST',
+        signal,
+    }).catch(() => undefined);
+
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < 180_000) {
+        if (signal?.aborted) {
+            throw new DOMException('Sync polling aborted', 'AbortError');
+        }
+
+        const statusResp = await shopApi(`${API_BASE_URL}/api/tiktok-shop/sync/job/${enqueueJson.jobId}`, { signal });
+        const statusJson = await statusResp.json();
+        if (!statusJson.success) {
+            void reportClientError({
+                event: 'shop.sync_job_status_failed',
+                message: statusJson.error || 'Failed to fetch job status',
+                route: '/api/tiktok-shop/sync/job/:jobId',
+                source: 'useShopStore.enqueueAndWaitSync',
+                accountId,
+                metadata: {
+                    jobId: enqueueJson.jobId,
+                    httpStatus: statusResp.status,
+                },
+            });
+            throw new Error(statusJson.error || 'Failed to fetch job status');
+        }
+        if (statusJson.progress && onProgress) {
+            onProgress(statusJson.progress as SyncJobProgress);
+        }
+
+        const status = statusJson.job?.status;
+        if (status === 'succeeded') {
+            return statusJson.lastAttempt?.result || { success: true };
+        }
+        if (status === 'dead_letter' || status === 'failed') {
+            const err = statusJson.job?.last_error || statusJson.lastAttempt?.error || 'Sync job failed';
+            throw new Error(err);
+        }
+
+        await sleep(1200);
+    }
+
+    void reportClientError({
+        event: 'shop.sync_job_timeout',
+        message: 'Sync job timeout. Background job still running.',
+        route: '/api/tiktok-shop/sync/job/:jobId',
+        source: 'useShopStore.enqueueAndWaitSync',
+        accountId,
+        metadata: {
+            timeoutMs: 180000,
+            jobId: enqueueJson.jobId,
+        },
+    });
+    throw new Error('Sync job timeout. Background job still running.');
+}
 
 /** If fetchShopData runs while another fetch is in flight, keep the latest args and run after the current completes (avoids dropped Overview requests). */
 let pendingShopDataRequest: {
@@ -244,8 +330,11 @@ interface SyncProgress {
     productsComplete: boolean;
     settlementsComplete: boolean;
     ordersFetched: number;
+    ordersTotal?: number;
     productsFetched: number;
+    productsTotal?: number;
     settlementsFetched: number;
+    settlementsTotal?: number;
 }
 
 export interface Warehouse {
@@ -542,8 +631,11 @@ export const useShopStore = create<ShopState>((set, get) => ({
         productsComplete: false,
         settlementsComplete: false,
         ordersFetched: 0,
+        ordersTotal: undefined,
         productsFetched: 0,
-        settlementsFetched: 0
+        productsTotal: undefined,
+        settlementsFetched: 0,
+        settlementsTotal: undefined,
     },
     plData: null,
     plDataKey: '',
@@ -1087,11 +1179,12 @@ export const useShopStore = create<ShopState>((set, get) => ({
 
                         try {
                             // Sync from TikTok for this specific date range
-                            const syncResp = await shopApi(`${API_BASE_URL}/api/tiktok-shop/sync/${accountId}`, {
-                                method: 'POST',
-                                body: JSON.stringify({ shopId, syncType: 'orders', startDate: fetchStartDate, endDate: fetchEndDate })
-                            });
-                            const syncResult = await syncResp.json();
+                            const syncResult = await enqueueAndWaitSync(accountId, {
+                                shopId,
+                                syncType: 'orders',
+                                startDate: fetchStartDate,
+                                endDate: fetchEndDate
+                            }, undefined);
                             const fetched = syncResult.stats?.orders?.fetched || 0;
                             console.log(`[Store] Historical sync complete: ${fetched} orders fetched from TikTok`);
 
@@ -1593,8 +1686,11 @@ export const useShopStore = create<ShopState>((set, get) => ({
                 productsComplete: !syncProducts,
                 settlementsComplete: !syncSettlements,
                 ordersFetched: 0,
+                ordersTotal: undefined,
                 productsFetched: 0,
-                settlementsFetched: 0
+                productsTotal: undefined,
+                settlementsFetched: 0,
+                settlementsTotal: undefined,
             }
         });
 
@@ -1611,52 +1707,71 @@ export const useShopStore = create<ShopState>((set, get) => ({
             set({ syncAbortController: controller });
             const signal = controller.signal;
 
-            // --- Parallel Sync: Orders + Products + Settlements fire simultaneously ---
-            console.log('[Sync] Starting parallel sync...');
+            // Single queued sync job (all phases) to avoid duplicate queue churn.
+            console.log('[Sync] Starting unified sync job...');
 
-            const syncFetch = (type: string) =>
-                shopApi(`${API_BASE_URL}/api/tiktok-shop/sync/${accountId}`, {
-                    method: 'POST',
-                    body: JSON.stringify({ shopId, syncType: type, forceFullSync }),
-                    signal
-                }).then(r => r.json());
+            const unified = await enqueueAndWaitSync(
+                accountId,
+                {
+                    shopId,
+                    syncType: 'all',
+                    forceFullSync,
+                },
+                (progress) => {
+                    const processed = Number(progress.processed || 0);
+                    const total = typeof progress.total === 'number' && progress.total > 0 ? progress.total : undefined;
+                    const phase = progress.phase || 'orders';
+                    const currentStep: 'orders' | 'products' | 'settlements' | 'complete' =
+                        phase === 'products'
+                            ? 'products'
+                            : phase === 'settlements' || phase === 'performance'
+                                ? 'settlements'
+                                : phase === 'complete'
+                                    ? 'complete'
+                                    : 'orders';
 
-            // Fire all enabled fetches in parallel; each .then() merges + updates progress immediately
-            const ordersFetch = syncOrders
-                ? syncFetch('orders').then((data: any) => {
-                    const fetched = data.stats?.orders?.fetched || 0;
-                    const syncedOrders = data.stats?.orders?.syncedOrders || [];
-                    console.log(`[Sync] Orders done (${fetched} fetched)`);
-                    if (syncedOrders.length > 0) get().mergeSyncedOrdersIntoStore(syncedOrders, shopId);
-                    set(s => ({ syncProgress: { ...s.syncProgress, ordersComplete: true, ordersFetched: fetched } }));
-                    ordersData = data;
-                }).catch((e: any) => { if (e.name === 'AbortError') throw e; console.error('[Sync] Orders failed:', e.message); })
-                : Promise.resolve();
+                    set((s) => ({
+                        syncProgress: {
+                            ...s.syncProgress,
+                            currentStep,
+                            message: progress.note || (total
+                                ? `${phase[0].toUpperCase()}${phase.slice(1)} ${Math.min(processed, total)}/${total}`
+                                : `${phase[0].toUpperCase()}${phase.slice(1)} ${processed}`),
+                            ordersFetched: phase === 'orders' ? processed : s.syncProgress.ordersFetched,
+                            ordersTotal: phase === 'orders' ? total : s.syncProgress.ordersTotal,
+                            productsFetched: phase === 'products' ? processed : s.syncProgress.productsFetched,
+                            productsTotal: phase === 'products' ? total : s.syncProgress.productsTotal,
+                            settlementsFetched: phase === 'settlements' ? processed : s.syncProgress.settlementsFetched,
+                            settlementsTotal: phase === 'settlements' ? total : s.syncProgress.settlementsTotal,
+                        },
+                    }));
+                },
+                signal,
+            );
 
-            const productsFetch = syncProducts
-                ? syncFetch('products').then((data: any) => {
-                    const fetched = data.stats?.products?.fetched || 0;
-                    const syncedProducts = data.stats?.products?.syncedProducts || [];
-                    console.log(`[Sync] Products done (${fetched} fetched)`);
-                    if (syncedProducts.length > 0) get().mergeSyncedProductsIntoStore(syncedProducts, shopId);
-                    set(s => ({ syncProgress: { ...s.syncProgress, productsComplete: true, productsFetched: fetched } }));
-                    productsData = data;
-                }).catch((e: any) => { if (e.name === 'AbortError') throw e; console.error('[Sync] Products failed:', e.message); })
-                : Promise.resolve();
+            ordersData = { stats: { orders: unified?.stats?.orders || { fetched: 0 } }, isFirstSync: unified?.isFirstSync };
+            productsData = { stats: { products: unified?.stats?.products || { fetched: 0 } } };
+            settlementsData = { stats: { settlements: unified?.stats?.settlements || { fetched: 0 } } };
 
-            const settlementsFetch = syncSettlements
-                ? syncFetch('settlements').then((data: any) => {
-                    const fetched = data.stats?.settlements?.fetched || 0;
-                    const syncedSettlements = data.stats?.settlements?.syncedSettlements || [];
-                    console.log(`[Sync] Settlements done (${fetched} fetched)`);
-                    if (syncedSettlements.length > 0) get().mergeSyncedSettlementsIntoStore(syncedSettlements, shopId);
-                    set(s => ({ syncProgress: { ...s.syncProgress, settlementsComplete: true, settlementsFetched: fetched } }));
-                    settlementsData = data;
-                }).catch((e: any) => { if (e.name === 'AbortError') throw e; console.error('[Sync] Settlements failed:', e.message); })
-                : Promise.resolve();
+            const syncedOrders = unified?.stats?.orders?.syncedOrders || [];
+            const syncedProducts = unified?.stats?.products?.syncedProducts || [];
+            const syncedSettlements = unified?.stats?.settlements?.syncedSettlements || [];
 
-            // Wait for all 3 to complete
-            await Promise.all([ordersFetch, productsFetch, settlementsFetch]);
+            if (syncedOrders.length > 0) get().mergeSyncedOrdersIntoStore(syncedOrders, shopId);
+            if (syncedProducts.length > 0) get().mergeSyncedProductsIntoStore(syncedProducts, shopId);
+            if (syncedSettlements.length > 0) get().mergeSyncedSettlementsIntoStore(syncedSettlements, shopId);
+
+            set((st) => ({
+                syncProgress: {
+                    ...st.syncProgress,
+                    ordersComplete: true,
+                    productsComplete: true,
+                    settlementsComplete: true,
+                    ordersFetched: ordersData.stats?.orders?.fetched || st.syncProgress.ordersFetched,
+                    productsFetched: productsData.stats?.products?.fetched || st.syncProgress.productsFetched,
+                    settlementsFetched: settlementsData.stats?.settlements?.fetched || st.syncProgress.settlementsFetched,
+                },
+            }));
 
             if (!get().syncProgress.isActive) return; // Stop if cancelled
 
@@ -1687,7 +1802,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
                     syncProgress: {
                         ...s.syncProgress,
                         currentStep: 'complete',
-                        message: 'Sync complete!'
+                        message: 'Sync complete!',
                     },
                     cacheMetadata: {
                         ...s.cacheMetadata,
@@ -1730,7 +1845,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
                 syncProgress: {
                     ...get().syncProgress,
                     isActive: false,
-                    message: `Sync failed: ${error.message}`
+                    message: `Sync failed: ${error.message}`,
                 }
             });
             throw error;
@@ -1760,8 +1875,11 @@ export const useShopStore = create<ShopState>((set, get) => ({
                 productsComplete: false,
                 settlementsComplete: false,
                 ordersFetched: 0,
+                ordersTotal: undefined,
                 productsFetched: 0,
-                settlementsFetched: 0
+                productsTotal: undefined,
+                settlementsFetched: 0,
+                settlementsTotal: undefined,
             },
             cacheMetadata: {
                 ...get().cacheMetadata,
@@ -1861,12 +1979,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
             // Step 3: Sync each stale type sequentially and merge silently
             if (syncOrders && get().autoSyncInProgress.length > 0) {
                 try {
-                    const resp = await shopApi(`${API_BASE_URL}/api/tiktok-shop/sync/${accountId}`, {
-                        method: 'POST',
-                        body: JSON.stringify({ shopId, syncType: 'orders' }),
-                        signal
-                    });
-                    const data = await resp.json();
+                    const data = await enqueueAndWaitSync(accountId, { shopId, syncType: 'orders' }, undefined, signal);
                     const fetched = data.stats?.orders?.fetched || 0;
                     const upserted = data.stats?.orders?.upserted || 0;
                     const syncedOrders = data.stats?.orders?.syncedOrders || [];
@@ -1885,12 +1998,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
 
             if (syncProducts && get().autoSyncInProgress.length > 0) {
                 try {
-                    const resp = await shopApi(`${API_BASE_URL}/api/tiktok-shop/sync/${accountId}`, {
-                        method: 'POST',
-                        body: JSON.stringify({ shopId, syncType: 'products' }),
-                        signal
-                    });
-                    const data = await resp.json();
+                    const data = await enqueueAndWaitSync(accountId, { shopId, syncType: 'products' }, undefined, signal);
                     const syncedProducts = data.stats?.products?.syncedProducts || [];
                     console.log(`[AutoSync] Products synced (${data.stats?.products?.fetched || 0} fetched, ${syncedProducts.length} returned for merge)`);
 
@@ -1904,12 +2012,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
 
             if (syncSettlements && get().autoSyncInProgress.length > 0) {
                 try {
-                    const resp = await shopApi(`${API_BASE_URL}/api/tiktok-shop/sync/${accountId}`, {
-                        method: 'POST',
-                        body: JSON.stringify({ shopId, syncType: 'settlements' }),
-                        signal
-                    });
-                    const data = await resp.json();
+                    const data = await enqueueAndWaitSync(accountId, { shopId, syncType: 'settlements' }, undefined, signal);
                     const syncedSettlements = data.stats?.settlements?.syncedSettlements || [];
                     console.log(`[AutoSync] Settlements synced (${data.stats?.settlements?.fetched || 0} fetched, ${syncedSettlements.length} returned for merge)`);
 

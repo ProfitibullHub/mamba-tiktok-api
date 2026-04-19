@@ -1,6 +1,13 @@
 import express from 'express';
 import { supabase } from '../config/supabase.js';
 import { resolveRequestUserId } from '../middleware/account-access.middleware.js';
+import { sendHtmlEmail } from '../services/email.js';
+import {
+    deactivateAgencyLifecycle,
+    tenantStatusTriggersLifecycle,
+    unlinkSellerFromAgencyLifecycle,
+} from '../services/tenant-lifecycle.service.js';
+import { auditLog } from '../services/audit-logger.js';
 
 const router = express.Router();
 
@@ -8,14 +15,11 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
 
 /**
  * Send an invitation email with an accept link.
- * Uses Resend API if RESEND_API_KEY is set; otherwise logs to console
- * (in production you should configure RESEND_API_KEY or swap for any email provider).
+ * Uses Resend when RESEND_API_KEY is set; otherwise logs the accept URL for local dev.
  */
 async function sendInvitationEmail(toEmail: string, acceptUrl: string): Promise<void> {
-    const resendKey = process.env.RESEND_API_KEY;
-    const fromEmail = process.env.INVITE_FROM_EMAIL || 'noreply@mamba.app';
-
     const subject = 'You have been invited to join a team on Mamba';
+    const from = process.env.INVITE_FROM_EMAIL || 'noreply@mamba.app';
     const html = `
         <div style="font-family:Inter,sans-serif;max-width:480px;margin:0 auto;padding:24px;">
             <h2 style="color:#fff;margin-bottom:8px;">You're invited! 🎉</h2>
@@ -33,26 +37,12 @@ async function sendInvitationEmail(toEmail: string, acceptUrl: string): Promise<
             </p>
         </div>`;
 
-    if (resendKey) {
-        const resp = await fetch('https://api.resend.com/emails', {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${resendKey}`,
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({ from: fromEmail, to: toEmail, subject, html }),
-        });
-        if (!resp.ok) {
-            const err = await resp.text().catch(() => 'unknown error');
-            throw new Error(`Resend API error: ${err}`);
-        }
-        return;
+    const { delivered } = await sendHtmlEmail(toEmail, subject, html, { from });
+    if (!delivered) {
+        console.log(`[team] invitation email (no RESEND_API_KEY set):`);
+        console.log(`  To: ${toEmail}`);
+        console.log(`  Accept URL: ${acceptUrl}`);
     }
-
-    // Fallback: log the accept link so developers can test locally
-    console.log(`[team] invitation email (no RESEND_API_KEY set):`);
-    console.log(`  To: ${toEmail}`);
-    console.log(`  Accept URL: ${acceptUrl}`);
 }
 
 function sanitizeIlikeQuery(q: string): string {
@@ -238,11 +228,18 @@ router.post('/invite-member', async (req, res) => {
         // Block assigning tenant roles to platform admins or Super Admins
         const { data: targetProfile } = await supabase
             .from('profiles')
-            .select('role')
+            .select('role, tenant_id')
             .eq('id', targetUserId)
             .maybeSingle();
         if (targetProfile?.role === 'admin') {
             res.status(400).json({ success: false, error: 'Platform admins cannot be assigned tenant roles' });
+            return;
+        }
+        if (targetProfile?.tenant_id && targetProfile.tenant_id !== tenantId) {
+            res.status(400).json({
+                success: false,
+                error: 'This user already belongs to a different tenant. Phase 2 users may belong to exactly one tenant.',
+            });
             return;
         }
         const { data: isSuperAdmin } = await supabase.rpc('user_is_platform_super_admin', {
@@ -494,6 +491,18 @@ router.post('/accept-seller-link', async (req, res) => {
             res.status(400).json({ success: false, error: error.message });
             return;
         }
+        auditLog(req, {
+            action: 'tenant.link_created',
+            resourceType: 'tenant_link',
+            resourceId: String(token),
+            tenantId: data?.agency_tenant_id ?? null,
+            metadata: {
+                agencyTenantId: data?.agency_tenant_id ?? null,
+                sellerTenantId: data?.seller_tenant_id ?? null,
+                acceptedBy: actorId,
+            },
+        }).catch(() => undefined);
+
         res.json({ success: true, data });
     } catch (e: any) {
         console.error('[team] accept-seller-link', e);
@@ -529,6 +538,67 @@ router.post('/decline-seller-link', async (req, res) => {
         res.json({ success: true });
     } catch (e: any) {
         console.error('[team] decline-seller-link', e);
+        res.status(500).json({ success: false, error: e.message || 'Internal error' });
+    }
+});
+
+router.post('/unlink-seller', async (req, res) => {
+    try {
+        const actorId = await resolveRequestUserId(req);
+        if (!actorId) {
+            res.status(401).json({ success: false, error: 'Authorization required' });
+            return;
+        }
+
+        const { agencyTenantId, sellerTenantId } = req.body ?? {};
+        if (!UUID_RE.test(agencyTenantId) || !UUID_RE.test(sellerTenantId)) {
+            res.status(400).json({ success: false, error: 'Valid agencyTenantId and sellerTenantId are required' });
+            return;
+        }
+
+        let allowed = false;
+        const { data: isAgencyAdmin } = await supabase.rpc('user_is_agency_admin', {
+            p_agency_tenant_id: agencyTenantId,
+            p_user_id: actorId,
+        });
+        if (isAgencyAdmin === true) allowed = true;
+
+        if (!allowed) {
+            const { data: isSellerAdmin } = await supabase.rpc('user_can_manage_tenant_members', {
+                p_tenant_id: sellerTenantId,
+                p_actor_id: actorId,
+            });
+            if (isSellerAdmin === true) allowed = true;
+        }
+
+        if (!allowed) {
+            const { data: profile } = await supabase.from('profiles').select('role').eq('id', actorId).maybeSingle();
+            if (profile?.role === 'admin') allowed = true;
+        }
+
+        if (!allowed) {
+            res.status(403).json({ success: false, error: 'Agency Admin, Seller Admin, or Super Admin access required' });
+            return;
+        }
+
+        await unlinkSellerFromAgencyLifecycle(agencyTenantId, sellerTenantId);
+
+        auditLog(req, {
+            action: 'tenant.link_revoked',
+            resourceType: 'tenant_link',
+            resourceId: `${agencyTenantId}:${sellerTenantId}`,
+            tenantId: agencyTenantId,
+            metadata: {
+                agencyTenantId,
+                sellerTenantId,
+                revokedBy: actorId,
+                source: 'team.unlink-seller',
+            },
+        }).catch(() => undefined);
+
+        res.json({ success: true });
+    } catch (e: any) {
+        console.error('[team] unlink-seller', e);
         res.status(500).json({ success: false, error: e.message || 'Internal error' });
     }
 });
@@ -620,6 +690,11 @@ router.patch('/agency-tenant/:tenantId', async (req, res) => {
 
         const { data: row, error: uErr } = await supabase.from('tenants').update(updates).eq('id', tenantId).select().single();
         if (uErr) throw uErr;
+
+        const lifecycle = tenantStatusTriggersLifecycle('agency', (updates.status as string | undefined) ?? null);
+        if (lifecycle.deactivateAgency) {
+            await deactivateAgencyLifecycle(tenantId);
+        }
 
         res.json({ success: true, data: row });
     } catch (e: any) {

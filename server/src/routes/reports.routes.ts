@@ -1,7 +1,10 @@
 import express from 'express';
 import { supabase } from '../config/supabase.js';
-import { resolveRequestUserId, userCanAccessAccount } from '../middleware/account-access.middleware.js';
+import { resolveRequestUserId } from '../middleware/account-access.middleware.js';
 import { sendHtmlEmail } from '../services/email.js';
+import { auditLog } from '../services/audit-logger.js';
+import { authorize } from '../services/authorization.service.js';
+import { applyFinancialFieldFiltering, getFinancialFieldAccess } from '../services/financial-visibility.service.js';
 import { calculateOrderGMV } from '../utils/gmvCalculations.js';
 import { isCancelledOrRefunded } from '../utils/orderFinancials.js';
 import {
@@ -14,7 +17,10 @@ import {
 const router = express.Router();
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-const PERM = 'dashboard.export_email';
+const EXPORT_PERMISSION = 'export_pnl';
+const EXPORT_FEATURE = 'export_pnl';
+const SCHEDULE_PERMISSION = 'schedule_export';
+const SCHEDULE_FEATURE = 'schedule_export';
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/i;
 
 type ShopOrderRow = {
@@ -50,23 +56,30 @@ function escapeHtml(s: string): string {
         .replace(/"/g, '&quot;');
 }
 
-async function assertCanExportDashboard(userId: string, accountId: string): Promise<boolean> {
-    const { data: okAccess, error: e1 } = await supabase.rpc('check_user_account_access', {
-        p_account_id: accountId,
-        p_user_id: userId,
-    });
-    if (e1 || !okAccess) return false;
+async function getSellerTenantIdForAccount(accountId: string): Promise<string | null> {
+    const { data, error } = await supabase
+        .from('accounts')
+        .select('tenant_id')
+        .eq('id', accountId)
+        .maybeSingle();
+    if (error || !data?.tenant_id) return null;
+    return data.tenant_id as string;
+}
 
-    const { data: okPerm, error: e2 } = await supabase.rpc('user_has_permission_for_account', {
-        p_user_id: userId,
-        p_account_id: accountId,
-        p_permission_action: PERM,
+async function assertCanExportDashboard(req: express.Request, accountId: string): Promise<{ ok: boolean; userId: string | null; reason?: string }> {
+    const userId = await resolveRequestUserId(req);
+    if (!userId) return { ok: false, userId: null, reason: 'Authorization required' };
+
+    const exportAuth = await authorize(req, {
+        action: EXPORT_PERMISSION,
+        accountId,
+        featureKey: EXPORT_FEATURE,
+        denyAction: 'export.permission_denied',
     });
-    if (e2) {
-        console.error('[reports] user_has_permission_for_account', e2.message);
-        return false;
+    if (!exportAuth.allowed) {
+        return { ok: false, userId, reason: exportAuth.reason };
     }
-    return okPerm === true;
+    return { ok: true, userId };
 }
 
 /**
@@ -295,12 +308,6 @@ function buildPlSectionHtml(pl: PlSummary): string {
  */
 router.post('/email-dashboard', async (req, res) => {
     try {
-        const userId = await resolveRequestUserId(req);
-        if (!userId) {
-            res.status(401).json({ success: false, error: 'Authorization required' });
-            return;
-        }
-
         const body = req.body as Record<string, unknown> | undefined;
         const { accountId, shopId, startDate, endDate, to, timezone: tzBody } = body ?? {};
         const toEmail = typeof to === 'string' ? to.trim() : '';
@@ -337,14 +344,15 @@ router.post('/email-dashboard', async (req, res) => {
             return;
         }
 
-        const can = await assertCanExportDashboard(userId, accountId as string);
-        if (!can) {
+        const can = await assertCanExportDashboard(req, accountId as string);
+        if (!can.ok || !can.userId) {
             res.status(403).json({
                 success: false,
-                error: 'You do not have permission to email dashboard exports for this account',
+                error: can.reason || 'You do not have permission to email dashboard exports for this account',
             });
             return;
         }
+        const userId = can.userId;
 
         const shop = await resolveTiktokShopForAccount(accountId as string, shopKey);
         if (!shop) {
@@ -388,7 +396,40 @@ router.post('/email-dashboard', async (req, res) => {
         }
 
         if (needsPl && plParsed) {
-            parts.push(buildPlSectionHtml(plParsed));
+            const sellerTenantId = await getSellerTenantIdForAccount(accountId as string);
+            if (sellerTenantId) {
+                const fieldAccess = await getFinancialFieldAccess(userId, sellerTenantId);
+                const filtered = applyFinancialFieldFiltering(
+                    {
+                        gmv: plParsed.gmv,
+                        totalOrders: plParsed.totalOrders,
+                        totalRevenue: plParsed.totalRevenue,
+                        netSales: plParsed.netSales,
+                        grossProfit: plParsed.grossProfit,
+                        netProfit: plParsed.netProfit,
+                        adSpend: plParsed.adSpend,
+                        margin: plParsed.totalRevenue !== 0 ? (plParsed.netProfit / plParsed.totalRevenue) * 100 : 0,
+                    },
+                    fieldAccess
+                ) as Record<string, unknown>;
+                const nextSummary: PlSummary = {
+                    gmv: Number(filtered.gmv ?? plParsed.gmv),
+                    totalOrders: Number(filtered.totalOrders ?? plParsed.totalOrders),
+                    totalRevenue: Number(filtered.totalRevenue ?? plParsed.totalRevenue),
+                    netSales: Number(filtered.netSales ?? plParsed.netSales),
+                    grossProfit: Number(filtered.grossProfit ?? plParsed.grossProfit),
+                    netProfit: Number(filtered.netProfit ?? plParsed.netProfit),
+                    adSpend: typeof filtered.adSpend === 'number' ? filtered.adSpend : undefined,
+                };
+                parts.push(buildPlSectionHtml(nextSummary));
+                if (typeof filtered.restriction_notice === 'string') {
+                    parts.push(
+                        `<p style="margin-top:8px;font-size:12px;color:#facc15;">${escapeHtml(filtered.restriction_notice)}</p>`
+                    );
+                }
+            } else {
+                parts.push(buildPlSectionHtml(plParsed));
+            }
         }
 
         const footer =
@@ -409,6 +450,22 @@ router.post('/email-dashboard', async (req, res) => {
         const subject = `Mamba ${typeLabel}: ${account.name || 'Shop'} (${periodLabel})`;
         const { delivered } = await sendHtmlEmail(toEmail, subject, html);
 
+        // Audit: record data export event (who sent what data to whom)
+        auditLog(req, {
+            action: 'export.dashboard_email',
+            resourceType: 'account',
+            resourceId: accountId as string,
+            accountId: accountId as string,
+            metadata: {
+                shopId: internalShopId,
+                to: toEmail,
+                reportTypes,
+                startDate,
+                endDate,
+                delivered,
+            },
+        }).catch(() => undefined);
+
         res.json({
             success: true,
             data: {
@@ -428,12 +485,6 @@ router.post('/email-dashboard', async (req, res) => {
 /** POST /api/reports/schedules — daily automated digest at hour_utc. */
 router.post('/schedules', async (req, res) => {
     try {
-        const userId = await resolveRequestUserId(req);
-        if (!userId) {
-            res.status(401).json({ success: false, error: 'Authorization required' });
-            return;
-        }
-
         const { accountId, shopId, recipientEmail, timezone, hourUtc } = req.body ?? {};
         const email = typeof recipientEmail === 'string' ? recipientEmail.trim() : '';
         const shopKey = typeof shopId === 'string' ? shopId.trim() : '';
@@ -448,9 +499,21 @@ router.post('/schedules', async (req, res) => {
             return;
         }
 
-        const can = await assertCanExportDashboard(userId, accountId);
-        if (!can) {
-            res.status(403).json({ success: false, error: 'Permission denied for this account' });
+        const canExport = await assertCanExportDashboard(req, accountId);
+        if (!canExport.ok || !canExport.userId) {
+            res.status(403).json({ success: false, error: canExport.reason || 'Permission denied for this account' });
+            return;
+        }
+        const userId = canExport.userId;
+
+        const canSchedule = await authorize(req, {
+            action: SCHEDULE_PERMISSION,
+            accountId,
+            featureKey: SCHEDULE_FEATURE,
+            denyAction: 'export.schedule_permission_denied',
+        });
+        if (!canSchedule.allowed) {
+            res.status(canSchedule.status).json({ success: false, error: canSchedule.reason });
             return;
         }
 
@@ -585,14 +648,33 @@ router.get('/cron-dashboard-digests', async (req, res) => {
             const shopId = row.shop_id as string;
 
             const stillOk =
-                (await userCanAccessAccount(ownerId, accountId, 'GET')) &&
                 (await (async () => {
-                    const { data: p } = await supabase.rpc('user_has_permission_for_account', {
+                    const { data: accountOk } = await supabase.rpc('check_user_account_access', {
                         p_user_id: ownerId,
                         p_account_id: accountId,
-                        p_permission_action: PERM,
                     });
-                    return p === true;
+                    if (accountOk !== true) return false;
+
+                    const { data: profile } = await supabase
+                        .from('profiles')
+                        .select('tenant_id')
+                        .eq('id', ownerId)
+                        .maybeSingle();
+                    if (!profile?.tenant_id) return false;
+
+                    const { data: permRows } = await supabase.rpc('get_user_effective_permissions_on_tenant', {
+                        p_user_id: ownerId,
+                        p_tenant_id: profile.tenant_id,
+                    });
+                    const hasExportPerm = Array.isArray(permRows)
+                        && permRows.some((r: any) => r?.action === EXPORT_PERMISSION);
+                    if (!hasExportPerm) return false;
+
+                    const { data: entitlement } = await supabase.rpc('tenant_feature_allowed', {
+                        p_tenant_id: profile.tenant_id,
+                        p_feature_key: EXPORT_FEATURE,
+                    });
+                    return entitlement === true;
                 })());
 
             if (!stillOk) continue;

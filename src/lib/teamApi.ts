@@ -33,3 +33,14 @@ export async function inviteTeamMember(
         invited: d.invited === true,
     };
 }
+
+export async function unlinkAgencySeller(agencyTenantId: string, sellerTenantId: string): Promise<void> {
+    const res = await apiFetch('/api/team/unlink-seller', {
+        method: 'POST',
+        body: JSON.stringify({ agencyTenantId, sellerTenantId }),
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) {
+        throw new Error(json.error || `Unlink failed (${res.status})`);
+    }
+}

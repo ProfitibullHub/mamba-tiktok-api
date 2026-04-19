@@ -202,6 +202,9 @@ export function AcceptInvitationView() {
                                         <Row label="Joining" value={info.tenantName ?? '—'} />
                                         <Row label="Tenant Type" value={info.tenantType ?? '—'} />
                                         <Row label="Your Role" value={info.roleName ?? '—'} />
+                                        <p className="text-xs text-gray-400 bg-white/5 border border-white/10 rounded-lg px-3 py-2 mt-3">
+                                            Phase 2 users belong to one product tenant. Accepting this invite will place your account in this tenant context.
+                                        </p>
                                     </div>
                                 )}
 
@@ -210,7 +213,7 @@ export function AcceptInvitationView() {
                                         <Row label="Agency" value={info.agencyName ?? '—'} />
                                         <Row label="Your Shop" value={info.sellerName ?? '—'} />
                                         <p className="text-xs text-amber-400/80 bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-2 mt-3">
-                                            Accepting will link your shop to this agency. The agency will be able to manage your shop's team and view data.
+                                            Accepting will link your seller tenant to this agency. Agency access is then derived from that link and any seller assignments.
                                         </p>
                                     </div>
                                 )}

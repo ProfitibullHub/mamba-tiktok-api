@@ -136,8 +136,22 @@ const TenantContext = createContext<TenantContextValue | null>(null);
 export function TenantProvider({ children }: { children: ReactNode }) {
     const { user } = useAuth();
 
-    const { data: memberships = [], isLoading, refetch } = useQuery({
-        queryKey: ['tenant-memberships', user?.id],
+    const { data: profileTenant, isLoading: loadingProfileTenant } = useQuery({
+        queryKey: ['profile-tenant', user?.id],
+        queryFn: async () => {
+            const { data, error } = await supabase
+                .from('profiles')
+                .select('tenant_id')
+                .eq('id', user!.id)
+                .single();
+            if (error) throw error;
+            return data?.tenant_id as string | null;
+        },
+        enabled: !!user?.id,
+    });
+
+    const { data: memberships = [], isLoading: loadingMemberships, refetch } = useQuery({
+        queryKey: ['tenant-memberships', user?.id, profileTenant],
         queryFn: async () => {
             const { data, error } = await supabase
                 .from('tenant_memberships')
@@ -147,12 +161,20 @@ export function TenantProvider({ children }: { children: ReactNode }) {
                 .eq('user_id', user!.id)
                 .eq('status', 'active');
             if (error) throw error;
-            return (data || []) as unknown as MembershipRow[];
+
+            const rows = ((data || []) as unknown as MembershipRow[]).filter((m) => {
+                const type = m.tenants?.type;
+                if (type === 'platform') return true;
+                return !!profileTenant && m.tenant_id === profileTenant;
+            });
+
+            return rows;
         },
         enabled: !!user?.id,
     });
 
-    // Agency Admin IDs (for fetching linked seller tenants)
+    const isLoading = loadingProfileTenant || loadingMemberships;
+
     const agencyAdminTenantIds = useMemo(
         () =>
             memberships
@@ -161,13 +183,9 @@ export function TenantProvider({ children }: { children: ReactNode }) {
         [memberships],
     );
 
-    // AM membership IDs (for fetching assigned seller tenants)
-    const amMembershipIds = useMemo(
-        () =>
-            memberships
-                .filter((m) => m.tenants?.type === 'agency' && m.roles?.name === 'Account Manager')
-                .map((m) => m.id),
-        [memberships],
+    const agencyMembershipIds = useMemo(
+        () => memberships.filter((m) => m.tenants?.type === 'agency').map((m) => m.tenant_id),
+        [memberships]
     );
 
     // Fetch seller tenants linked to agencies where the user is Agency Admin
@@ -187,20 +205,21 @@ export function TenantProvider({ children }: { children: ReactNode }) {
         enabled: agencyAdminTenantIds.length > 0,
     });
 
-    // Fetch seller tenants assigned to AM memberships via user_seller_assignments
+    // Fetch seller tenants assigned to the current agency user via user_seller_assignments.
     const { data: amAssignedSellerTenants = [] } = useQuery({
-        queryKey: ['am-assigned-sellers-for-mgmt', amMembershipIds],
+        queryKey: ['agency-user-assigned-sellers-for-mgmt', user?.id, agencyMembershipIds],
         queryFn: async () => {
             const { data, error } = await supabase
                 .from('user_seller_assignments')
-                .select('seller_tenant_id, tenants!seller_tenant_id ( id, name, type, status )')
-                .in('tenant_membership_id', amMembershipIds);
+                .select('seller_tenant_id, agency_tenant_id, tenants!seller_tenant_id ( id, name, type, status )')
+                .eq('user_id', user!.id)
+                .in('agency_tenant_id', agencyMembershipIds);
             if (error) throw error;
             return (data || [])
                 .map((row: any) => row.tenants)
                 .filter((t: any) => t && t.status === 'active') as { id: string; name: string; type: string }[];
         },
-        enabled: amMembershipIds.length > 0,
+        enabled: !!user?.id && agencyMembershipIds.length > 0,
     });
 
     const value = useMemo(() => {

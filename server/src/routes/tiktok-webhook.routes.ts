@@ -58,6 +58,76 @@ function formatWebhookNotification(type: number, data: any): { category: string;
     }
 }
 
+const BROADCAST_FAILURE_LOG_MS = 60_000;
+const broadcastFailureLastLog = new Map<string, number>();
+
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isLikelyRealtimeTimeout(err: unknown): boolean {
+    if (!err) return false;
+    const name = err instanceof DOMException ? err.name : (err as Error)?.name;
+    const message = err instanceof Error ? err.message : String(err);
+    return (
+        name === 'AbortError'
+        || message.includes('AbortError')
+        || message.includes('aborted')
+        || message.includes('_fetchWithTimeout')
+    );
+}
+
+/** Avoid spamming logs when Realtime is flaky under load. */
+function logBroadcastFailureOnce(key: string, severity: 'warn' | 'error', message: string, err: unknown): void {
+    const now = Date.now();
+    const last = broadcastFailureLastLog.get(key) ?? 0;
+    if (now - last < BROADCAST_FAILURE_LOG_MS) return;
+    broadcastFailureLastLog.set(key, now);
+    if (broadcastFailureLastLog.size > 500) {
+        for (const [k, t] of broadcastFailureLastLog) {
+            if (now - t > BROADCAST_FAILURE_LOG_MS * 2) broadcastFailureLastLog.delete(k);
+        }
+    }
+    if (severity === 'warn') console.warn(message, err);
+    else console.error(message, err);
+}
+
+/**
+ * Supabase Realtime `httpSend` can throw `AbortError` when its internal fetch times out.
+ * Retries with short backoff; failures are throttled in logs (timeouts → warn).
+ */
+async function broadcastOrderUpdateWithRetry(params: {
+    internalShopDbId: string;
+    externalShopId: string;
+    orderId: string;
+    payload: unknown;
+}): Promise<void> {
+    const { internalShopDbId, externalShopId, orderId, payload } = params;
+    const channelName = `shop-orders-realtime-${internalShopDbId}`;
+    const channel = supabase.channel(channelName);
+    const maxAttempts = 3;
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            await (channel as any).httpSend('broadcast', {
+                event: 'order_update',
+                payload,
+            });
+            return;
+        } catch (e) {
+            lastErr = e;
+            if (attempt < maxAttempts) await sleep(150 * attempt);
+        }
+    }
+    const throttleKey = `${channelName}:${orderId}`;
+    const msg = `[Webhook] Broadcast failed after ${maxAttempts} attempts channel=${channelName} externalShopId=${externalShopId} orderId=${orderId}`;
+    if (isLikelyRealtimeTimeout(lastErr)) {
+        logBroadcastFailureOnce(throttleKey, 'warn', msg, lastErr);
+    } else {
+        logBroadcastFailureOnce(`${throttleKey}:non-abort`, 'error', msg, lastErr);
+    }
+}
+
 /**
  * Verify TikTok webhook signature.
  * TikTok signs the payload as: HMAC-SHA256(app_secret, timestamp + nonce + rawBody)
@@ -439,13 +509,14 @@ router.post('/', async (req: Request, res: Response) => {
 
                         // 4. If we have the updated order, broadcast it to the Realtime UI
                         if (fullOrderRow) {
-                            internalIds.forEach(internalId => {
-                                const channel = supabase.channel(`shop-orders-realtime-${internalId}`);
-                                (channel as any).httpSend('broadcast', {
-                                    event: 'order_update',
-                                    payload: fullOrderRow
-                                }).catch((err: any) => console.error('[Webhook] Broadcast error:', err));
-                            });
+                            for (const internalId of internalIds) {
+                                void broadcastOrderUpdateWithRetry({
+                                    internalShopDbId: internalId,
+                                    externalShopId: String(shop_id),
+                                    orderId: String(orderId),
+                                    payload: fullOrderRow,
+                                });
+                            }
                         }
 
                         // 5. Evaluate notification rules

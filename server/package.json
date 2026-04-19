@@ -9,7 +9,8 @@
         "build": "tsc",
         "start": "node dist/index.js",
         "typecheck": "tsc --noEmit",
-        "seed:test-role-users": "tsx scripts/seed-role-test-users.ts"
+        "seed:test-role-users": "tsx scripts/seed-role-test-users.ts",
+        "test:ingestion": "node --import tsx --test src/tests/ingestion-queue.test.ts"
     },
     "keywords": [
         "tiktok",
@@ -20,6 +21,7 @@
     "author": "",
     "license": "ISC",
     "dependencies": {
+        "@sentry/node": "^10.48.0",
         "@supabase/supabase-js": "^2.57.4",
         "@types/cors": "^2.8.17",
         "@types/express": "^4.17.21",
@@ -27,15 +29,19 @@
         "@types/node-cron": "^3.0.11",
         "@types/pg": "^8.16.0",
         "axios": "^1.6.2",
+        "compression": "^1.8.1",
         "cors": "^2.8.5",
         "dotenv": "^16.3.1",
         "express": "^4.18.2",
+        "express-rate-limit": "^8.3.2",
+        "helmet": "^8.1.0",
         "node-cron": "^3.0.3",
         "pg": "^8.16.3",
         "typescript": "^5.3.3",
         "undici": "^7.23.0"
     },
     "devDependencies": {
+        "@types/compression": "^1.8.1",
         "tsx": "^4.7.0"
     }
 }

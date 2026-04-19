@@ -83,7 +83,6 @@ export function AffiliateCommissionCard({
                 {/* Back Side — line-by-line TikTok auto commission (tap card to flip) */}
                 <div
                     className="absolute inset-0 backface-hidden rotate-y-180 bg-gray-900 border border-gray-700/50 rounded-xl p-4 overflow-hidden flex flex-col"
-                    onClick={(e) => e.stopPropagation()}
                 >
                     <div
                         className="flex items-center justify-between mb-2 pb-2 border-b border-gray-800 shrink-0 cursor-pointer"

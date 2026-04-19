@@ -17,6 +17,22 @@
     ],
     "crons": [
         {
+            "path": "/api/tiktok-shop/sync/run-worker",
+            "schedule": "*/10 * * * *"
+        },
+        {
+            "path": "/api/tiktok-ads/sync/run-worker",
+            "schedule": "*/10 * * * *"
+        },
+        {
+            "path": "/api/tiktok-shop/sync/refresh-tokens",
+            "schedule": "0 */2 * * *"
+        },
+        {
+            "path": "/api/tiktok-ads/poll-all",
+            "schedule": "*/15 * * * *"
+        },
+        {
             "path": "/api/tiktok-shop/sync/cron-settlements",
             "schedule": "0 7 * * *"
         },

@@ -91,6 +91,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
   const fetchShopData = useShopStore(state => state.fetchShopData);
   const syncData = useShopStore(state => state.syncData);
   const cacheMetadata = useShopStore(state => state.cacheMetadata);
+  const syncProgress = useShopStore(state => state.syncProgress);
   const dismissRefreshPrompt = useShopStore(state => state.dismissRefreshPrompt);
 
   const orders = useShopStore(state => state.orders);
@@ -98,6 +99,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
   const finance = useShopStore(state => state.finance);
   const dataVersion = useShopStore(state => state.dataVersion);
   const plData = useShopStore(state => state.plData);
+  const fetchPLData = useShopStore(state => state.fetchPLData);
 
   // TikTok Ads store
 
@@ -228,8 +230,10 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       fetchAffiliateSettlements(account.id, shopId, start, end);
       fetchAgencyFees(account.id, shopId, start, end);
       fetchAdsSpend(account.id, start, end);
+      // Same P&L payload as ProfitLossView — powers Affiliate Commissions card (plData.fees)
+      void fetchPLData(account.id, shopId, start, end, false, timezone);
     }
-  }, [shopId, account.id, fetchShopData, fetchAffiliateSettlements, fetchAgencyFees, fetchAdsSpend, defaultLoadDays, timezone]);
+  }, [shopId, account.id, fetchShopData, fetchAffiliateSettlements, fetchAgencyFees, fetchAdsSpend, fetchPLData, defaultLoadDays, timezone]);
 
   // Keep a ref to the latest handleDateRangeChange so the mount effect always
   // calls the current version without needing it in the dependency array.
@@ -262,12 +266,22 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
   // mergeAfterSync already updated zustand state with new data — this counter
   // just ensures React picks up the change and re-runs the useMemo.
   const [syncRenderKey, setSyncRenderKey] = useState(0);
+  const [syncSummaryToast, setSyncSummaryToast] = useState<string | null>(null);
+  const [syncSummaryToastVisible, setSyncSummaryToastVisible] = useState(false);
   const wasSyncingRef = useRef(false);
   useEffect(() => {
     if (cacheMetadata.isSyncing) {
       wasSyncingRef.current = true;
     } else if (wasSyncingRef.current) {
       wasSyncingRef.current = false;
+      const stats = cacheMetadata.lastSyncStats;
+      if (stats) {
+        const ordersFetched = stats.orders?.fetched ?? 0;
+        const productsFetched = stats.products?.fetched ?? 0;
+        const settlementsFetched = stats.settlements?.fetched ?? 0;
+        setSyncSummaryToast(`Sync complete: orders ${ordersFetched}, products ${productsFetched}, settlements ${settlementsFetched}`);
+        setSyncSummaryToastVisible(true);
+      }
       console.log('[OverviewView] Sync completed — forcing re-render to pick up merged data.');
       // Increment counter to force React re-render (no Supabase refetch)
       setSyncRenderKey(k => k + 1);
@@ -276,9 +290,63 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
         fetchAffiliateSettlements(account.id, shopId, dateRange.startDate, dateRange.endDate);
         fetchAgencyFees(account.id, shopId, dateRange.startDate, dateRange.endDate);
         fetchAdsSpend(account.id, dateRange.startDate, dateRange.endDate);
+        void fetchPLData(account.id, shopId, dateRange.startDate, dateRange.endDate, true, timezone);
       }
     }
-  }, [cacheMetadata.isSyncing, shopId, account.id, fetchAffiliateSettlements, fetchAgencyFees, fetchAdsSpend, dateRange.startDate, dateRange.endDate]);
+  }, [cacheMetadata.isSyncing, shopId, account.id, fetchAffiliateSettlements, fetchAgencyFees, fetchAdsSpend, fetchPLData, dateRange.startDate, dateRange.endDate, timezone]);
+
+  useEffect(() => {
+    if (!syncSummaryToast) return;
+    const hideTimer = window.setTimeout(() => setSyncSummaryToastVisible(false), 2600);
+    const clearTimer = window.setTimeout(() => setSyncSummaryToast(null), 3000);
+    return () => {
+      window.clearTimeout(hideTimer);
+      window.clearTimeout(clearTimer);
+    };
+  }, [syncSummaryToast]);
+
+  const syncStatusText = useMemo(() => {
+    if (cacheMetadata.isSyncing) {
+      const currentLabel = syncProgress.currentStep === 'orders'
+        ? 'Orders'
+        : syncProgress.currentStep === 'products'
+          ? 'Products'
+          : syncProgress.currentStep === 'settlements'
+            ? 'Settlements'
+            : 'Sync';
+
+      const processed = syncProgress.currentStep === 'orders'
+        ? syncProgress.ordersFetched
+        : syncProgress.currentStep === 'products'
+          ? syncProgress.productsFetched
+          : syncProgress.currentStep === 'settlements'
+            ? syncProgress.settlementsFetched
+            : 0;
+
+      const total = syncProgress.currentStep === 'orders'
+        ? syncProgress.ordersTotal
+        : syncProgress.currentStep === 'products'
+          ? syncProgress.productsTotal
+          : syncProgress.currentStep === 'settlements'
+            ? syncProgress.settlementsTotal
+            : undefined;
+
+      if (total && total > 0) {
+        return `${currentLabel} ${Math.min(processed, total)}/${total}`;
+      }
+      return `${currentLabel} ${processed}`;
+    }
+    return null;
+  }, [
+    cacheMetadata.isSyncing,
+    syncProgress.currentStep,
+    syncProgress.ordersFetched,
+    syncProgress.ordersTotal,
+    syncProgress.productsFetched,
+    syncProgress.productsTotal,
+    syncProgress.settlementsFetched,
+    syncProgress.settlementsTotal,
+  ]);
 
   // Handle reconnect - redirect to TikTok auth
   const handleReconnect = async () => {
@@ -1398,6 +1466,18 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
 
   return (
     <div className="space-y-6">
+      {syncSummaryToast && (
+        <div
+          className={`fixed top-8 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 rounded-2xl bg-gray-900/95 backdrop-blur-md px-5 py-3.5 shadow-2xl border border-gray-700/50 transition-all duration-400 ease-out ${
+            syncSummaryToastVisible ? 'opacity-100 translate-y-0 scale-100' : 'opacity-0 -translate-y-4 scale-95 pointer-events-none'
+          }`}
+        >
+          <div className="flex flex-col">
+            <span className="text-sm font-semibold text-white">{syncSummaryToast}</span>
+          </div>
+        </div>
+      )}
+
       {/* Refresh Prompt */}
       {cacheMetadata.showRefreshPrompt && canSyncShop && (
         <RefreshPrompt
@@ -1466,7 +1546,10 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
             </div>
           </div>
 
-          <div className="flex min-w-0 flex-1 items-center justify-end gap-1.5 sm:gap-2 overflow-x-auto overflow-y-hidden py-0.5 [-webkit-overflow-scrolling:touch]">
+          {/* Scroll only the left segment of the toolbar — overflow-y-hidden on a parent clips
+              absolutely positioned dropdowns (timezone panel, date picker calendar, etc.). */}
+          <div className="flex min-w-0 flex-1 items-center justify-end gap-1.5 sm:gap-2 py-0.5">
+            <div className="flex min-w-0 flex-1 items-center justify-end gap-1.5 sm:gap-2 overflow-x-auto [-webkit-overflow-scrolling:touch]">
             <div className="inline-flex h-9 shrink-0 items-stretch rounded-lg border border-white/10 bg-black/30 p-0.5 gap-0.5">
               <button
                 type="button"
@@ -1515,6 +1598,11 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
               <RefreshCw className={`w-3.5 h-3.5 sm:w-4 sm:h-4 ${cacheMetadata.isSyncing ? 'animate-spin' : ''}`} />
               <span className="hidden min-[380px]:inline">{cacheMetadata.isSyncing ? 'Syncing…' : 'Sync'}</span>
             </button>
+            {syncStatusText && (
+              <span className="hidden md:inline shrink-0 text-[10px] text-gray-400 whitespace-nowrap">
+                {syncStatusText}
+              </span>
+            )}
 
             {canEmailDashboardExport && (
               <button
@@ -1545,6 +1633,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
                 </span>
               )}
             </button>
+            </div>
 
             {shopId && onTimezoneChange && (
               <TimezoneSelector

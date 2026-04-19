@@ -3,6 +3,58 @@ import { createClient } from '@supabase/supabase-js';
 import { apiFetch } from '../lib/apiClient';
 import { getUtcCalendarRangeExclusiveUnix } from '../utils/dateUtils';
 
+async function sleep(ms: number): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Enqueue durable ads sync, nudge worker, poll job until terminal (matches Shop ingestion UX). */
+async function enqueueAndWaitAdsSync(
+    accountId: string,
+    body: Record<string, unknown>,
+    signal?: AbortSignal
+): Promise<unknown> {
+    const enqueueResp = await apiFetch(`/api/tiktok-ads/sync/${accountId}`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+        signal,
+    });
+    const enqueueJson = await enqueueResp.json();
+    if (!enqueueJson.success || !enqueueJson.jobId) {
+        throw new Error(enqueueJson.error || 'Failed to enqueue ads sync job');
+    }
+
+    await apiFetch(`/api/tiktok-ads/sync/run-worker?limit=1`, {
+        method: 'POST',
+        signal,
+    }).catch(() => undefined);
+
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < 900_000) {
+        if (signal?.aborted) {
+            throw new DOMException('Sync polling aborted', 'AbortError');
+        }
+
+        const statusResp = await apiFetch(`/api/tiktok-ads/sync/job/${enqueueJson.jobId}`, { signal });
+        const statusJson = await statusResp.json();
+        if (!statusJson.success) {
+            throw new Error(statusJson.error || 'Failed to fetch ads sync job status');
+        }
+
+        const status = statusJson.job?.status;
+        if (status === 'succeeded') {
+            return statusJson.lastAttempt?.result || { success: true };
+        }
+        if (status === 'dead_letter') {
+            const err = statusJson.job?.last_error || statusJson.lastAttempt?.error || 'Ads sync job failed';
+            throw new Error(err);
+        }
+
+        await sleep(1500);
+    }
+
+    throw new Error('Ads sync job timeout. Background job may still be running.');
+}
+
 // Supabase client for Realtime subscriptions (uses the same project as the main app)
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || '';
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
@@ -349,17 +401,12 @@ export const useTikTokAdsStore = create<TikTokAdsState>((set, get) => ({
     syncAdsData: async (accountId: string, startDate?: string, endDate?: string) => {
         try {
             set({ isSyncing: true, error: null });
-            const body: any = {};
+            const body: Record<string, string> = {};
             if (startDate) body.startDate = startDate;
             if (endDate) body.endDate = endDate;
 
-            const response = await apiFetch(`/api/tiktok-ads/sync/${accountId}`, {
-                method: 'POST',
-                body: JSON.stringify(body),
-            });
-            const result = await response.json();
-            if (!result.success) throw new Error(result.error || 'Sync failed');
-            console.log('[TikTok Ads] Sync complete:', result.summary);
+            const result = (await enqueueAndWaitAdsSync(accountId, body)) as { summary?: unknown };
+            console.log('[TikTok Ads] Sync complete:', result?.summary);
 
             // After sync, refresh the DB-first data store so the UI updates with new data
             await get().loadMarketingFromDB(accountId);

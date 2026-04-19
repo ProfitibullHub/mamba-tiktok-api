@@ -2,8 +2,14 @@ import { Router, Request, Response } from 'express';
 import crypto from 'crypto';
 import { tiktokAPI } from '../services/tiktok-api.service';
 import { supabase } from '../config/supabase';
+import {
+    enforceRequestAccountAccess,
+    verifyAccountIdParam,
+} from '../middleware/account-access.middleware.js';
 
 const router = Router();
+router.use(enforceRequestAccountAccess);
+router.param('accountId', verifyAccountIdParam);
 
 // Store CSRF tokens and code verifiers temporarily (in production, use Redis or similar)
 const csrfTokens = new Map<string, { accountId?: string; codeVerifier: string; timestamp: number }>();

@@ -15,6 +15,7 @@ import {
     Store,
     TrendingUp,
     Users,
+    Activity,
 } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
@@ -134,6 +135,7 @@ function ConsoleNav({
     const adminItems = [
         { id: 'admin-dashboard', label: 'Admin Dashboard', icon: BarChart3 },
         { id: 'platform-tenants', label: 'Platform tenants', icon: Globe },
+        { id: 'ingestion-monitoring', label: 'Ingestion Monitoring', icon: Activity },
     ];
 
     return (

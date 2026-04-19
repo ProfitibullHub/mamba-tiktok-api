@@ -1,7 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useParams, useLocation } from 'react-router-dom';
 import { Sidebar } from './Sidebar';
-import { SyncProgressBar } from './SyncProgressBar';
 import { NewOrdersToast } from './NewOrdersToast';
 import { NotificationToast } from './NotificationToast';
 import { OverviewView } from './views/OverviewView';
@@ -356,7 +355,6 @@ export function ShopPage() {
                         }
                     })()}
 
-                    <SyncProgressBar />
                     <NewOrdersToast />
                     <NotificationToast />
                 </div>

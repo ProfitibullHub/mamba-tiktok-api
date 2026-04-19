@@ -113,7 +113,15 @@ export class TikTokSyncService {
     }
 
     /**
-     * Sync all videos for an account
+     * Sync all videos for an account.
+     *
+     * Batching strategy:
+     *  - Collect one full page of videos → batch-upsert to `tiktok_videos` in a single call.
+     *  - After each page upsert, retrieve the newly-created/existing DB IDs for those video_ids
+     *    with a single SELECT (instead of one SELECT per video).
+     *  - Build analytics records in memory and batch-upsert to `tiktok_video_analytics`.
+     *
+     * This reduces DB round-trips from O(2N) per video to O(3) per page.
      */
     async syncVideos(accountId: string): Promise<number> {
         try {
@@ -121,91 +129,102 @@ export class TikTokSyncService {
             let cursor: number | undefined = 0;
             let hasMore = true;
             let totalVideos = 0;
+            const syncedAt = new Date().toISOString();
 
             while (hasMore) {
                 const { videos, cursor: nextCursor, hasMore: more } = await tiktokAPI.getVideoList(accessToken, cursor, 20);
 
-                for (const video of videos) {
-                    // Upsert video data
-                    const { error: videoError } = await supabase
-                        .from('tiktok_videos')
-                        .upsert({
-                            account_id: accountId,
-                            video_id: video.id,
-                            title: video.title,
-                            description: video.video_description,
-                            cover_image_url: video.cover_image_url,
-                            share_url: video.share_url,
-                            embed_html: video.embed_html,
-                            embed_link: video.embed_link,
-                            duration: video.duration,
-                            height: video.height,
-                            width: video.width,
-                            create_time: video.create_time,
-                            updated_at: new Date().toISOString(),
-                        }, {
-                            onConflict: 'video_id',
-                        });
-
-                    if (videoError) {
-                        console.error(`Error saving video ${video.id}:`, videoError);
-                        continue;
-                    }
-
-                    // Get the video's database ID
-                    const { data: videoData } = await supabase
-                        .from('tiktok_videos')
-                        .select('id')
-                        .eq('video_id', video.id)
-                        .single();
-
-                    if (videoData) {
-                        // Calculate engagement rate
-                        const engagementRate = this.calculateEngagementRate(
-                            video.like_count,
-                            video.comment_count,
-                            video.share_count,
-                            video.view_count
-                        );
-
-                        // Upsert video analytics
-                        const { error: analyticsError } = await supabase
-                            .from('tiktok_video_analytics')
-                            .upsert({
-                                video_id: videoData.id,
-                                account_id: accountId,
-                                like_count: video.like_count,
-                                comment_count: video.comment_count,
-                                share_count: video.share_count,
-                                view_count: video.view_count,
-                                engagement_rate: engagementRate,
-                                synced_at: new Date().toISOString(),
-                                updated_at: new Date().toISOString(),
-                            }, {
-                                onConflict: 'video_id',
-                            });
-
-                        if (analyticsError) {
-                            console.error(`Error saving analytics for video ${video.id}:`, analyticsError);
-                        }
-                    }
-
-                    totalVideos++;
+                if (videos.length === 0) {
+                    hasMore = more;
+                    cursor = nextCursor;
+                    continue;
                 }
 
+                // ── 1. Batch-upsert all videos in this page ──────────────────────
+                const videoRows = videos.map((video: TikTokVideo) => ({
+                    account_id: accountId,
+                    video_id: video.id,
+                    title: video.title,
+                    description: video.video_description,
+                    cover_image_url: video.cover_image_url,
+                    share_url: video.share_url,
+                    embed_html: video.embed_html,
+                    embed_link: video.embed_link,
+                    duration: video.duration,
+                    height: video.height,
+                    width: video.width,
+                    create_time: video.create_time,
+                    updated_at: syncedAt,
+                }));
+
+                const { error: videoUpsertError } = await supabase
+                    .from('tiktok_videos')
+                    .upsert(videoRows, { onConflict: 'video_id' });
+
+                if (videoUpsertError) {
+                    console.error(`[SyncVideos] Batch upsert error (account ${accountId}):`, videoUpsertError);
+                    // Continue to analytics step — partial data is better than none
+                }
+
+                // ── 2. Single SELECT to retrieve DB IDs for this page's video_ids ─
+                const videoExternalIds = videos.map((v: TikTokVideo) => v.id);
+                const { data: dbVideos } = await supabase
+                    .from('tiktok_videos')
+                    .select('id, video_id')
+                    .in('video_id', videoExternalIds);
+
+                const dbIdByExternalId = new Map<string, string>(
+                    (dbVideos || []).map((row: { id: string; video_id: string }) => [row.video_id, row.id])
+                );
+
+                // ── 3. Build analytics records and batch-upsert ───────────────────
+                const analyticsRows = videos
+                    .map((video: TikTokVideo) => {
+                        const dbId = dbIdByExternalId.get(video.id);
+                        if (!dbId) return null;
+                        return {
+                            video_id: dbId,
+                            account_id: accountId,
+                            like_count: video.like_count,
+                            comment_count: video.comment_count,
+                            share_count: video.share_count,
+                            view_count: video.view_count,
+                            engagement_rate: this.calculateEngagementRate(
+                                video.like_count,
+                                video.comment_count,
+                                video.share_count,
+                                video.view_count
+                            ),
+                            synced_at: syncedAt,
+                            updated_at: syncedAt,
+                        };
+                    })
+                    .filter((r): r is NonNullable<typeof r> => r !== null);
+
+                if (analyticsRows.length > 0) {
+                    const { error: analyticsError } = await supabase
+                        .from('tiktok_video_analytics')
+                        .upsert(analyticsRows, { onConflict: 'video_id' });
+
+                    if (analyticsError) {
+                        console.error(`[SyncVideos] Analytics batch upsert error (account ${accountId}):`, analyticsError);
+                    }
+                }
+
+                totalVideos += videos.length;
                 cursor = nextCursor;
                 hasMore = more;
 
-                // Add a small delay to avoid rate limiting
+                // Small delay to avoid TikTok rate limiting between pages
                 if (hasMore) {
-                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    await new Promise(resolve => setTimeout(resolve, 600));
                 }
             }
 
-            console.log(`Synced ${totalVideos} videos for account ${accountId}`);
+            console.log(`[SyncVideos] Synced ${totalVideos} videos for account ${accountId}`);
             return totalVideos;
         } catch (error: any) {
-            console.error(`Error syncing videos for account ${accountId}:`, error.message);
+            console.error(`[SyncVideos] Error for account ${accountId}:`, error.message);
             throw error;
         }
     }

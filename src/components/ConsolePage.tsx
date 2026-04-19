@@ -6,6 +6,7 @@ import { RoleManagementView } from './views/RoleManagementView';
 import { MyAccessView } from './views/MyAccessView';
 import { PlatformTenantsView } from './views/PlatformTenantsView';
 import { AdminDashboard } from './views/AdminDashboard';
+import { IngestionMonitoringView } from './views/IngestionMonitoringView';
 import { ProfileView } from './views/ProfileView';
 import { ConsoleNotificationsView } from './views/ConsoleNotificationsView';
 import { ConsoleNotificationToast } from './ConsoleNotificationToast';
@@ -27,7 +28,9 @@ const FULL_WIDTH_TABS = new Set([
     'my-access',
     'platform-tenants',
     'notifications',
+    'ingestion-monitoring',
 ]);
+const CONSOLE_ACTIVE_TAB_KEY = 'console.activeTab';
 
 export function ConsolePage() {
     const { user } = useAuth();
@@ -40,16 +43,26 @@ export function ConsolePage() {
     } = useTenantContext();
     const queryClient = useQueryClient();
 
-    const [activeTab, setActiveTab] = useState('home');
+    const [activeTab, setActiveTab] = useState(() => {
+        const saved = sessionStorage.getItem(CONSOLE_ACTIVE_TAB_KEY);
+        return saved && saved.trim().length > 0 ? saved : 'home';
+    });
     const adminTabInitialized = useRef(false);
     const [hasSkippedWelcome, setHasSkippedWelcome] = useState(false);
 
     useEffect(() => {
         if (isPlatformSuperAdmin && !adminTabInitialized.current) {
             adminTabInitialized.current = true;
-            setActiveTab('admin-dashboard');
+            const saved = sessionStorage.getItem(CONSOLE_ACTIVE_TAB_KEY);
+            if (!saved) {
+                setActiveTab('admin-dashboard');
+            }
         }
     }, [isPlatformSuperAdmin]);
+
+    useEffect(() => {
+        sessionStorage.setItem(CONSOLE_ACTIVE_TAB_KEY, activeTab);
+    }, [activeTab]);
 
     const fetchNotifications = useConsoleNotificationStore((state) => state.fetchNotifications);
     const subscribeToNotifications = useConsoleNotificationStore((state) => state.subscribeToNotifications);
@@ -258,6 +271,12 @@ export function ConsolePage() {
                                     <PlatformTenantsView />
                                 ) : (
                                     <p className="text-red-400">Platform view requires an internal administrator.</p>
+                                );
+                            case 'ingestion-monitoring':
+                                return isPlatformSuperAdmin ? (
+                                    <IngestionMonitoringView />
+                                ) : (
+                                    <p className="text-red-400">Ingestion monitoring requires a platform administrator.</p>
                                 );
                             case 'admin-dashboard':
                                 return <AdminDashboard onNavigateToTeamRoles={() => setActiveTab('team-roles')} />;

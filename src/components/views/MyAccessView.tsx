@@ -29,11 +29,8 @@ function permissionGroupLabel(action: string): string {
 
 function pickDefaultTenantId(memberships: MembershipRow[]): string | null {
     if (!memberships.length) return null;
-    const sellers = memberships.filter((m) => m.tenants?.type === 'seller');
-    if (sellers.length) return sellers[0].tenant_id;
-    const agencies = memberships.filter((m) => m.tenants?.type === 'agency');
-    if (agencies.length) return agencies[0].tenant_id;
-    return memberships[0].tenant_id;
+    const productTenant = memberships.find((m) => m.tenants?.type === 'seller' || m.tenants?.type === 'agency');
+    return productTenant?.tenant_id ?? memberships[0].tenant_id;
 }
 
 function roleScopeLine(m: MembershipRow | undefined): string {
@@ -99,7 +96,9 @@ export function MyAccessView() {
                 .eq('role_id', selected!.role_id);
             if (error) throw error;
             const rows = (data || [])
-                .map((r: { permissions: PermRow | null }) => r.permissions)
+                .flatMap((r: { permissions: PermRow[] | PermRow | null }) =>
+                    Array.isArray(r.permissions) ? r.permissions : r.permissions ? [r.permissions] : []
+                )
                 .filter((p): p is PermRow => !!p?.action);
             rows.sort((a, b) => a.action.localeCompare(b.action));
             return rows;
@@ -135,8 +134,8 @@ export function MyAccessView() {
                         <div className="min-w-0 flex-1">
                             <h1 className="text-2xl font-bold tracking-tight text-white sm:text-3xl">My access & roles</h1>
                             <p className="mt-2 text-sm leading-relaxed text-gray-400 lg:max-w-4xl xl:max-w-none">
-                                See exactly what you can do in each organization you belong to. This reflects your assigned
-                                role and permission catalog for the tenant you select—not a generic role list.
+                                See exactly what you can do in your tenant context. This reflects your assigned role and
+                                permission catalog for the current tenant, not a generic role list.
                             </p>
                             {user?.email && (
                                 <p className="mt-3 flex flex-wrap items-center gap-2 text-xs text-gray-500">
@@ -170,7 +169,7 @@ export function MyAccessView() {
                     <div className="space-y-6 xl:col-span-4">
                         <section className="rounded-2xl border border-white/10 bg-gray-900/35 p-6 backdrop-blur-sm">
                             <label className="mb-3 block text-xs font-bold uppercase tracking-wider text-gray-500">
-                                Organization context
+                                Tenant context
                             </label>
                             <div className="relative">
                                 <select

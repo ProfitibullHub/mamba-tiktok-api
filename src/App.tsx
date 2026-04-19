@@ -7,7 +7,8 @@ import { ShopPage } from './components/ShopPage';
 import { ResetPassword } from './components/ResetPassword';
 import { TikTokAdsCallback } from './components/TikTokAdsCallback';
 import { AcceptInvitationView } from './components/views/AcceptInvitationView';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { reportClientError } from './lib/observability';
 
 function detectPasswordFlow(): 'reset' | 'invite' | null {
     const hash = window.location.hash;
@@ -16,15 +17,46 @@ function detectPasswordFlow(): 'reset' | 'invite' | null {
     if (hash.includes('type=invite')) return 'invite';
     return null;
 }
-function AppTester (){
-    return null;
-}
+
 function AppContent() {
     const { user, loading } = useAuth();
     const location = useLocation();
     const [passwordFlowMode, setPasswordFlowMode] = useState<'reset' | 'invite' | null>(detectPasswordFlow);
 
     const isTikTokAdsCallback = window.location.pathname === '/auth/tiktok-ads/callback';
+    useEffect(() => {
+        const onError = (event: ErrorEvent) => {
+            void reportClientError({
+                event: 'frontend.window_error',
+                message: event.message || 'Unhandled window error',
+                route: window.location.pathname,
+                source: event.filename || 'window.onerror',
+                stack: event.error?.stack,
+                metadata: {
+                    line: event.lineno,
+                    column: event.colno,
+                },
+            });
+        };
+        const onUnhandledRejection = (event: PromiseRejectionEvent) => {
+            const reason = event.reason;
+            void reportClientError({
+                event: 'frontend.unhandled_rejection',
+                message: reason instanceof Error ? reason.message : String(reason),
+                route: window.location.pathname,
+                source: 'window.unhandledrejection',
+                stack: reason instanceof Error ? reason.stack : undefined,
+            });
+        };
+
+        window.addEventListener('error', onError);
+        window.addEventListener('unhandledrejection', onUnhandledRejection);
+        return () => {
+            window.removeEventListener('error', onError);
+            window.removeEventListener('unhandledrejection', onUnhandledRejection);
+        };
+    }, []);
+
     const isResetPasswordPath = window.location.pathname === '/reset-password';
     const isAcceptInvitation = window.location.pathname === '/accept-invitation';
 

@@ -20,7 +20,7 @@ import { useTenantContext } from '../../contexts/TenantContext';
 import { useAuth } from '../../contexts/AuthContext';
 import { agencyLinkSellerTenant, agencyGrantStaffSellerAccess } from '../../lib/agencyRpc';
 import { tenantSetMemberRole } from '../../lib/tenantRolesRpc';
-import { inviteTeamMember, searchTeamProfiles, type TeamProfileRow } from '../../lib/teamApi';
+import { inviteTeamMember, searchTeamProfiles, unlinkAgencySeller, type TeamProfileRow } from '../../lib/teamApi';
 import { patchAgencyTenantAsAdmin } from '../../lib/adminTenantsApi';
 
 type ChildTenant = {
@@ -92,19 +92,32 @@ export function AgencyConsoleView() {
     });
 
     const { data: linkedSellers = [], isLoading: loadingSellers } = useQuery({
-        queryKey: ['agency-sellers', selectedAgencyId],
+        queryKey: ['agency-sellers', selectedAgencyId, canAdmin, user?.id],
         queryFn: async () => {
             if (!selectedAgencyId) return [];
+            if (canAdmin) {
+                const { data, error } = await supabase
+                    .from('tenants')
+                    .select('id, name, type, status, parent_tenant_id')
+                    .eq('parent_tenant_id', selectedAgencyId)
+                    .eq('type', 'seller')
+                    .order('name');
+                if (error) throw error;
+                return (data || []) as ChildTenant[];
+            }
+
             const { data, error } = await supabase
-                .from('tenants')
-                .select('id, name, type, status, parent_tenant_id')
-                .eq('parent_tenant_id', selectedAgencyId)
-                .eq('type', 'seller')
-                .order('name');
+                .from('user_seller_assignments')
+                .select('seller_tenant_id, tenants!seller_tenant_id(id, name, type, status, parent_tenant_id)')
+                .eq('agency_tenant_id', selectedAgencyId)
+                .eq('user_id', user!.id);
             if (error) throw error;
-            return (data || []) as ChildTenant[];
+
+            return (data || [])
+                .map((row: any) => row.tenants)
+                .filter((row: any) => row && row.type === 'seller') as ChildTenant[];
         },
-        enabled: !!selectedAgencyId,
+        enabled: !!selectedAgencyId && !!user?.id,
     });
 
     const { data: agencyAssignableRoles = [] } = useQuery({
@@ -349,6 +362,20 @@ export function AgencyConsoleView() {
         }
     };
 
+    const handleUnlinkSeller = async (sellerTenantId: string) => {
+        if (!selectedAgencyId || !canAdmin) return;
+        setBusy(`unlink-${sellerTenantId}`);
+        try {
+            await unlinkAgencySeller(selectedAgencyId, sellerTenantId);
+            await queryClient.invalidateQueries({ queryKey: ['agency-sellers', selectedAgencyId] });
+            flash('ok', 'Seller unlinked. Agency assignments were cleared and future scheduled exports were disabled.');
+        } catch (e: any) {
+            flash('err', e.message || 'Unlink failed');
+        } finally {
+            setBusy(null);
+        }
+    };
+
     return (
         <div className="w-full max-w-none space-y-10 animate-in fade-in duration-500 pb-12 relative">
             <div className="absolute inset-x-0 top-0 h-64 bg-gradient-to-b from-violet-500/10 via-fuchsia-500/5 to-transparent -z-10 rounded-full blur-[100px] opacity-60 pointer-events-none" />
@@ -389,7 +416,7 @@ export function AgencyConsoleView() {
                             <div className="p-2 bg-gray-800 rounded-xl border border-white/5">
                                 <Building2 className="w-5 h-5 text-gray-300" />
                             </div>
-                            Your Agencies
+                            Agency context
                         </div>
                         <div className="flex flex-wrap gap-3">
                             {agencyMemberships.map((m) => (
@@ -419,7 +446,7 @@ export function AgencyConsoleView() {
 
             {agencyMemberships.length === 0 && (
                 <p className="text-gray-500 text-sm">
-                    You are not a member of any agency tenant yet. Create one above to get started.
+                    You are not a member of an agency tenant.
                 </p>
             )}
 
@@ -435,7 +462,7 @@ export function AgencyConsoleView() {
                                 <div>
                                     <h2 className="text-lg font-bold text-white">Agency settings</h2>
                                     <p className="text-sm text-gray-400 mt-1 max-w-xl">
-                                        Organization name, status, and ID for this agency. Only Agency Admins can change name and status.
+                                        Organization name, status, and ID for this agency. Setting an agency inactive or suspended immediately removes access to linked sellers.
                                     </p>
                                     {loadingAgencyDetail ? (
                                         <Loader2 className="w-5 h-5 animate-spin text-gray-500 mt-3" />
@@ -560,7 +587,7 @@ export function AgencyConsoleView() {
                                     </div>
                                 </div>
                                 <p className="text-[12px] text-gray-400 leading-relaxed mb-4">
-                                    Seller tenant UUIDs (from the seller's dashboard → My access). Agency Admin only.
+                                    Agency Admin sees all linked sellers. Account Managers and Coordinators only see sellers assigned to them.
                                 </p>
                                 
                                 {canAdmin ? (
@@ -599,7 +626,7 @@ export function AgencyConsoleView() {
                                             <thead className="text-xs text-gray-500 uppercase bg-gray-900/50 sticky top-0 z-10 backdrop-blur-md border-b border-white/5">
                                                 <tr>
                                                     <th className="px-4 py-3 font-semibold">Seller Name</th>
-                                                    <th className="px-4 py-3 font-semibold w-24 text-right">Actions</th>
+                                                    <th className="px-4 py-3 font-semibold w-40 text-right">Actions</th>
                                                 </tr>
                                             </thead>
                                             <tbody className="divide-y divide-white/5">
@@ -619,14 +646,27 @@ export function AgencyConsoleView() {
                                                             </div>
                                                         </td>
                                                         <td className="px-4 py-3 text-right">
-                                                            <button
-                                                                type="button"
-                                                                onClick={() => copyId(s.id)}
-                                                                className="text-gray-500 hover:text-white p-1.5 rounded-md hover:bg-white/10 transition-colors inline-block"
-                                                                title="Copy full UUID"
-                                                            >
-                                                                {copied === s.id ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4" />}
-                                                            </button>
+                                                            <div className="flex items-center justify-end gap-3">
+                                                                {canAdmin && (
+                                                                    <button
+                                                                        type="button"
+                                                                        disabled={busy === `unlink-${s.id}`}
+                                                                        onClick={() => handleUnlinkSeller(s.id)}
+                                                                        className="text-xs font-bold text-amber-300 hover:text-amber-200 disabled:opacity-50"
+                                                                        title="Unlink seller"
+                                                                    >
+                                                                        Unlink
+                                                                    </button>
+                                                                )}
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={() => copyId(s.id)}
+                                                                    className="text-gray-500 hover:text-white p-1.5 rounded-md hover:bg-white/10 transition-colors inline-block"
+                                                                    title="Copy full UUID"
+                                                                >
+                                                                    {copied === s.id ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4" />}
+                                                                </button>
+                                                            </div>
                                                         </td>
                                                     </tr>
                                                 ))}
