@@ -58,13 +58,19 @@ export const globalLimiter = rateLimit({
     },
 });
 
-/** 20 req / 15 min — auth and shop connect endpoints */
+/** 20 req / 15 min — auth and shop connect endpoints (GET status polling is excluded). */
 export const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 20,
     standardHeaders: 'draft-7',
     legacyHeaders: false,
     handler: rateLimitHandler,
+    skip: (req) => {
+        if (req.method === 'GET' && typeof req.path === 'string' && req.path.startsWith('/status/')) {
+            return true;
+        }
+        return false;
+    },
 });
 
 /** 15 req / 60 sec — POST /sync/:accountId (manual sync trigger) */

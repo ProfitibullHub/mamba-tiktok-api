@@ -186,7 +186,7 @@ autoTable(doc, {
     ['AC: assigned scope; no subscription or agency-level admin', 'Implemented', 'Role grants + read-only team/roles UI where implemented.'],
     ['Custom roles tenant-scoped; cannot exceed creator', 'Implemented', '`get_my_custom_role_permission_ceiling`, `create_custom_role` / `update_custom_role`.'],
     ['Central permission logic; avoid ad-hoc hardcoding', 'Implemented', 'Action strings in DB; some UI still uses role names for UX—authoritative checks are DB/RPC.'],
-    ['Export dashboards & email (manual / automated)', 'Implemented', 'API `/api/reports/email-dashboard` (order + optional P&L snapshot); daily digest + Resend; Vercel cron (daily on Hobby).'],
+    ['Export dashboards & email (manual / automated)', 'Implemented', 'API `/api/reports/email-dashboard` (order + optional P&L snapshot); daily digest via GoHighLevel (LeadConnector) PIT + location; Vercel cron (daily on Hobby).'],
     ['Unified messaging', 'Partial', '`messages.send` in catalog; product messaging UX not covered in this summary.'],
     ['Tasks (AM/AC)', 'Partial', '`tasks.manage` permission seeded; dedicated task product scope to confirm with client.'],
     ['§3.13 Financial restrictions (cross-reference)', 'See §3.13', '`financials.restricted` vs `financials.view`; fee/settlement RLS—full §3.13 matrix separate doc if required.'],

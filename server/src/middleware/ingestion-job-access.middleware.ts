@@ -1,7 +1,12 @@
 import type { NextFunction, Request, Response } from 'express';
 import { authorize } from '../services/authorization.service.js';
 import { getIngestionJob } from '../services/ingestion-queue.service.js';
-import { ACTION_TIKTOK_AUTH, FEATURE_TIKTOK_ADS, FEATURE_TIKTOK_SHOP } from '../constants/tiktok-entitlements.js';
+import {
+    ACTION_TIKTOK_ADS_DATA,
+    ACTION_TIKTOK_SHOP_DATA,
+    FEATURE_TIKTOK_ADS,
+    FEATURE_TIKTOK_SHOP,
+} from '../constants/tiktok-entitlements.js';
 
 function featureKeyForIngestionStream(stream: string): string | null {
     if (stream === 'shop') return FEATURE_TIKTOK_SHOP;
@@ -25,8 +30,9 @@ export function requireIngestionJobReadAccess() {
                 res.status(400).json({ success: false, error: 'Unsupported job stream' });
                 return;
             }
+            const action = job.stream === 'ads' ? ACTION_TIKTOK_ADS_DATA : ACTION_TIKTOK_SHOP_DATA;
             const result = await authorize(req, {
-                action: ACTION_TIKTOK_AUTH,
+                action,
                 featureKey,
                 accountId: job.account_id,
             });

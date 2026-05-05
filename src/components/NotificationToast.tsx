@@ -15,7 +15,7 @@ export function NotificationToast() {
     // pointer-events-none stops the invisible container from blocking the screen, 
     // while pointer-events-auto on the children re-enables clicks.
     return (
-        <div className="fixed top-8 left-1/2 -translate-x-1/2 z-[60] flex flex-col gap-3 pointer-events-none">
+        <div className="fixed top-8 left-1/2 -translate-x-1/2 z-[100040] flex flex-col gap-3 pointer-events-none">
             {activeToasts.map((toast) => (
                 <ToastItem 
                     key={toast.id} 
@@ -66,31 +66,31 @@ function ToastItem({
     const getIcon = (category: string) => {
         switch (category) {
             case 'Order':
-                return <ShoppingBag className="h-5 w-5 text-emerald-400" />;
+                return <ShoppingBag className="h-5 w-5" style={{ color: 'var(--brand-success-text)' }} />;
             case 'Customer Service':
-                return <MessageSquare className="h-5 w-5 text-blue-400" />;
+                return <MessageSquare className="h-5 w-5" style={{ color: 'var(--brand-info-text)' }} />;
             case 'Fulfillment':
-                return <Package className="h-5 w-5 text-amber-400" />;
+                return <Package className="h-5 w-5" style={{ color: 'var(--brand-warning-text)' }} />;
             case 'Reverse':
-                return <RefreshCcw className="h-5 w-5 text-rose-400" />;
+                return <RefreshCcw className="h-5 w-5" style={{ color: 'var(--brand-danger-text)' }} />;
             default:
-                return <Bell className="h-5 w-5 text-indigo-400" />;
+                return <Bell className="h-5 w-5" style={{ color: 'var(--brand-toast-info-icon)' }} />;
         }
     };
 
     const getBgColor = (category: string) => {
         switch (category) {
-            case 'Order': return 'bg-emerald-500/20';
-            case 'Customer Service': return 'bg-blue-500/20';
-            case 'Fulfillment': return 'bg-amber-500/20';
-            case 'Reverse': return 'bg-rose-500/20';
-            default: return 'bg-indigo-500/20';
+            case 'Order': return 'var(--brand-success-bg)';
+            case 'Customer Service': return 'var(--brand-info-bg)';
+            case 'Fulfillment': return 'var(--brand-warning-bg)';
+            case 'Reverse': return 'var(--brand-danger-bg)';
+            default: return 'var(--brand-info-bg)';
         }
     };
 
     return (
         <div
-            className={`flex items-center gap-4 rounded-2xl bg-gray-900/95 backdrop-blur-md px-5 py-4 shadow-2xl border border-gray-700/50 transition-all duration-500 ease-out cursor-pointer hover:bg-gray-800/95 pointer-events-auto ${
+            className={`flex items-center gap-4 rounded-2xl brand-toast-info backdrop-blur-md px-5 py-4 shadow-2xl transition-all duration-500 ease-out cursor-pointer brand-row-hover pointer-events-auto ${
                 visible ? 'opacity-100 translate-y-0 scale-100' : 'opacity-0 -translate-y-8 scale-95'
             }`}
             onClick={() => {
@@ -107,14 +107,14 @@ function ToastItem({
                 }, 400);
             }}
         >
-            <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full ${getBgColor(toast.category)}`}>
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full" style={{ backgroundColor: getBgColor(toast.category) }}>
                 {getIcon(toast.category)}
             </div>
             <div className="flex flex-col pr-4">
-                <span className="text-sm font-semibold text-white">
+                <span className="text-sm font-semibold brand-text">
                     {toast.title}
                 </span>
-                <span className="text-sm text-gray-300">{toast.message}</span>
+                <span className="text-sm brand-muted">{toast.message}</span>
             </div>
         </div>
     );

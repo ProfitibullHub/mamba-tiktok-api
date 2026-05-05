@@ -1,16 +1,19 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { useState, useMemo, useEffect, useRef } from 'react';
+import { useState, useMemo, useEffect, useRef, Fragment } from 'react';
 import {
     Users, Store, Building2, ShoppingBag, Shield, BarChart3, Crown,
     Search, RefreshCw, ExternalLink, ChevronRight, X, Calculator, Wallet,
-    Globe, MoreVertical, Ban, Unlock, KeyRound, Trash2, UserX, AlertTriangle, Copy, Check, Pencil,
+    Globe, MoreVertical, Ban, Unlock, KeyRound, Trash2, UserX, AlertTriangle, Copy, Check, Pencil, Unlink, ChevronDown,
 } from 'lucide-react';
 import { supabase } from '../../lib/supabase';
 import { useTenantContext } from '../../contexts/TenantContext';
 import { useAuth } from '../../contexts/AuthContext';
 import { adminPatchTenant, adminDeleteTenant } from '../../lib/adminTenantsApi';
+import { showAppToast } from '../../store/useAppToastStore';
+import { unlinkAgencySeller } from '../../lib/teamApi';
+import { getApiOrigin } from '../../lib/apiClient';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001';
+const API_BASE_URL = getApiOrigin();
 
 type StatsData = {
     totalUsers: number;
@@ -41,6 +44,7 @@ type TenantRow = {
     type: 'agency' | 'seller';
     status: string;
     created_at: string;
+    parent_tenant_id?: string | null;
     parent_agency_name: string | null;
     member_count: number;
     linked_sellers?: number;
@@ -288,7 +292,7 @@ export function AdminDashboard({ onNavigateToTeamRoles }: { onNavigateToTeamRole
         false;
 
     return (
-        <div className="space-y-8 animate-in fade-in duration-500 relative">
+        <div className="w-full max-w-none space-y-8 animate-in fade-in duration-500 relative">
             <div className="absolute inset-x-0 top-0 h-64 bg-gradient-to-b from-fuchsia-500/10 via-pink-500/5 to-transparent -z-10 rounded-full blur-[100px] opacity-50 pointer-events-none" />
 
             <div>
@@ -409,6 +413,7 @@ export function AdminDashboard({ onNavigateToTeamRoles }: { onNavigateToTeamRole
                         {(drillView === 'agencies' || drillView === 'sellers') && (
                             <TenantsTable
                                 tenants={filteredTenants}
+                                allTenants={allTenants}
                                 search={search}
                                 drillView={drillView}
                                 showSuperAdminActions={isPlatformSuperAdmin}
@@ -447,11 +452,10 @@ function UsersTable({ users, search, tenantOptions }: { users: AdminUser[]; sear
     const queryClient = useQueryClient();
     const [openMenuId, setOpenMenuId] = useState<string | null>(null);
     const menuRef = useRef<HTMLDivElement>(null);
-    const [confirm, setConfirm] = useState<null | { type: 'delete' | 'revoke'; target: AdminUser }>(null);
+    const [confirm, setConfirm] = useState<null | { type: 'delete' | 'deleteForce' | 'revoke'; target: AdminUser }>(null);
     const [transferTarget, setTransferTarget] = useState<AdminUser | null>(null);
     const [transferTenantId, setTransferTenantId] = useState('');
     const [transferRoleName, setTransferRoleName] = useState('');
-    const [toast, setToast] = useState<null | { kind: 'ok' | 'err'; msg: string }>(null);
 
     useEffect(() => {
         const close = (e: MouseEvent) => {
@@ -472,51 +476,81 @@ function UsersTable({ users, search, tenantOptions }: { users: AdminUser[]; sear
 
     const deleteMut = useMutation({
         mutationFn: (id: string) => adminDelete(`/api/admin/users/${id}`),
-        onSuccess: () => {
+        onSuccess: (data: unknown) => {
             invalidateAdmin();
-            setToast({ kind: 'ok', msg: 'User deleted.' });
+            const payload = data as {
+                tenantsRetained?: { tenantId: string; reason: string; otherUserIds: string[] }[];
+            };
+            const retained = payload?.tenantsRetained;
+            if (Array.isArray(retained) && retained.length > 0) {
+                showAppToast(
+                    `User deleted. ${retained.length} tenant(s) were not removed because other users still have them as canonical tenant: ${retained.map((r) => r.tenantId.slice(0, 8)).join(', ')}…`,
+                    'ok'
+                );
+            } else {
+                showAppToast('User deleted.', 'ok');
+            }
             setConfirm(null);
         },
-        onError: (e: Error) => setToast({ kind: 'err', msg: e.message }),
+        onError: (e: Error) => showAppToast(e.message, 'err'),
+    });
+
+    const deleteWithOwnedTenantsMut = useMutation({
+        mutationFn: (id: string) => adminPost(`/api/admin/users/${id}/delete-with-owned-tenants`),
+        onSuccess: (data: unknown) => {
+            invalidateAdmin();
+            const payload = data as {
+                tenantsDeleted?: string[];
+                tenantsRetained?: { tenantId: string; reason: string; otherUserIds: string[] }[];
+            };
+            const deletedCount = Array.isArray(payload?.tenantsDeleted) ? payload.tenantsDeleted.length : 0;
+            const retainedCount = Array.isArray(payload?.tenantsRetained) ? payload.tenantsRetained.length : 0;
+            showAppToast(
+                `User deleted. Removed ${deletedCount} solely-owned seller tenant(s). ${retainedCount > 0 ? `${retainedCount} shared tenant(s) were kept intact.` : 'Shared tenants stayed intact.'}`,
+                'ok'
+            );
+            setConfirm(null);
+        },
+        onError: (e: Error) => showAppToast(e.message, 'err'),
     });
 
     const revokeMut = useMutation({
         mutationFn: (id: string) => adminPost(`/api/admin/users/${id}/revoke-memberships`),
         onSuccess: () => {
             invalidateAdmin();
-            setToast({ kind: 'ok', msg: 'All tenant memberships removed.' });
+            showAppToast('All tenant memberships removed.', 'ok');
             setConfirm(null);
         },
-        onError: (e: Error) => setToast({ kind: 'err', msg: e.message }),
+        onError: (e: Error) => showAppToast(e.message, 'err'),
     });
 
     const suspendMut = useMutation({
         mutationFn: (id: string) => adminPost(`/api/admin/users/${id}/suspend`),
         onSuccess: () => {
             invalidateAdmin();
-            setToast({ kind: 'ok', msg: 'User suspended.' });
+            showAppToast('User suspended.', 'ok');
             setOpenMenuId(null);
         },
-        onError: (e: Error) => setToast({ kind: 'err', msg: e.message }),
+        onError: (e: Error) => showAppToast(e.message, 'err'),
     });
 
     const unsuspendMut = useMutation({
         mutationFn: (id: string) => adminPost(`/api/admin/users/${id}/unsuspend`),
         onSuccess: () => {
             invalidateAdmin();
-            setToast({ kind: 'ok', msg: 'Suspension lifted.' });
+            showAppToast('Suspension lifted.', 'ok');
             setOpenMenuId(null);
         },
-        onError: (e: Error) => setToast({ kind: 'err', msg: e.message }),
+        onError: (e: Error) => showAppToast(e.message, 'err'),
     });
 
     const resetPwMut = useMutation({
         mutationFn: (id: string) => adminPost(`/api/admin/users/${id}/reset-password`),
         onSuccess: () => {
-            setToast({ kind: 'ok', msg: 'Password reset email sent.' });
+            showAppToast('Password reset email sent.', 'ok');
             setOpenMenuId(null);
         },
-        onError: (e: Error) => setToast({ kind: 'err', msg: e.message }),
+        onError: (e: Error) => showAppToast(e.message, 'err'),
     });
 
     const transferMut = useMutation({
@@ -527,23 +561,23 @@ function UsersTable({ users, search, tenantOptions }: { users: AdminUser[]; sear
             }),
         onSuccess: () => {
             invalidateAdmin();
-            setToast({ kind: 'ok', msg: 'Tenant membership transferred.' });
+            showAppToast('Tenant membership transferred.', 'ok');
             setTransferTarget(null);
             setTransferTenantId('');
             setTransferRoleName('');
         },
-        onError: (e: Error) => setToast({ kind: 'err', msg: e.message }),
+        onError: (e: Error) => showAppToast(e.message, 'err'),
     });
-
-    useEffect(() => {
-        if (!toast) return;
-        const t = setTimeout(() => setToast(null), 5000);
-        return () => clearTimeout(t);
-    }, [toast]);
 
     const isSelf = (id: string) => currentUser?.id === id;
     const busy =
-        deleteMut.isPending || revokeMut.isPending || suspendMut.isPending || unsuspendMut.isPending || resetPwMut.isPending || transferMut.isPending;
+        deleteMut.isPending ||
+        deleteWithOwnedTenantsMut.isPending ||
+        revokeMut.isPending ||
+        suspendMut.isPending ||
+        unsuspendMut.isPending ||
+        resetPwMut.isPending ||
+        transferMut.isPending;
 
     const selectedTransferTenant = useMemo(
         () => tenantOptions.find((t) => t.id === transferTenantId) ?? null,
@@ -570,18 +604,6 @@ function UsersTable({ users, search, tenantOptions }: { users: AdminUser[]; sear
 
     return (
         <div className="space-y-4">
-            {toast && (
-                <div
-                    className={`px-5 py-3 rounded-2xl text-sm font-medium border ${
-                        toast.kind === 'ok'
-                            ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-300'
-                            : 'bg-red-500/10 border-red-500/20 text-red-300'
-                    }`}
-                >
-                    {toast.msg}
-                </div>
-            )}
-
             <div className="bg-white/[0.02] border border-white/10 rounded-3xl overflow-visible backdrop-blur-md">
                 <table className="w-full text-left">
                     <thead>
@@ -733,6 +755,17 @@ function UsersTable({ users, search, tenantOptions }: { users: AdminUser[]; sear
                                                         <Trash2 className="w-4 h-4" />
                                                         Delete user
                                                     </button>
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => {
+                                                            setOpenMenuId(null);
+                                                            setConfirm({ type: 'deleteForce', target: user });
+                                                        }}
+                                                        className="w-full flex items-center gap-2 px-4 py-2.5 text-left text-sm text-amber-200 hover:bg-amber-500/10"
+                                                    >
+                                                        <AlertTriangle className="w-4 h-4 text-amber-400" />
+                                                        Delete user + owned seller tenants
+                                                    </button>
                                                 </div>
                                             )}
                                         </div>
@@ -762,13 +795,22 @@ function UsersTable({ users, search, tenantOptions }: { users: AdminUser[]; sear
                             </div>
                             <div>
                                 <h3 className="text-lg font-bold text-white">
-                                    {confirm.type === 'delete' ? 'Delete user' : 'Revoke all memberships'}
+                                    {confirm.type === 'revoke'
+                                        ? 'Revoke all memberships'
+                                        : confirm.type === 'deleteForce'
+                                            ? 'Delete user with owned tenant cleanup'
+                                            : 'Delete user'}
                                 </h3>
                                 <p className="text-sm text-gray-400 mt-2 leading-relaxed">
                                     {confirm.type === 'delete' ? (
                                         <>
                                             Permanently remove <span className="text-white font-semibold">{confirm.target.full_name || confirm.target.email}</span> (
-                                            {confirm.target.email}). Orphan seller tenants they solely own (and linked shops) will be removed; shared tenants stay intact.
+                                            {confirm.target.email}). This action is blocked if the user is the last active Agency Admin or Seller Admin.
+                                        </>
+                                    ) : confirm.type === 'deleteForce' ? (
+                                        <>
+                                            Permanently remove <span className="text-white font-semibold">{confirm.target.full_name || confirm.target.email}</span> (
+                                            {confirm.target.email}). Solely-owned seller tenants (and linked shops) will be removed automatically; shared tenants stay intact.
                                         </>
                                     ) : (
                                         <>
@@ -789,15 +831,21 @@ function UsersTable({ users, search, tenantOptions }: { users: AdminUser[]; sear
                             </button>
                             <button
                                 type="button"
-                                disabled={deleteMut.isPending || revokeMut.isPending}
+                                disabled={deleteMut.isPending || deleteWithOwnedTenantsMut.isPending || revokeMut.isPending}
                                 onClick={() =>
                                     confirm.type === 'delete'
                                         ? deleteMut.mutate(confirm.target.id)
-                                        : revokeMut.mutate(confirm.target.id)
+                                        : confirm.type === 'deleteForce'
+                                            ? deleteWithOwnedTenantsMut.mutate(confirm.target.id)
+                                            : revokeMut.mutate(confirm.target.id)
                                 }
                                 className="px-4 py-2 rounded-xl bg-red-600 hover:bg-red-500 text-white text-sm font-semibold disabled:opacity-50"
                             >
-                                {confirm.type === 'delete' ? 'Delete' : 'Revoke'}
+                                {confirm.type === 'delete'
+                                    ? 'Delete'
+                                    : confirm.type === 'deleteForce'
+                                        ? 'Delete + Cleanup'
+                                        : 'Revoke'}
                             </button>
                         </div>
                     </div>
@@ -882,11 +930,14 @@ function UsersTable({ users, search, tenantOptions }: { users: AdminUser[]; sear
 
 function TenantsTable({
     tenants,
+    allTenants,
     search,
     drillView,
     showSuperAdminActions,
 }: {
     tenants: TenantRow[];
+    /** Full tenant list (used to resolve seller orgs under an agency). */
+    allTenants: TenantRow[];
     search: string;
     drillView: string;
     showSuperAdminActions: boolean;
@@ -898,7 +949,8 @@ function TenantsTable({
     const [editName, setEditName] = useState('');
     const [deleteTarget, setDeleteTarget] = useState<TenantRow | null>(null);
     const [copiedId, setCopiedId] = useState<string | null>(null);
-    const [toast, setToast] = useState<null | { kind: 'ok' | 'err'; msg: string }>(null);
+    const [expandedAgencyId, setExpandedAgencyId] = useState<string | null>(null);
+    const [unlinkBusySellerId, setUnlinkBusySellerId] = useState<string | null>(null);
 
     useEffect(() => {
         const close = (e: MouseEvent) => {
@@ -908,40 +960,65 @@ function TenantsTable({
         return () => document.removeEventListener('click', close);
     }, []);
 
+    useEffect(() => {
+        setExpandedAgencyId(null);
+    }, [drillView]);
+
     const invalidate = () => {
         queryClient.invalidateQueries({ queryKey: ['admin-tenants'] });
+        queryClient.invalidateQueries({ queryKey: ['admin-tenants-all'] });
         queryClient.invalidateQueries({ queryKey: ['admin-stats'] });
         queryClient.invalidateQueries({ queryKey: ['admin-memberships'] });
         queryClient.invalidateQueries({ queryKey: ['tenant-memberships'] });
+    };
+
+    const linkedSellerOrgs = useMemo(() => {
+        if (!expandedAgencyId) return [];
+        return allTenants.filter((t) => t.type === 'seller' && t.parent_tenant_id === expandedAgencyId);
+    }, [allTenants, expandedAgencyId]);
+
+    const handleUnlinkSellerFromAgency = async (agencyId: string, seller: TenantRow) => {
+        if (
+            !window.confirm(
+                `Unlink "${seller.name}" from this agency? The seller organization remains; agency access derived from this link is removed (same behavior as Agency Console).`
+            )
+        ) {
+            return;
+        }
+        setUnlinkBusySellerId(seller.id);
+        try {
+            await unlinkAgencySeller(agencyId, seller.id);
+            showAppToast('Seller unlinked from agency.', 'ok');
+            invalidate();
+        } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : 'Unlink failed';
+            showAppToast(msg, 'err');
+        } finally {
+            setUnlinkBusySellerId(null);
+        }
     };
 
     const patchMut = useMutation({
         mutationFn: ({ id, body }: { id: string; body: { name?: string; status?: string } }) => adminPatchTenant(id, body),
         onSuccess: () => {
             invalidate();
-            setToast({ kind: 'ok', msg: 'Tenant updated.' });
+            showAppToast('Tenant updated.', 'ok');
             setEditTarget(null);
             setOpenMenuId(null);
         },
-        onError: (e: Error) => setToast({ kind: 'err', msg: e.message }),
+        onError: (e: Error) => showAppToast(e.message, 'err'),
     });
 
     const deleteMut = useMutation({
         mutationFn: (id: string) => adminDeleteTenant(id),
         onSuccess: () => {
             invalidate();
-            setToast({ kind: 'ok', msg: 'Tenant deleted.' });
+            showAppToast('Tenant deleted.', 'ok');
             setDeleteTarget(null);
             setOpenMenuId(null);
         },
-        onError: (e: Error) => setToast({ kind: 'err', msg: e.message }),
+        onError: (e: Error) => showAppToast(e.message, 'err'),
     });
-
-    useEffect(() => {
-        if (!toast) return;
-        const t = setTimeout(() => setToast(null), 5000);
-        return () => clearTimeout(t);
-    }, [toast]);
 
     const copyId = async (id: string) => {
         try {
@@ -950,7 +1027,7 @@ function TenantsTable({
             setOpenMenuId(null);
             setTimeout(() => setCopiedId(null), 2000);
         } catch {
-            setToast({ kind: 'err', msg: 'Could not copy' });
+            showAppToast('Could not copy', 'err');
         }
     };
 
@@ -965,18 +1042,6 @@ function TenantsTable({
 
     return (
         <div className="space-y-4">
-            {toast && (
-                <div
-                    className={`px-5 py-3 rounded-2xl text-sm font-medium border ${
-                        toast.kind === 'ok'
-                            ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-300'
-                            : 'bg-red-500/10 border-red-500/20 text-red-300'
-                    }`}
-                >
-                    {toast.msg}
-                </div>
-            )}
-
             <div className="bg-white/[0.02] border border-white/10 rounded-3xl overflow-visible backdrop-blur-md">
                 <table className="w-full text-left">
                     <thead>
@@ -1000,9 +1065,32 @@ function TenantsTable({
                     </thead>
                     <tbody className="divide-y divide-white/5">
                         {tenants.map((t) => (
-                            <tr key={t.id} className="hover:bg-white/[0.03] transition-colors group">
+                            <Fragment key={t.id}>
+                            <tr
+                                title={
+                                    drillView === 'agencies' && t.type === 'agency'
+                                        ? 'Expand to see linked sellers and shops'
+                                        : undefined
+                                }
+                                className={`hover:bg-white/[0.03] transition-colors group ${
+                                    drillView === 'agencies' && t.type === 'agency' ? 'cursor-pointer' : ''
+                                } ${expandedAgencyId === t.id ? 'bg-violet-500/[0.07]' : ''}`}
+                                onClick={() => {
+                                    if (drillView === 'agencies' && t.type === 'agency') {
+                                        setExpandedAgencyId((cur) => (cur === t.id ? null : t.id));
+                                    }
+                                }}
+                            >
                                 <td className="px-6 py-4">
                                     <div className="flex items-center gap-3">
+                                        {drillView === 'agencies' && t.type === 'agency' && (
+                                            <ChevronDown
+                                                className={`w-4 h-4 shrink-0 text-gray-500 transition-transform ${
+                                                    expandedAgencyId === t.id ? 'rotate-180' : ''
+                                                }`}
+                                                aria-hidden
+                                            />
+                                        )}
                                         <div className={`w-10 h-10 rounded-full border border-white/10 flex items-center justify-center text-sm font-bold text-white shrink-0 ${
                                             t.type === 'agency'
                                                 ? 'bg-gradient-to-br from-violet-500/30 to-indigo-500/30'
@@ -1065,7 +1153,7 @@ function TenantsTable({
                                     {new Date(t.created_at).toLocaleDateString()}
                                 </td>
                                 {showSuperAdminActions && (
-                                    <td className="px-6 py-4 text-right relative">
+                                    <td className="px-6 py-4 text-right relative" onClick={(e) => e.stopPropagation()}>
                                         <div className="relative inline-block" ref={openMenuId === t.id ? menuRef : undefined}>
                                             <button
                                                 type="button"
@@ -1137,6 +1225,82 @@ function TenantsTable({
                                     </td>
                                 )}
                             </tr>
+                            {drillView === 'agencies' && t.type === 'agency' && expandedAgencyId === t.id && (
+                                <tr className="bg-gray-950/90 border-t border-violet-500/20">
+                                    <td colSpan={colCount} className="px-6 py-4">
+                                        <div className="rounded-xl border border-white/10 bg-black/30 overflow-hidden">
+                                            <div className="px-4 py-2.5 border-b border-white/10 bg-white/[0.03]">
+                                                <p className="text-xs text-gray-400">
+                                                    Linked seller organizations under{' '}
+                                                    <span className="text-white font-semibold">{t.name}</span>
+                                                    . Shop count = TikTok shops on that seller tenant. Unlink removes the agency link only.
+                                                </p>
+                                            </div>
+                                            <div className="p-3 max-h-[min(360px,50vh)] overflow-y-auto">
+                                                {linkedSellerOrgs.length === 0 ? (
+                                                    <p className="text-sm text-gray-500 italic py-6 text-center px-2">
+                                                        No seller tenants linked under this agency.
+                                                    </p>
+                                                ) : (
+                                                    <table className="w-full text-left text-sm">
+                                                        <thead>
+                                                            <tr className="text-[10px] font-bold text-gray-500 uppercase tracking-wider border-b border-white/10">
+                                                                <th className="py-2 pr-3">Seller</th>
+                                                                <th className="py-2 text-center w-20">Shops</th>
+                                                                <th className="py-2 w-24">Status</th>
+                                                                <th className="py-2 text-right w-36">Link</th>
+                                                            </tr>
+                                                        </thead>
+                                                        <tbody className="divide-y divide-white/5">
+                                                            {linkedSellerOrgs.map((s) => (
+                                                                <tr key={s.id}>
+                                                                    <td className="py-2.5 pr-3">
+                                                                        <p className="font-semibold text-white">{s.name}</p>
+                                                                        <p className="text-[10px] text-gray-600 font-mono truncate max-w-[320px]">{s.id}</p>
+                                                                    </td>
+                                                                    <td className="py-2.5 text-center">
+                                                                        <span
+                                                                            className={`font-bold ${
+                                                                                s.shop_count > 0 ? 'text-emerald-400' : 'text-gray-600'
+                                                                            }`}
+                                                                        >
+                                                                            {s.shop_count}
+                                                                        </span>
+                                                                    </td>
+                                                                    <td className="py-2.5">
+                                                                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-md border text-gray-400 border-white/10 uppercase">
+                                                                            {s.status || '—'}
+                                                                        </span>
+                                                                    </td>
+                                                                    <td className="py-2.5 text-right">
+                                                                        <button
+                                                                            type="button"
+                                                                            disabled={unlinkBusySellerId === s.id}
+                                                                            onClick={(e) => {
+                                                                                e.stopPropagation();
+                                                                                void handleUnlinkSellerFromAgency(t.id, s);
+                                                                            }}
+                                                                            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-amber-500/35 bg-amber-500/10 text-amber-200 text-[11px] font-bold hover:bg-amber-500/20 disabled:opacity-50"
+                                                                        >
+                                                                            {unlinkBusySellerId === s.id ? (
+                                                                                <span className="inline-block w-3 h-3 border-2 border-amber-300/30 border-t-amber-200 rounded-full animate-spin" />
+                                                                            ) : (
+                                                                                <Unlink className="w-3 h-3" />
+                                                                            )}
+                                                                            Unlink
+                                                                        </button>
+                                                                    </td>
+                                                                </tr>
+                                                            ))}
+                                                        </tbody>
+                                                    </table>
+                                                )}
+                                            </div>
+                                        </div>
+                                    </td>
+                                </tr>
+                            )}
+                            </Fragment>
                         ))}
                         {tenants.length === 0 && (
                             <tr>

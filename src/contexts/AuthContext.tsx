@@ -2,6 +2,7 @@ import { createContext, useContext, useEffect, useState, ReactNode } from 'react
 import { User } from '@supabase/supabase-js';
 import { supabase, Profile } from '../lib/supabase';
 import { queryClient } from '../queryClient';
+import { useShopStore } from '../store/useShopStore';
 
 interface AuthContextType {
   user: User | null;
@@ -35,6 +36,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         // so the incoming user never sees the outgoing user's shops/memberships/tenants.
         if (current?.id !== newUser?.id) {
           queryClient.clear();
+          useShopStore.getState().clearData();
         }
         if (current?.id === newUser?.id && current?.email === newUser?.email) return current;
         return newUser;
@@ -67,28 +69,48 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           return data;
         });
       } else {
-        // Profile doesn't exist — auto-create it
-        console.log('[Auth] Profile missing for user, creating automatically:', userId);
+        // Profile missing: create a minimal row only — no seller tenant until Connect shop / agency onboarding.
+        console.log('[Auth] Profile missing for user, creating minimal profile:', userId);
         const { data: { user: authUser } } = await supabase.auth.getUser();
         if (authUser) {
-          const newProfile = {
-            id: authUser.id,
-            email: authUser.email,
-            full_name: authUser.user_metadata?.full_name || authUser.email?.split('@')[0] || 'User',
-            role: 'client',
-            updated_at: new Date().toISOString(),
-          };
-          const { data: created, error: insertError } = await supabase
-            .from('profiles')
-            .upsert(newProfile, { onConflict: 'id' })
-            .select()
-            .single();
-
-          if (insertError) {
-            console.error('[Auth] Failed to auto-create profile:', insertError);
+          const email = (authUser.email ?? '').trim();
+          if (!email) {
+            console.error('[Auth] Cannot create profile: auth user has no email');
           } else {
-            console.log('[Auth] Profile auto-created successfully');
-            setProfile(created);
+            const fullName =
+              authUser.user_metadata?.full_name?.trim() ||
+              email.split('@')[0] ||
+              'User';
+            const row = {
+              id: authUser.id,
+              email,
+              full_name: fullName,
+              role: 'client' as const,
+              tenant_id: null as string | null,
+              updated_at: new Date().toISOString(),
+            };
+            const { data: inserted, error: insertError } = await supabase
+              .from('profiles')
+              .insert(row)
+              .select('*')
+              .maybeSingle();
+
+            if (insertError?.code === '23505') {
+              const { data: existing, error: readErr } = await supabase
+                .from('profiles')
+                .select('*')
+                .eq('id', userId)
+                .maybeSingle();
+              if (readErr) console.error('[Auth] Profile race: reload failed:', readErr);
+              else if (existing) setProfile(existing);
+            } else if (insertError) {
+              console.error('[Auth] Failed to create minimal profile:', insertError);
+            } else if (inserted) {
+              setProfile(inserted);
+              await queryClient.invalidateQueries({ queryKey: ['profile-tenant', userId] });
+              await queryClient.invalidateQueries({ queryKey: ['tenant-memberships', userId] });
+              await queryClient.invalidateQueries({ queryKey: ['accounts', userId] });
+            }
           }
         }
       }
@@ -123,6 +145,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     } finally {
       // Clear the entire React Query cache so the next user starts fresh
       queryClient.clear();
+      useShopStore.getState().clearData();
       setUser(null);
       setProfile(null);
       setLoading(false);

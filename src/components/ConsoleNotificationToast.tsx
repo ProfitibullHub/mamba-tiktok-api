@@ -13,7 +13,7 @@ export function ConsoleNotificationToast() {
     );
 
     return (
-        <div className="fixed top-4 right-4 z-[9999] flex flex-col gap-3 pointer-events-none">
+        <div className="fixed top-20 right-4 z-[100030] flex flex-col gap-3 pointer-events-none">
             {ephemeralToasts.map((toast) => (
                 <div key={toast.id} className="pointer-events-auto">
                     <ToastItem toast={toast} onClose={() => removeActiveToast(toast.id)} />

@@ -18,4 +18,168 @@
     .rotate-y-180 {
         transform: rotateY(180deg);
     }
+
+    .brand-bg {
+        background-color: var(--brand-bg);
+    }
+    
+    /** Surfaces: app cards + metric tiles (8-digit hex / alpha supported via CSS vars) */
+    .brand-card {
+        background-color: var(--brand-card-bg);
+        border: 1px solid var(--brand-card-border);
+    }
+    .brand-card-hover:hover {
+        background-color: var(--brand-card-hover);
+    }
+    .brand-primary-card {
+        background-color: var(--brand-primary-card-bg);
+        border: 1px solid var(--brand-primary-card-border);
+    }
+    .brand-secondary-card {
+        background-color: var(--brand-secondary-card-bg);
+        border: 1px solid var(--brand-secondary-card-border);
+    }
+
+    /** Toolbar / header strips that sit on the page background */
+    .brand-toolbar {
+        background-color: color-mix(in srgb, var(--brand-card-bg) 88%, var(--brand-primary));
+        border: 1px solid var(--brand-card-border);
+    }
+    
+    .brand-text {
+        color: var(--brand-text);
+    }
+    
+    .brand-muted {
+        color: var(--brand-text-muted);
+    }
+
+    /** Text on primary / accent fills (badges, gradient icons) — uses agency “Button text” token */
+    .brand-on-primary {
+        color: var(--brand-btn-text);
+    }
+
+    /** Inactive nav / links: muted, then primary text on hover */
+    .brand-nav-idle {
+        color: var(--brand-text-muted);
+    }
+    .brand-nav-idle:hover {
+        color: var(--brand-text);
+    }
+    .brand-focus-ring:focus-visible {
+        outline: 2px solid var(--brand-interactive-focus-ring);
+        outline-offset: 2px;
+    }
+    .brand-row-hover:hover {
+        background-color: var(--brand-interactive-hover-bg);
+    }
+    .brand-profit {
+        color: var(--brand-profit);
+    }
+    .brand-loss {
+        color: var(--brand-loss);
+    }
+    .brand-metric-zero {
+        color: var(--brand-warning-text);
+    }
+
+    /**
+     * Icon metric tiles — mix against main card surface (not secondary-card).
+     * Secondary card bg is often used for loud agency accents; P&L rows use the same
+     * icon treatment on top of `--brand-card-*`, so mixing here avoids “Skittle” tiles.
+     */
+    .brand-icon-tile-profit {
+        color: var(--brand-profit);
+        background-color: color-mix(in srgb, var(--brand-profit) 16%, var(--brand-card-bg));
+        border: 1px solid color-mix(in srgb, var(--brand-profit) 38%, var(--brand-card-border));
+    }
+    .brand-icon-tile-profit svg {
+        stroke: var(--brand-profit);
+    }
+    .brand-icon-tile-loss {
+        color: var(--brand-loss);
+        background-color: color-mix(in srgb, var(--brand-loss) 16%, var(--brand-card-bg));
+        border: 1px solid color-mix(in srgb, var(--brand-loss) 38%, var(--brand-card-border));
+    }
+    .brand-icon-tile-loss svg {
+        stroke: var(--brand-loss);
+    }
+    .brand-icon-tile-zero {
+        color: var(--brand-warning-text);
+        background-color: color-mix(in srgb, var(--brand-warning-text) 14%, var(--brand-card-bg));
+        border: 1px solid color-mix(in srgb, var(--brand-warning-border) 45%, var(--brand-card-border));
+    }
+    .brand-icon-tile-zero svg {
+        stroke: var(--brand-warning-text);
+    }
+    .brand-icon-tile-neutral {
+        color: var(--brand-text-muted);
+        background-color: color-mix(in srgb, var(--brand-text-muted) 12%, var(--brand-card-bg));
+        border: 1px solid var(--brand-card-border);
+    }
+    .brand-icon-tile-neutral svg {
+        stroke: var(--brand-text-muted);
+    }
+
+    .brand-state-success {
+        color: var(--brand-success-text);
+        border: 1px solid var(--brand-success-border);
+        background-color: var(--brand-success-bg);
+    }
+    .brand-state-warning {
+        color: var(--brand-warning-text);
+        border: 1px solid var(--brand-warning-border);
+        background-color: var(--brand-warning-bg);
+    }
+    .brand-state-danger {
+        color: var(--brand-danger-text);
+        border: 1px solid var(--brand-danger-border);
+        background-color: var(--brand-danger-bg);
+    }
+    .brand-state-info {
+        color: var(--brand-info-text);
+        border: 1px solid var(--brand-info-border);
+        background-color: var(--brand-info-bg);
+    }
+
+    .brand-toast-success {
+        background-color: var(--brand-toast-success-bg);
+        border: 1px solid var(--brand-toast-success-border);
+    }
+    .brand-toast-error {
+        background-color: var(--brand-toast-error-bg);
+        border: 1px solid var(--brand-toast-error-border);
+    }
+    .brand-toast-info {
+        background-color: var(--brand-toast-info-bg);
+        border: 1px solid var(--brand-toast-info-border);
+    }
+    .brand-toast-warning {
+        background-color: var(--brand-toast-warning-bg);
+        border: 1px solid var(--brand-toast-warning-border);
+    }
+
+    /** Inputs / search — typed text + placeholder follow brand tokens */
+    .brand-input::placeholder {
+        color: color-mix(in srgb, var(--brand-text-muted) 68%, transparent);
+    }
+}
+
+/* react-colorful — seller branding picker (scoped wrapper) */
+.brand-color-picker .react-colorful {
+    width: 220px;
+    height: 180px;
+}
+.brand-color-picker .react-colorful__saturation {
+    border-radius: 10px 10px 0 0;
+}
+.brand-color-picker .react-colorful__hue {
+    height: 14px;
+    border-radius: 0 0 10px 10px;
+}
+.brand-color-picker .react-colorful__pointer {
+    width: 18px;
+    height: 18px;
+    border: 2px solid #fff;
+    box-shadow: 0 1px 4px rgb(0 0 0 / 0.45);
 }

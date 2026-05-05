@@ -203,7 +203,7 @@ export function AcceptInvitationView() {
                                         <Row label="Tenant Type" value={info.tenantType ?? '—'} />
                                         <Row label="Your Role" value={info.roleName ?? '—'} />
                                         <p className="text-xs text-gray-400 bg-white/5 border border-white/10 rounded-lg px-3 py-2 mt-3">
-                                            Phase 2 users belong to one product tenant. Accepting this invite will place your account in this tenant context.
+                                            Each account is linked to one organization at a time. Accepting places your account in this team&apos;s tenant context.
                                         </p>
                                     </div>
                                 )}

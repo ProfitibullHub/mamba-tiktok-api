@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { createClient } from '@supabase/supabase-js';
+import { supabase } from '../lib/supabase';
 import { apiFetch } from '../lib/apiClient';
 import { getUtcCalendarRangeExclusiveUnix } from '../utils/dateUtils';
 
@@ -54,11 +54,6 @@ async function enqueueAndWaitAdsSync(
 
     throw new Error('Ads sync job timeout. Background job may still be running.');
 }
-
-// Supabase client for Realtime subscriptions (uses the same project as the main app)
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || '';
-const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
-const realtimeClient = createClient(supabaseUrl, supabaseAnonKey);
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -498,7 +493,7 @@ export const useTikTokAdsStore = create<TikTokAdsState>((set, get) => ({
     subscribeToMarketingUpdates: (accountId: string) => {
         console.log(`[TikTok Ads] Subscribing to Realtime updates for account ${accountId}`);
 
-        const channel = realtimeClient
+        const channel = supabase
             .channel(`marketing-realtime-${accountId}`)
             .on(
                 'postgres_changes',
@@ -520,7 +515,7 @@ export const useTikTokAdsStore = create<TikTokAdsState>((set, get) => ({
         // Return an unsubscribe function the caller can store in a useEffect cleanup
         return () => {
             console.log(`[TikTok Ads] Unsubscribing from Realtime for account ${accountId}`);
-            realtimeClient.removeChannel(channel);
+            supabase.removeChannel(channel);
         };
     },
 

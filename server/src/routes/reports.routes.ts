@@ -4,7 +4,9 @@ import { resolveRequestUserId } from '../middleware/account-access.middleware.js
 import { sendHtmlEmail } from '../services/email.js';
 import { auditLog } from '../services/audit-logger.js';
 import { authorize } from '../services/authorization.service.js';
+import { buildBrandedFromAddress, resolveTenantBranding } from '../services/tenant-branding.service.js';
 import { applyFinancialFieldFiltering, getFinancialFieldAccess } from '../services/financial-visibility.service.js';
+import { buildDashboardExportPdfBuffer } from '../services/report-pdf.service.js';
 import { calculateOrderGMV } from '../utils/gmvCalculations.js';
 import { isCancelledOrRefunded } from '../utils/orderFinancials.js';
 import {
@@ -13,12 +15,11 @@ import {
     getShopDayStartTimestamp,
     previousCalendarDayISO,
 } from '../utils/dateUtils.js';
+import { ACTION_TIKTOK_SHOP_DATA, FEATURE_TIKTOK_SHOP } from '../constants/tiktok-entitlements.js';
 
 const router = express.Router();
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-const EXPORT_PERMISSION = 'export_pnl';
-const EXPORT_FEATURE = 'export_pnl';
 const SCHEDULE_PERMISSION = 'schedule_export';
 const SCHEDULE_FEATURE = 'schedule_export';
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/i;
@@ -66,20 +67,27 @@ async function getSellerTenantIdForAccount(accountId: string): Promise<string | 
     return data.tenant_id as string;
 }
 
-async function assertCanExportDashboard(req: express.Request, accountId: string): Promise<{ ok: boolean; userId: string | null; reason?: string }> {
+/**
+ * Dashboard report email (order and/or P&L snapshot) uses the same bar as reading synced shop data.
+ * P&L figures are overview-style numbers with the same financial-visibility filtering as the UI — not the separate `export_pnl` CSV/export product gate.
+ */
+async function assertCanEmailDashboard(
+    req: express.Request,
+    accountId: string
+): Promise<{ ok: boolean; userId: string | null; reason?: string }> {
     const userId = await resolveRequestUserId(req);
     if (!userId) return { ok: false, userId: null, reason: 'Authorization required' };
 
-    const exportAuth = await authorize(req, {
-        action: EXPORT_PERMISSION,
+    const shopAuth = await authorize(req, {
+        action: ACTION_TIKTOK_SHOP_DATA,
         accountId,
-        featureKey: EXPORT_FEATURE,
-        denyAction: 'export.permission_denied',
+        featureKey: FEATURE_TIKTOK_SHOP,
+        denyAction: 'export.dashboard_email_denied',
     });
-    if (!exportAuth.allowed) {
-        return { ok: false, userId, reason: exportAuth.reason };
+    if (!shopAuth.allowed) {
+        return { ok: false, userId, reason: shopAuth.reason };
     }
-    return { ok: true, userId };
+    return { ok: true, userId: shopAuth.context.userId };
 }
 
 /**
@@ -167,6 +175,7 @@ function summarizeOrders(orders: ShopOrderRow[], startSec: number, endSec: numbe
 }
 
 type ReportType = 'order' | 'pl';
+type ScheduleFrequency = 'daily' | 'weekly' | 'monthly';
 
 type PlSummary = {
     gmv: number;
@@ -198,6 +207,87 @@ function parseReportTypes(body: Record<string, unknown> | null | undefined): Rep
     return ['order'];
 }
 
+function parseReportTypesArray(input: unknown): ReportType[] {
+    if (!Array.isArray(input)) return ['order', 'pl'];
+    const set = new Set<ReportType>();
+    for (const v of input) {
+        if (v === 'order' || v === 'pl') set.add(v);
+    }
+    return set.size > 0 ? Array.from(set) : ['order', 'pl'];
+}
+
+function parseScheduleFrequency(input: unknown): ScheduleFrequency {
+    const raw = typeof input === 'string' ? input.trim().toLowerCase() : '';
+    if (raw === 'weekly' || raw === 'monthly') return raw;
+    return 'daily';
+}
+
+function scheduleMatchesDate(
+    frequency: ScheduleFrequency,
+    localDate: Date,
+    dayOfWeek: number | null,
+    dayOfMonth: number | null
+): boolean {
+    if (frequency === 'daily') return true;
+    if (frequency === 'weekly') {
+        if (dayOfWeek == null) return false;
+        return localDate.getUTCDay() === dayOfWeek;
+    }
+    if (dayOfMonth == null) return false;
+    return localDate.getUTCDate() === dayOfMonth;
+}
+
+function getTimezoneDateParts(now: Date, tz: string): { year: number; month: number; day: number; hour: number; weekDay: number } {
+    const fmt = new Intl.DateTimeFormat('en-US', {
+        timeZone: tz,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        hour12: false,
+        weekday: 'short',
+    });
+    const parts = fmt.formatToParts(now);
+    const get = (type: string) => parts.find((p) => p.type === type)?.value || '';
+    const wd = get('weekday');
+    const weekDayMap: Record<string, number> = {
+        Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6,
+    };
+    return {
+        year: Number(get('year')),
+        month: Number(get('month')),
+        day: Number(get('day')),
+        hour: Number(get('hour')),
+        weekDay: weekDayMap[wd] ?? 0,
+    };
+}
+
+function shouldSendScheduleNow(
+    row: any,
+    now: Date
+): { shouldSend: boolean; localDateKey: string } {
+    const tz = (row.timezone as string) || 'America/Los_Angeles';
+    const parts = getTimezoneDateParts(now, tz);
+    const localDateKey = `${parts.year}-${String(parts.month).padStart(2, '0')}-${String(parts.day).padStart(2, '0')}`;
+    const targetHourUtc = Number(row.hour_utc);
+    const nowUtcHour = now.getUTCHours();
+    if (!Number.isInteger(targetHourUtc) || targetHourUtc < 0 || targetHourUtc > 23) {
+        return { shouldSend: false, localDateKey };
+    }
+    if (nowUtcHour !== targetHourUtc) {
+        return { shouldSend: false, localDateKey };
+    }
+    const frequency = parseScheduleFrequency(row.frequency);
+    const localDate = new Date(Date.UTC(parts.year, parts.month - 1, parts.day));
+    const matches = scheduleMatchesDate(
+        frequency,
+        localDate,
+        typeof row.day_of_week === 'number' ? row.day_of_week : null,
+        typeof row.day_of_month === 'number' ? row.day_of_month : null
+    );
+    return { shouldSend: matches, localDateKey };
+}
+
 function parsePlSummary(body: Record<string, unknown> | null | undefined): PlSummary | null {
     const p = body?.plSummary;
     if (!p || typeof p !== 'object') return null;
@@ -226,15 +316,22 @@ function buildEmailShell(
     shopLabel: string,
     periodLabel: string,
     inner: string,
-    footerNote: string
+    footerNote: string,
+    branding?: { displayName?: string; logoSignedUrl?: string | null; primaryColor?: string }
 ): string {
+    const brandName = branding?.displayName || 'Mamba';
+    const primaryColor = branding?.primaryColor || '#4f46e5';
+    const logo = branding?.logoSignedUrl
+        ? `<img src="${branding.logoSignedUrl}" alt="${escapeHtml(brandName)} logo" style="max-height:40px;max-width:180px;display:block;margin-bottom:10px;" />`
+        : '';
     return `
 <div style="font-family:Inter,system-ui,sans-serif;max-width:560px;margin:0 auto;padding:24px;background:#0f0f12;color:#e5e5e5;">
-  <h1 style="font-size:18px;margin:0 0 8px;color:#fff;">Mamba — dashboard report</h1>
+  ${logo}
+  <h1 style="font-size:18px;margin:0 0 8px;color:#fff;">${escapeHtml(brandName)} — dashboard report</h1>
   <p style="margin:0 0 16px;color:#a3a3a3;font-size:14px;">
     ${escapeHtml(accountName)} · ${escapeHtml(shopLabel)}
   </p>
-  <p style="margin:0 0 20px;color:#d4d4d4;font-size:14px;">Period: <strong style="color:#fff;">${escapeHtml(
+  <p style="margin:0 0 20px;color:#d4d4d4;font-size:14px;">Period: <strong style="color:${primaryColor};">${escapeHtml(
       periodLabel
   )}</strong></p>
   ${inner}
@@ -277,7 +374,7 @@ function buildPlSectionHtml(pl: PlSummary): string {
         ['GMV (dashboard)', money(pl.gmv)],
         ['Orders (dashboard count)', String(pl.totalOrders)],
         ['Total revenue', money(pl.totalRevenue)],
-        ['Net sales (statements)', money(pl.netSales)],
+        ['TikTok settlement net sales (reference)', money(pl.netSales)],
         ['Gross profit', money(pl.grossProfit)],
         ['Net profit', money(pl.netProfit)],
     ];
@@ -344,7 +441,7 @@ router.post('/email-dashboard', async (req, res) => {
             return;
         }
 
-        const can = await assertCanExportDashboard(req, accountId as string);
+        const can = await assertCanEmailDashboard(req, accountId as string);
         if (!can.ok || !can.userId) {
             res.status(403).json({
                 success: false,
@@ -363,7 +460,7 @@ router.post('/email-dashboard', async (req, res) => {
 
         const { data: account, error: accErr } = await supabase
             .from('accounts')
-            .select('id, name')
+            .select('id, name, tenant_id')
             .eq('id', accountId as string)
             .maybeSingle();
         if (accErr || !account) {
@@ -374,10 +471,15 @@ router.post('/email-dashboard', async (req, res) => {
         const timezone =
             (typeof tzBody === 'string' && tzBody.trim()) || shop.timezone || 'America/Los_Angeles';
         const periodLabel = `${startDate} → ${endDate} (${timezone})`;
+        const branding = await resolveTenantBranding((account.tenant_id as string | null | undefined) || null);
+        const brandName = branding.displayName || 'Mamba';
+        const brandedFrom = buildBrandedFromAddress(branding);
 
         const parts: string[] = [];
         let orderCount = 0;
         let gmv = 0;
+        let finalPlSummary: PlSummary | null = null;
+        let restrictionNotice: string | null = null;
 
         if (reportTypes.includes('order')) {
             const startUnix = getShopDayStartTimestamp(startDate, timezone);
@@ -412,7 +514,7 @@ router.post('/email-dashboard', async (req, res) => {
                     },
                     fieldAccess
                 ) as Record<string, unknown>;
-                const nextSummary: PlSummary = {
+                finalPlSummary = {
                     gmv: Number(filtered.gmv ?? plParsed.gmv),
                     totalOrders: Number(filtered.totalOrders ?? plParsed.totalOrders),
                     totalRevenue: Number(filtered.totalRevenue ?? plParsed.totalRevenue),
@@ -421,34 +523,54 @@ router.post('/email-dashboard', async (req, res) => {
                     netProfit: Number(filtered.netProfit ?? plParsed.netProfit),
                     adSpend: typeof filtered.adSpend === 'number' ? filtered.adSpend : undefined,
                 };
-                parts.push(buildPlSectionHtml(nextSummary));
+                parts.push(buildPlSectionHtml(finalPlSummary));
                 if (typeof filtered.restriction_notice === 'string') {
+                    restrictionNotice = filtered.restriction_notice;
                     parts.push(
                         `<p style="margin-top:8px;font-size:12px;color:#facc15;">${escapeHtml(filtered.restriction_notice)}</p>`
                     );
                 }
             } else {
-                parts.push(buildPlSectionHtml(plParsed));
+                finalPlSummary = plParsed;
+                parts.push(buildPlSectionHtml(finalPlSummary));
             }
         }
 
         const footer =
             reportTypes.length > 1
-                ? 'Generated by Mamba — combined report. Open the app for full detail and drill-down.'
-                : 'Generated by Mamba. Open the app for full detail and drill-down.';
+                ? `Generated by ${brandName} — combined report. Open the app for full detail and drill-down.`
+                : `Generated by ${brandName}. Open the app for full detail and drill-down.`;
 
         const html = buildEmailShell(
             account.name || 'Shop',
             shop.shop_name || 'TikTok Shop',
             periodLabel,
             parts.join(''),
-            footer
+            footer,
+            branding
         );
 
         const typeLabel =
             reportTypes.length === 2 ? 'orders + P&L' : reportTypes[0] === 'pl' ? 'P&L' : 'orders';
-        const subject = `Mamba ${typeLabel}: ${account.name || 'Shop'} (${periodLabel})`;
-        const { delivered } = await sendHtmlEmail(toEmail, subject, html);
+        const subject = `${brandName} ${typeLabel}: ${account.name || 'Shop'} (${periodLabel})`;
+        const pdf = await buildDashboardExportPdfBuffer({
+            brandName,
+            accountName: account.name || 'Shop',
+            shopName: shop.shop_name || 'TikTok Shop',
+            periodLabel,
+            reportTypes,
+            orderSummary: reportTypes.includes('order') ? { orderCount, gmv } : undefined,
+            plSummary: reportTypes.includes('pl') ? finalPlSummary || undefined : undefined,
+            notes: restrictionNotice
+                ? [restrictionNotice, 'Open the dashboard for full drill-down details.']
+                : ['Open the dashboard for full drill-down details.'],
+        });
+        const attachmentName = `dashboard-export-${startDate}-to-${endDate}.pdf`;
+        const { delivered } = await sendHtmlEmail(toEmail, subject, html, {
+            from: brandedFrom || undefined,
+            fromDisplayName: brandName,
+            attachments: [{ filename: attachmentName, contentBase64: pdf.toString('base64') }],
+        });
 
         // Audit: record data export event (who sent what data to whom)
         auditLog(req, {
@@ -482,10 +604,20 @@ router.post('/email-dashboard', async (req, res) => {
     }
 });
 
-/** POST /api/reports/schedules — daily automated digest at hour_utc. */
+/** POST /api/reports/schedules — automated digest schedule. */
 router.post('/schedules', async (req, res) => {
     try {
-        const { accountId, shopId, recipientEmail, timezone, hourUtc } = req.body ?? {};
+        const {
+            accountId,
+            shopId,
+            recipientEmail,
+            timezone,
+            hourUtc,
+            frequency,
+            dayOfWeek,
+            dayOfMonth,
+            reportTypes,
+        } = req.body ?? {};
         const email = typeof recipientEmail === 'string' ? recipientEmail.trim() : '';
         const shopKey = typeof shopId === 'string' ? shopId.trim() : '';
         if (!UUID_RE.test(accountId) || !shopKey || !EMAIL_RE.test(email)) {
@@ -498,8 +630,25 @@ router.post('/schedules', async (req, res) => {
             res.status(400).json({ success: false, error: 'hourUtc must be 0–23 (UTC hour to send)' });
             return;
         }
-
-        const canExport = await assertCanExportDashboard(req, accountId);
+        const freq = parseScheduleFrequency(frequency);
+        const dow =
+            dayOfWeek === undefined || dayOfWeek === null || dayOfWeek === ''
+                ? null
+                : Number(dayOfWeek);
+        const dom =
+            dayOfMonth === undefined || dayOfMonth === null || dayOfMonth === ''
+                ? null
+                : Number(dayOfMonth);
+        if (freq === 'weekly' && (!Number.isInteger(dow) || dow < 0 || dow > 6)) {
+            res.status(400).json({ success: false, error: 'dayOfWeek must be 0-6 for weekly schedules' });
+            return;
+        }
+        if (freq === 'monthly' && (!Number.isInteger(dom) || dom < 1 || dom > 31)) {
+            res.status(400).json({ success: false, error: 'dayOfMonth must be 1-31 for monthly schedules' });
+            return;
+        }
+        const selectedReportTypes = parseReportTypesArray(reportTypes);
+        const canExport = await assertCanEmailDashboard(req, accountId);
         if (!canExport.ok || !canExport.userId) {
             res.status(403).json({ success: false, error: canExport.reason || 'Permission denied for this account' });
             return;
@@ -535,9 +684,13 @@ router.post('/schedules', async (req, res) => {
                 recipient_email: email,
                 timezone: tz,
                 hour_utc: h,
+                frequency: freq,
+                day_of_week: freq === 'weekly' ? dow : null,
+                day_of_month: freq === 'monthly' ? dom : null,
+                report_types: selectedReportTypes,
                 enabled: true,
             })
-            .select('id')
+            .select('id, frequency, day_of_week, day_of_month, report_types')
             .single();
 
         if (insErr) {
@@ -546,7 +699,7 @@ router.post('/schedules', async (req, res) => {
             return;
         }
 
-        res.json({ success: true, data: { id: row.id } });
+        res.json({ success: true, data: row });
     } catch (e: any) {
         console.error('[reports] schedules POST', e);
         res.status(500).json({ success: false, error: e.message || 'Internal error' });
@@ -563,7 +716,7 @@ router.get('/schedules', async (req, res) => {
 
         const { data, error } = await supabase
             .from('dashboard_email_schedules')
-            .select('id, account_id, shop_id, recipient_email, timezone, hour_utc, enabled, last_sent_on, created_at')
+            .select('id, account_id, shop_id, recipient_email, timezone, hour_utc, frequency, day_of_week, day_of_month, report_types, enabled, last_sent_on, created_at')
             .eq('created_by', userId)
             .order('created_at', { ascending: false });
 
@@ -609,8 +762,8 @@ router.delete('/schedules/:id', async (req, res) => {
 /**
  * GET /api/reports/cron-dashboard-digests?secret=...
  * Vercel Cron: must run at most once per day on Hobby; we use one daily slot (see server/vercel.json).
- * Sends "yesterday" in each schedule's shop timezone at most once per UTC calendar day (last_sent_on).
- * hour_utc is stored for optional external schedulers or future Pro (hourly) setups; this endpoint ignores it.
+ * Sends based on schedule frequency (daily/weekly/monthly), hour_utc, and timezone.
+ * last_sent_on stores local schedule date (YYYY-MM-DD) to prevent same-day duplicate sends.
  */
 router.get('/cron-dashboard-digests', async (req, res) => {
     try {
@@ -627,7 +780,7 @@ router.get('/cron-dashboard-digests', async (req, res) => {
             return;
         }
 
-        const todayUtc = new Date().toISOString().slice(0, 10);
+        const now = new Date();
 
         const { data: schedules, error } = await supabase
             .from('dashboard_email_schedules')
@@ -641,7 +794,9 @@ router.get('/cron-dashboard-digests', async (req, res) => {
 
         let sent = 0;
         for (const row of schedules || []) {
-            if (row.last_sent_on === todayUtc) continue;
+            const { shouldSend, localDateKey } = shouldSendScheduleNow(row, now);
+            if (!shouldSend) continue;
+            if (row.last_sent_on === localDateKey) continue;
 
             const ownerId = row.created_by as string;
             const accountId = row.account_id as string;
@@ -666,15 +821,23 @@ router.get('/cron-dashboard-digests', async (req, res) => {
                         p_user_id: ownerId,
                         p_tenant_id: profile.tenant_id,
                     });
-                    const hasExportPerm = Array.isArray(permRows)
-                        && permRows.some((r: any) => r?.action === EXPORT_PERMISSION);
-                    if (!hasExportPerm) return false;
+                    if (!Array.isArray(permRows)) return false;
 
-                    const { data: entitlement } = await supabase.rpc('tenant_feature_allowed', {
-                        p_tenant_id: profile.tenant_id,
-                        p_feature_key: EXPORT_FEATURE,
+                    const { data: sellerAcc } = await supabase
+                        .from('accounts')
+                        .select('tenant_id')
+                        .eq('id', accountId)
+                        .maybeSingle();
+                    const planTenantId =
+                        typeof sellerAcc?.tenant_id === 'string' ? sellerAcc.tenant_id : profile.tenant_id;
+
+                    const hasShop = permRows.some((r: any) => r?.action === ACTION_TIKTOK_SHOP_DATA);
+                    if (!hasShop) return false;
+                    const { data: entShop } = await supabase.rpc('tenant_feature_allowed', {
+                        p_tenant_id: planTenantId,
+                        p_feature_key: FEATURE_TIKTOK_SHOP,
                     });
-                    return entitlement === true;
+                    return entShop === true;
                 })());
 
             if (!stillOk) continue;
@@ -688,7 +851,7 @@ router.get('/cron-dashboard-digests', async (req, res) => {
 
             const { data: account } = await supabase
                 .from('accounts')
-                .select('name')
+                .select('name, tenant_id')
                 .eq('id', accountId)
                 .maybeSingle();
 
@@ -700,33 +863,70 @@ router.get('/cron-dashboard-digests', async (req, res) => {
             const startIso = new Date(startUnix * 1000).toISOString();
             const endIso = new Date(endUnix * 1000).toISOString();
 
+            const rowReportTypes = parseReportTypesArray(row.report_types);
             try {
                 const orders = await loadOrdersInPaidRange(shopId, startIso, endIso);
                 const { orderCount, gmv } = summarizeOrders(orders, startUnix, endUnix);
                 const periodLabel = `${yStr} (${tz}, previous shop day)`;
-                const inner = buildOrderSectionHtml({
-                    orderCount,
-                    gmv,
-                    note: 'Automated daily digest (order-based only).',
-                });
+                const innerParts: string[] = [];
+                if (rowReportTypes.includes('order')) {
+                    innerParts.push(
+                        buildOrderSectionHtml({
+                            orderCount,
+                            gmv,
+                            note: 'Automated digest.',
+                        })
+                    );
+                }
+                if (rowReportTypes.includes('pl')) {
+                    const plInner = `<p style="margin-top:8px;font-size:12px;color:#a3a3a3;">P&amp;L summary is included in the attached PDF export.</p>`;
+                    innerParts.push(plInner);
+                }
+                const branding = await resolveTenantBranding((account?.tenant_id as string | null | undefined) || null);
+                const brandedFrom = buildBrandedFromAddress(branding);
                 const html = buildEmailShell(
                     account?.name || 'Shop',
                     shop.shop_name || 'TikTok Shop',
                     periodLabel,
-                    inner,
-                    'Generated by Mamba. P&L detail is available in the app.'
+                    innerParts.join(''),
+                    `Generated by ${branding.displayName || 'Mamba'}. P&L detail is available in the app.`,
+                    branding
                 );
-                const subject = `Mamba daily digest: ${account?.name || 'Shop'} (${yStr})`;
-                const { delivered } = await sendHtmlEmail(row.recipient_email as string, subject, html);
+                const pdf = await buildDashboardExportPdfBuffer({
+                    brandName: branding.displayName || 'Mamba',
+                    accountName: account?.name || 'Shop',
+                    shopName: shop.shop_name || 'TikTok Shop',
+                    periodLabel,
+                    reportTypes: rowReportTypes,
+                    orderSummary: rowReportTypes.includes('order') ? { orderCount, gmv } : undefined,
+                    notes: [
+                        `Schedule frequency: ${parseScheduleFrequency(row.frequency)}`,
+                        'Automated digest generated by configured report schedule.',
+                    ],
+                });
+                const subject = `${branding.displayName || 'Mamba'} dashboard digest: ${account?.name || 'Shop'} (${yStr})`;
+                const digestBrand = branding.displayName || 'Mamba';
+                const { delivered } = await sendHtmlEmail(row.recipient_email as string, subject, html, {
+                    from: brandedFrom || undefined,
+                    fromDisplayName: digestBrand,
+                    attachments: [
+                        {
+                            filename: `dashboard-digest-${yStr}.pdf`,
+                            contentBase64: pdf.toString('base64'),
+                        },
+                    ],
+                });
 
                 if (delivered) {
                     await supabase
                         .from('dashboard_email_schedules')
-                        .update({ last_sent_on: todayUtc, updated_at: new Date().toISOString() })
+                        .update({ last_sent_on: localDateKey, updated_at: new Date().toISOString() })
                         .eq('id', row.id);
                     sent += 1;
                 } else {
-                    console.warn('[reports] cron digest skipped last_sent_on — email not delivered (no RESEND_API_KEY?)');
+                    console.warn(
+                        '[reports] cron digest skipped last_sent_on — email not delivered (missing GOHIGHLEVEL_PIT / GOHIGHLEVEL_LOCATION_ID or LeadConnector failure)'
+                    );
                 }
             } catch (err: any) {
                 console.error('[reports] cron digest row', row.id, err?.message);

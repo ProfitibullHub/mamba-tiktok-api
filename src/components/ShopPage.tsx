@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useParams, useLocation } from 'react-router-dom';
 import { Sidebar } from './Sidebar';
 import { NewOrdersToast } from './NewOrdersToast';
@@ -12,23 +12,39 @@ import { DataAuditView } from './views/DataAuditView';
 import { MarketingDashboardView } from './views/MarketingDashboardView';
 import { NotificationsView } from './views/NotificationsView';
 import { ProfileView } from './views/ProfileView';
+import { FinancialRestrictionsView } from './views/FinancialRestrictionsView';
 import { type Account, supabase } from '../lib/supabase';
 import { matchesSlug } from '../utils/slugify';
 import { useAuth } from '../contexts/AuthContext';
+import { useTenantContext } from '../contexts/TenantContext';
+import { fetchBranding } from '../lib/brandingApi';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useShopStore } from '../store/useShopStore';
 import { useNotificationStore } from '../store/useNotificationStore';
 import { useTikTokAdsStore } from '../store/useTikTokAdsStore';
 import { getTimezoneDisplay } from '../utils/timezoneMapping';
+import { getDateRangeFromPreset } from '../utils/dateUtils';
 import { AlertTriangle, Store } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import type { VisibleShop } from './views/HomeConsoleView';
 import { UnauthorizedShopAccess } from './UnauthorizedShopAccess';
+import {
+    SellerBrandingProvider,
+    SELLER_FACING_BRANDING_QK,
+    useSellerBranding,
+} from '../contexts/SellerBrandingContext';
 
 export function ShopPage() {
     const { shopSlug } = useParams<{ shopSlug: string }>();
     const location = useLocation();
     const { user } = useAuth();
+    const {
+        profileTenantId,
+        sellerFacingBrandingEligible,
+        isTenantAccessLocked,
+        tenantAccessLockReason,
+        loading: tenantLoading,
+    } = useTenantContext();
     const queryClient = useQueryClient();
 
     const passedShop = (location.state as { shop?: VisibleShop })?.shop ?? null;
@@ -38,6 +54,7 @@ export function ShopPage() {
 
     const navigationTarget = useNotificationStore((state) => state.navigationTarget);
     const setNavigationTarget = useNotificationStore((state) => state.setNavigationTarget);
+    const plPrefetchKeyRef = useRef<string | null>(null);
 
     useEffect(() => {
         if (navigationTarget) {
@@ -87,7 +104,7 @@ export function ShopPage() {
                 tenant_type: (match as any).accounts?.tenants?.type ?? null,
             } as VisibleShop;
         },
-        enabled: Boolean(shopSlug && user?.id),
+        enabled: Boolean(shopSlug && user?.id && !isTenantAccessLocked),
         staleTime: 1000 * 60 * 10,
     });
 
@@ -120,14 +137,21 @@ export function ShopPage() {
             if (error) throw error;
             return data === true;
         },
-        enabled: Boolean(user?.id && shop?.account_id),
+        enabled: Boolean(user?.id && shop?.account_id && !isTenantAccessLocked),
         staleTime: 30_000,
     });
 
-    const canMountShop = Boolean(shop && accessAllowed === true);
+    const canMountShop = Boolean(shop && accessAllowed === true && !isTenantAccessLocked);
     const accessDenied = Boolean(
         shop && !accessLoading && (accessCheckError || accessAllowed === false),
     );
+
+    const brandingCacheKey = profileTenantId ?? shop?.shop_id ?? '';
+
+    const shopDocumentTitle = useMemo(() => {
+        if (!shop?.shop_name) return null;
+        return { kind: 'shop' as const, shopName: shop.shop_name };
+    }, [shop?.shop_name]);
 
     const selectedAccount: Account | null = shop
         ? {
@@ -142,6 +166,88 @@ export function ShopPage() {
         : null;
 
     const shopTimezone = timezoneOverride ?? shop?.timezone ?? 'America/Los_Angeles';
+
+    const brandingPrefetchEnabled = Boolean(
+        canMountShop && sellerFacingBrandingEligible && Boolean(brandingCacheKey) && !tenantLoading,
+    );
+
+    const { isFetched: brandingPrefetchFetched } = useQuery({
+        queryKey: [SELLER_FACING_BRANDING_QK, brandingCacheKey],
+        queryFn: fetchBranding,
+        enabled: brandingPrefetchEnabled,
+        staleTime: 30 * 60 * 1000,
+        gcTime: 60 * 60 * 1000,
+        refetchOnWindowFocus: false,
+    });
+
+    const brandingGateDone =
+        !sellerFacingBrandingEligible ||
+        (brandingPrefetchEnabled && brandingPrefetchFetched);
+
+    /** Cold slug fetch without navigation state — wait for React Query row before treating as missing. */
+    const awaitingSlugResolution = Boolean(
+        user?.id && shopSlug && loadingShop && !passedShop && resolvedShop === undefined,
+    );
+
+    const awaitingAccess = Boolean(shop?.account_id && accessLoading);
+
+    const needsFullDashboardGate = Boolean(
+        shop &&
+            shop.account_id &&
+            accessAllowed === true &&
+            !accessLoading &&
+            !awaitingSlugResolution &&
+            (tenantLoading || !brandingGateDone),
+    );
+
+    const dashboardReady = Boolean(
+        shop &&
+            shop.account_id &&
+            accessAllowed === true &&
+            !accessLoading &&
+            !awaitingSlugResolution &&
+            !tenantLoading &&
+            brandingGateDone &&
+            !isTenantAccessLocked,
+    );
+
+    const showUnifiedDashboardGate =
+        awaitingSlugResolution || awaitingAccess || needsFullDashboardGate;
+
+    const unifiedGateLabel = awaitingSlugResolution
+        ? 'Loading shop…'
+        : awaitingAccess
+          ? 'Checking access…'
+          : tenantLoading
+            ? 'Loading workspace…'
+            : 'Loading brand…';
+
+    // Warm the P&L default range as soon as the shop shell mounts (next macrotask) so refresh triggers prefetch immediately.
+    // Overview keeps its own 1-day date range; these shared store loads are filtered per view.
+    useEffect(() => {
+        if (!dashboardReady || !shop?.shop_id || !selectedAccount?.id) return;
+
+        const range = getDateRangeFromPreset('last30', shopTimezone);
+        const prefetchKey = `${selectedAccount.id}:${shop.shop_id}:${range.startDate}:${range.endDate}:${shopTimezone}`;
+        if (plPrefetchKeyRef.current === prefetchKey) return;
+        plPrefetchKeyRef.current = prefetchKey;
+
+        const timer = window.setTimeout(() => {
+            const store = useShopStore.getState();
+            void store.fetchShopData(
+                selectedAccount.id,
+                shop.shop_id,
+                { skipSyncCheck: true, timezone: shopTimezone },
+                range.startDate,
+                range.endDate,
+            );
+            void store.fetchPLData(selectedAccount.id, shop.shop_id, range.startDate, range.endDate, false, shopTimezone);
+            void store.fetchAffiliateSettlements(selectedAccount.id, shop.shop_id, range.startDate, range.endDate);
+            void store.fetchAgencyFees(selectedAccount.id, shop.shop_id, range.startDate, range.endDate);
+        }, 0);
+
+        return () => window.clearTimeout(timer);
+    }, [dashboardReady, selectedAccount?.id, shop?.shop_id, shopTimezone]);
 
     /** Persists via PATCH; updates React Query cache so refresh and navigation state both reflect the saved timezone. */
     const handleTimezoneChange = useCallback(
@@ -165,18 +271,18 @@ export function ShopPage() {
     const subscribeToNotifications = useNotificationStore((state) => state.subscribeToNotifications);
 
     useEffect(() => {
-        if (canMountShop && shop?.shop_id) {
+        if (dashboardReady && shop?.shop_id) {
             fetchNotifications([shop.shop_id]);
             subscribeToNotifications([shop.shop_id]);
         } else {
             fetchNotifications([]);
             subscribeToNotifications([]);
         }
-    }, [canMountShop, shop?.shop_id, fetchNotifications, subscribeToNotifications]);
+    }, [dashboardReady, shop?.shop_id, fetchNotifications, subscribeToNotifications]);
 
     // Marketing preload
     useEffect(() => {
-        if (!canMountShop || !shop?.account_id) return;
+        if (!dashboardReady || !shop?.account_id) return;
         const accountId = shop.account_id;
         const { checkConnection, loadMarketingFromDB, subscribeToMarketingUpdates } = useTikTokAdsStore.getState();
 
@@ -188,11 +294,11 @@ export function ShopPage() {
 
         const unsubscribe = subscribeToMarketingUpdates(accountId);
         return unsubscribe;
-    }, [canMountShop, shop?.account_id]);
+    }, [dashboardReady, shop?.account_id]);
 
     // Realtime order subscription
     useEffect(() => {
-        const internalShopId = canMountShop ? shop?.id : undefined;
+        const internalShopId = dashboardReady ? shop?.id : undefined;
         if (!internalShopId) return;
 
         const channel = supabase
@@ -219,7 +325,7 @@ export function ShopPage() {
         return () => {
             supabase.removeChannel(channel);
         };
-    }, [canMountShop, shop?.id]);
+    }, [dashboardReady, shop?.id]);
 
     if (!user?.id) {
         return (
@@ -229,11 +335,13 @@ export function ShopPage() {
         );
     }
 
-    if (loadingShop && !passedShop) {
+    if (isTenantAccessLocked) {
         return (
-            <div className="flex items-center justify-center h-screen bg-gray-900">
-                <div className="animate-spin rounded-full h-12 w-12 border-4 border-pink-500 border-t-transparent" />
-            </div>
+            <UnauthorizedShopAccess
+                attemptedLabel={shopSlug}
+                title="Tenant access is locked"
+                message={`Your ${tenantAccessLockReason ?? 'inactive'} tenant cannot access shop dashboards until reactivated.`}
+            />
         );
     }
 
@@ -242,8 +350,8 @@ export function ShopPage() {
             <div className="flex items-center justify-center h-screen bg-gray-900">
                 <div className="text-center max-w-md">
                     <AlertTriangle className="w-14 h-14 text-yellow-400 mx-auto mb-4" />
-                    <h2 className="text-xl font-bold text-white mb-2">Shop not found</h2>
-                    <p className="text-gray-400 text-sm mb-6">
+                    <h2 className="text-xl font-bold brand-text mb-2">Shop not found</h2>
+                    <p className="brand-muted text-sm mb-6">
                         This shop could not be loaded. Return to the console and open a shop from your list.
                     </p>
                     <Link
@@ -258,16 +366,12 @@ export function ShopPage() {
         );
     }
 
-    if (shop && accessLoading) {
-        return (
-            <div className="flex items-center justify-center h-screen bg-gray-900">
-                <div className="animate-spin rounded-full h-12 w-12 border-4 border-pink-500 border-t-transparent" />
-            </div>
-        );
-    }
-
     if (accessDenied) {
         return <UnauthorizedShopAccess attemptedLabel={shopSlug} />;
+    }
+
+    if (showUnifiedDashboardGate) {
+        return <ShopDashboardGateSpinner label={unifiedGateLabel} />;
     }
 
     if (!shop) {
@@ -275,9 +379,9 @@ export function ShopPage() {
             <div className="flex items-center justify-center h-screen bg-gray-900">
                 <div className="text-center max-w-md">
                     <AlertTriangle className="w-14 h-14 text-yellow-400 mx-auto mb-4" />
-                    <h2 className="text-xl font-bold text-white mb-2">Shop not found</h2>
-                    <p className="text-gray-400 text-sm mb-6">
-                        No shop matching <span className="text-white font-medium">{shopSlug}</span> was found, or you don't have access to it.
+                    <h2 className="text-xl font-bold brand-text mb-2">Shop not found</h2>
+                    <p className="brand-muted text-sm mb-6">
+                        No shop matching <span className="brand-text font-medium">{shopSlug}</span> was found, or you don't have access to it.
                     </p>
                     <Link
                         to="/"
@@ -292,16 +396,81 @@ export function ShopPage() {
     }
 
     return (
-        <div className="flex h-screen bg-gray-900">
-            <Sidebar mode="shop" activeTab={activeTab} onTabChange={setActiveTab} shopName={shop.shop_name} />
+        <SellerBrandingProvider
+            enabled={canMountShop && sellerFacingBrandingEligible}
+            brandingCacheKey={brandingCacheKey}
+            documentTitle={shopDocumentTitle}
+        >
+            <ShopShell
+                shop={shop}
+                activeTab={activeTab}
+                setActiveTab={setActiveTab}
+                shopTimezone={shopTimezone}
+                selectedAccount={selectedAccount}
+                targetOrderId={targetOrderId}
+                setTargetOrderId={setTargetOrderId}
+                handleTimezoneChange={handleTimezoneChange}
+            />
+        </SellerBrandingProvider>
+    );
+}
 
-            <main className="flex-1 overflow-y-auto min-w-0 bg-gray-900">
+function ShopDashboardGateSpinner({ label }: { label: string }) {
+    return (
+        <div className="flex flex-col items-center justify-center gap-4 h-screen bg-gray-900 px-6">
+            <div className="animate-spin rounded-full h-12 w-12 border-4 border-pink-500 border-t-transparent shrink-0" />
+            <p className="text-sm text-gray-400 text-center max-w-xs">{label}</p>
+        </div>
+    );
+}
+
+/** Inner shell — runs inside SellerBrandingProvider so it can read brand CSS vars. */
+function ShopShell({
+    shop,
+    activeTab,
+    setActiveTab,
+    shopTimezone,
+    selectedAccount,
+    targetOrderId,
+    setTargetOrderId,
+    handleTimezoneChange,
+}: {
+    shop: VisibleShop;
+    activeTab: string;
+    setActiveTab: (tab: string) => void;
+    shopTimezone: string;
+    selectedAccount: import('../lib/supabase').Account | null;
+    targetOrderId: string | undefined;
+    setTargetOrderId: (id: string | undefined) => void;
+    handleTimezoneChange: (tz: string) => void;
+}) {
+    const { data: brand } = useSellerBranding();
+    const { isSellerAdminOn } = useTenantContext();
+    const canConfigureFinancialRestrictions = Boolean(
+        selectedAccount?.tenant_id && isSellerAdminOn(selectedAccount.tenant_id)
+    );
+
+    /** Same row layout as ConsolePage: without `flex`, sidebar + main stack as blocks and the area beside the sidebar shows the page background (white). */
+    return (
+        <div className="flex h-screen min-h-0 w-full brand-bg">
+            <Sidebar
+                mode="shop"
+                activeTab={activeTab}
+                onTabChange={setActiveTab}
+                shopName={shop.shop_name}
+                canConfigureFinancialRestrictions={canConfigureFinancialRestrictions}
+            />
+
+            <main className="flex-1 min-h-0 min-w-0 w-full overflow-y-auto brand-bg">
                 <div className="p-8">
                     {/* Shop context header */}
                     <div className="mb-6 flex justify-between items-center min-h-[40px]">
                         <div />
-                        <div className="text-gray-400 text-sm flex items-center gap-2">
-                            Viewing: <span className="text-white font-medium">{shop.shop_name}</span>
+                        <div className="brand-muted text-sm flex items-center gap-2">
+                            Viewing:{' '}
+                            <span className="font-medium" style={{ color: brand.primaryColor }}>
+                                {shop.shop_name}
+                            </span>
                             <span className="text-gray-500 text-xs">({getTimezoneDisplay(shopTimezone)})</span>
                         </div>
                     </div>
@@ -332,6 +501,8 @@ export function ShopPage() {
                                 return <ProductsView account={selectedAccount!} shopId={shop.shop_id} />;
                             case 'profit-loss':
                                 return <ProfitLossView account={selectedAccount!} shopId={shop.shop_id} timezone={shopTimezone} />;
+                            case 'financial-restrictions':
+                                return <FinancialRestrictionsView account={selectedAccount!} />;
                             case 'data-audit':
                                 return <DataAuditView account={selectedAccount!} shopId={shop.shop_id} timezone={shopTimezone} />;
                             case 'finance-debug':

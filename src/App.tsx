@@ -9,6 +9,7 @@ import { TikTokAdsCallback } from './components/TikTokAdsCallback';
 import { AcceptInvitationView } from './components/views/AcceptInvitationView';
 import { useEffect, useState } from 'react';
 import { reportClientError } from './lib/observability';
+import { AppToastHost } from './components/AppToastHost';
 
 function detectPasswordFlow(): 'reset' | 'invite' | null {
     const hash = window.location.hash;
@@ -111,6 +112,7 @@ function AppContent() {
 function App() {
     return (
         <BrowserRouter>
+            <AppToastHost />
             <AuthProvider>
                 <AppContent />
             </AuthProvider>

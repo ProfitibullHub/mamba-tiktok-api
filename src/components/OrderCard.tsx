@@ -8,30 +8,54 @@ interface OrderCardProps {
 }
 
 export function OrderCard({ order, onClick }: OrderCardProps) {
-    const getStatusIcon = (status: string) => {
+    const getStatusTone = (status: string): 'warning' | 'info' | 'success' | 'danger' | 'neutral' => {
         switch (status?.toLowerCase()) {
-            case 'unpaid': return <Clock className="w-5 h-5 text-yellow-500" />;
+            case 'unpaid':
+                return 'warning';
             case 'awaiting_shipment':
-            case 'awaiting_collection': return <Package className="w-5 h-5 text-blue-500" />;
-            case 'shipped': return <TruckIcon className="w-5 h-5 text-purple-500" />;
+            case 'awaiting_collection':
+            case 'shipped':
+                return 'info';
             case 'delivered':
-            case 'completed': return <CheckCircle className="w-5 h-5 text-green-500" />;
-            case 'cancelled': return <XCircle className="w-5 h-5 text-red-500" />;
-            default: return <ShoppingBag className="w-5 h-5 text-gray-500" />;
+            case 'completed':
+                return 'success';
+            case 'cancelled':
+                return 'danger';
+            default:
+                return 'neutral';
+        }
+    };
+
+    const toneTextColor = (tone: 'warning' | 'info' | 'success' | 'danger' | 'neutral') => {
+        if (tone === 'warning') return 'var(--brand-warning-text)';
+        if (tone === 'info') return 'var(--brand-info-text)';
+        if (tone === 'success') return 'var(--brand-success-text)';
+        if (tone === 'danger') return 'var(--brand-danger-text)';
+        return 'var(--brand-text-muted)';
+    };
+
+    const getStatusIcon = (status: string) => {
+        const tone = getStatusTone(status);
+        const iconProps = { className: 'w-5 h-5', style: { color: toneTextColor(tone) } };
+        switch (status?.toLowerCase()) {
+            case 'unpaid': return <Clock {...iconProps} />;
+            case 'awaiting_shipment':
+            case 'awaiting_collection': return <Package {...iconProps} />;
+            case 'shipped': return <TruckIcon {...iconProps} />;
+            case 'delivered':
+            case 'completed': return <CheckCircle {...iconProps} />;
+            case 'cancelled': return <XCircle {...iconProps} />;
+            default: return <ShoppingBag {...iconProps} />;
         }
     };
 
     const getStatusColor = (status: string) => {
-        switch (status?.toLowerCase()) {
-            case 'unpaid': return 'bg-yellow-500/10 text-yellow-500 border-yellow-500/20';
-            case 'awaiting_shipment':
-            case 'awaiting_collection': return 'bg-blue-500/10 text-blue-500 border-blue-500/20';
-            case 'shipped': return 'bg-purple-500/10 text-purple-500 border-purple-500/20';
-            case 'delivered':
-            case 'completed': return 'bg-green-500/10 text-green-500 border-green-500/20';
-            case 'cancelled': return 'bg-red-500/10 text-red-500 border-red-500/20';
-            default: return 'bg-gray-500/10 text-gray-500 border-gray-500/20';
-        }
+        const tone = getStatusTone(status);
+        if (tone === 'warning') return 'brand-state-warning';
+        if (tone === 'info') return 'brand-state-info';
+        if (tone === 'success') return 'brand-state-success';
+        if (tone === 'danger') return 'brand-state-danger';
+        return 'brand-card';
     };
 
     const formatStatus = (status: string) => {
@@ -53,22 +77,22 @@ export function OrderCard({ order, onClick }: OrderCardProps) {
     return (
         <div
             onClick={onClick}
-            className="bg-gray-800 rounded-xl p-4 border border-gray-700 hover:border-pink-500 transition-all cursor-pointer group"
+            className="brand-card rounded-xl p-4 transition-all cursor-pointer group brand-card-hover"
         >
             {/* Header: Order ID, Status, Amount, Date */}
             <div className="flex justify-between items-start mb-4">
                 <div className="flex items-center gap-3">
-                    <div className="p-2 bg-gray-700 rounded-lg group-hover:bg-pink-500/10 group-hover:text-pink-500 transition-colors">
+                    <div className="p-2 rounded-lg transition-colors" style={{ backgroundColor: 'var(--brand-interactive-hover-bg)' }}>
                         {getStatusIcon(order.order_status)}
                     </div>
                     <div>
-                        <p className="text-sm text-gray-400">Order #{order.order_id.slice(-6)}</p>
+                        <p className="text-sm brand-muted">Order #{order.order_id.slice(-6)}</p>
                         <div className="flex items-center gap-2">
                             <span className={`text-xs font-medium px-2 py-0.5 rounded-full border ${getStatusColor(order.order_status)}`}>
                                 {formatStatus(order.order_status)}
                             </span>
                             {order.is_fbt && (
-                                <span className="text-xs font-medium px-2 py-0.5 rounded-full bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
+                                <span className="text-xs font-medium px-2 py-0.5 rounded-full brand-state-info">
                                     FBT
                                 </span>
                             )}
@@ -76,8 +100,8 @@ export function OrderCard({ order, onClick }: OrderCardProps) {
                     </div>
                 </div>
                 <div className="text-right">
-                    <p className="text-lg font-bold text-white">{formatCurrency(order.order_amount)}</p>
-                    <p className="text-xs text-gray-500">
+                    <p className="text-lg font-bold brand-text">{formatCurrency(order.order_amount)}</p>
+                    <p className="text-xs brand-muted">
                         {(order.order_status === 'CANCELLED' || order.cancel_reason || order.cancellation_initiator)
                             ? `Cancelled: ${formatShopDateTime(Number(order.update_time || order.paid_time || order.created_time) * 1000)}`
                             : formatShopDateTime(Number(order.paid_time || order.created_time) * 1000)
@@ -87,23 +111,24 @@ export function OrderCard({ order, onClick }: OrderCardProps) {
             </div>
 
             {/* Buyer & Shipping Info Row */}
-            <div className="flex items-center gap-3 mb-3 p-3 bg-gray-700/30 rounded-lg">
+            <div className="flex items-center gap-3 mb-3 p-3 rounded-lg" style={{ backgroundColor: 'var(--brand-interactive-hover-bg)' }}>
                 {order.buyer_info?.buyer_avatar ? (
                     <img
                         src={order.buyer_info.buyer_avatar}
                         alt="Buyer"
-                        className="w-8 h-8 rounded-full border border-gray-600"
+                        className="w-8 h-8 rounded-full border"
+                        style={{ borderColor: 'var(--brand-card-border)' }}
                     />
                 ) : (
-                    <div className="w-8 h-8 rounded-full bg-gray-600 flex items-center justify-center">
-                        <User size={14} className="text-gray-300" />
+                    <div className="w-8 h-8 rounded-full flex items-center justify-center" style={{ backgroundColor: 'var(--brand-card-bg)' }}>
+                        <User size={14} className="brand-muted" />
                     </div>
                 )}
                 <div className="flex-1 overflow-hidden">
-                    <p className="text-sm font-medium text-white truncate">
+                    <p className="text-sm font-medium brand-text truncate">
                         {order.buyer_info?.buyer_nickname || order.buyer_info?.buyer_email || 'Guest Buyer'}
                     </p>
-                    <p className="text-xs text-gray-400 truncate">
+                    <p className="text-xs brand-muted truncate">
                         {order.shipping_info?.full_address || order.shipping_info?.name || 'No recipient info'}
                     </p>
                 </div>
@@ -112,93 +137,93 @@ export function OrderCard({ order, onClick }: OrderCardProps) {
             {/* Fulfillment & Shipping Info Pills */}
             <div className="flex flex-wrap gap-2 mb-3">
                 {/* Fulfillment Type */}
-                <div className="flex items-center gap-1.5 px-2 py-1 bg-gray-700/50 rounded-md">
-                    <Box size={12} className="text-gray-400" />
-                    <span className="text-xs text-gray-300">
+                <div className="flex items-center gap-1.5 px-2 py-1 rounded-md" style={{ backgroundColor: 'var(--brand-interactive-hover-bg)' }}>
+                    <Box size={12} className="brand-muted" />
+                    <span className="text-xs brand-muted">
                         {order.fulfillment_type === 'FULFILLMENT_BY_TIKTOK' ? 'TikTok Fulfillment' : 'Seller Fulfillment'}
                     </span>
                 </div>
 
                 {/* Shipping Type */}
                 {order.delivery_option_name && (
-                    <div className="flex items-center gap-1.5 px-2 py-1 bg-gray-700/50 rounded-md">
-                        <Truck size={12} className="text-gray-400" />
-                        <span className="text-xs text-gray-300">{order.delivery_option_name}</span>
+                    <div className="flex items-center gap-1.5 px-2 py-1 rounded-md" style={{ backgroundColor: 'var(--brand-interactive-hover-bg)' }}>
+                        <Truck size={12} className="brand-muted" />
+                        <span className="text-xs brand-muted">{order.delivery_option_name}</span>
                     </div>
                 )}
 
                 {/* Payment Method */}
                 {order.payment_method_name && (
-                    <div className="flex items-center gap-1.5 px-2 py-1 bg-gray-700/50 rounded-md">
-                        <CreditCard size={12} className="text-gray-400" />
-                        <span className="text-xs text-gray-300">{order.payment_method_name}</span>
+                    <div className="flex items-center gap-1.5 px-2 py-1 rounded-md" style={{ backgroundColor: 'var(--brand-interactive-hover-bg)' }}>
+                        <CreditCard size={12} className="brand-muted" />
+                        <span className="text-xs brand-muted">{order.payment_method_name}</span>
                     </div>
                 )}
             </div>
 
             {/* Payment Breakdown */}
             {payment && (
-                <div className="mb-3 p-3 bg-gray-900/50 rounded-lg border border-gray-700/50">
+                <div className="mb-3 p-3 rounded-lg border brand-card">
                     <div className="grid grid-cols-2 gap-2 text-xs">
                         {/* Subtotal */}
                         <div className="flex justify-between">
-                            <span className="text-gray-400">Product Total:</span>
-                            <span className="text-gray-300">{formatCurrency(payment.original_total_product_price || payment.sub_total)}</span>
+                            <span className="brand-muted">Product Total:</span>
+                            <span className="brand-text">{formatCurrency(payment.original_total_product_price || payment.sub_total)}</span>
                         </div>
 
                         {/* Original Shipping */}
                         {parseFloat(payment.original_shipping_fee || '0') > 0 && (
                             <div className="flex justify-between">
-                                <span className="text-gray-400">Shipping:</span>
-                                <span className="text-gray-300">{formatCurrency(payment.original_shipping_fee)}</span>
+                                <span className="brand-muted">Shipping:</span>
+                                <span className="brand-text">{formatCurrency(payment.original_shipping_fee)}</span>
                             </div>
                         )}
 
                         {/* Platform Discount */}
                         {parseFloat(payment.platform_discount || '0') > 0 && (
                             <div className="flex justify-between">
-                                <span className="text-green-400 flex items-center gap-1">
+                                <span className="brand-profit flex items-center gap-1">
                                     <Tag size={10} /> Platform Discount:
                                 </span>
-                                <span className="text-green-400">-{formatCurrency(payment.platform_discount)}</span>
+                                <span className="brand-profit">-{formatCurrency(payment.platform_discount)}</span>
                             </div>
                         )}
 
                         {/* Seller Discount */}
                         {parseFloat(payment.seller_discount || '0') > 0 && (
                             <div className="flex justify-between">
-                                <span className="text-orange-400 flex items-center gap-1">
+                                <span className="brand-state-warning flex items-center gap-1 px-1 rounded">
                                     <Tag size={10} /> Seller Discount:
                                 </span>
-                                <span className="text-orange-400">-{formatCurrency(payment.seller_discount)}</span>
+                                <span className="brand-state-warning px-1 rounded">-{formatCurrency(payment.seller_discount)}</span>
                             </div>
                         )}
 
                         {/* Shipping Discount */}
                         {parseFloat(payment.shipping_fee_seller_discount || '0') > 0 && (
                             <div className="flex justify-between">
-                                <span className="text-blue-400 flex items-center gap-1">
+                                <span className="brand-state-info flex items-center gap-1 px-1 rounded">
                                     <Truck size={10} /> Shipping Discount:
                                 </span>
-                                <span className="text-blue-400">-{formatCurrency(payment.shipping_fee_seller_discount)}</span>
+                                <span className="brand-state-info px-1 rounded">-{formatCurrency(payment.shipping_fee_seller_discount)}</span>
                             </div>
                         )}
 
                         {/* Tax */}
                         {parseFloat(payment.tax || payment.product_tax || '0') > 0 && (
                             <div className="flex justify-between">
-                                <span className="text-gray-400">Tax:</span>
-                                <span className="text-gray-300">{formatCurrency(payment.tax || payment.product_tax)}</span>
+                                <span className="brand-muted">Tax:</span>
+                                <span className="brand-text">{formatCurrency(payment.tax || payment.product_tax)}</span>
                             </div>
                         )}
                     </div>
 
                     {/* Total */}
-                    <div className="flex justify-between mt-2 pt-2 border-t border-gray-700">
-                        <span className="text-white font-medium flex items-center gap-1">
+                    <div className="flex justify-between mt-2 pt-2 border-t" style={{ borderColor: 'var(--brand-card-border)' }}>
+                        <span className="brand-text font-medium flex items-center gap-1">
                             <DollarSign size={12} /> Total Paid:
                         </span>
-                        <span className="text-white font-bold">{formatCurrency(payment.total_amount)}</span>
+                        <span className="brand-text font-bold">{formatCurrency(payment.total_amount)}</span>
                     </div>
                 </div>
             )}
@@ -209,25 +234,26 @@ export function OrderCard({ order, onClick }: OrderCardProps) {
                     <img
                         src={mainItem.sku_image}
                         alt={mainItem.product_name}
-                        className="w-12 h-12 rounded-lg object-cover border border-gray-700"
+                        className="w-12 h-12 rounded-lg object-cover border"
+                        style={{ borderColor: 'var(--brand-card-border)' }}
                     />
                 ) : (
-                    <div className="w-12 h-12 rounded-lg bg-gray-700 flex items-center justify-center">
-                        <ShoppingBag size={20} className="text-gray-500" />
+                    <div className="w-12 h-12 rounded-lg flex items-center justify-center" style={{ backgroundColor: 'var(--brand-interactive-hover-bg)' }}>
+                        <ShoppingBag size={20} className="brand-muted" />
                     </div>
                 )}
                 <div className="flex-1 min-w-0">
-                    <p className="text-sm text-gray-300 truncate">{mainItem?.product_name || 'Unknown Product'}</p>
+                    <p className="text-sm brand-text truncate">{mainItem?.product_name || 'Unknown Product'}</p>
                     <div className="flex items-center gap-2">
                         {mainItem?.seller_sku && (
-                            <span className="text-xs text-gray-500">SKU: {mainItem.seller_sku}</span>
+                            <span className="text-xs brand-muted">SKU: {mainItem.seller_sku}</span>
                         )}
                         {otherItemsCount > 0 && (
-                            <span className="text-xs text-pink-400">+{otherItemsCount} more items</span>
+                            <span className="text-xs" style={{ color: 'var(--brand-primary)' }}>+{otherItemsCount} more items</span>
                         )}
                     </div>
                 </div>
-                <ChevronRight size={16} className="text-gray-500 group-hover:text-pink-500 transition-colors" />
+                <ChevronRight size={16} className="brand-muted transition-colors" />
             </div>
         </div>
     );

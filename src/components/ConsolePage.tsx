@@ -1,7 +1,8 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef, useMemo } from 'react';
 import { Sidebar } from './Sidebar';
 import { HomeConsoleView } from './views/HomeConsoleView';
 import { AgencyConsoleView } from './views/AgencyConsoleView';
+import { AgencyBrandingView } from './views/AgencyBrandingView';
 import { RoleManagementView } from './views/RoleManagementView';
 import { MyAccessView } from './views/MyAccessView';
 import { PlatformTenantsView } from './views/PlatformTenantsView';
@@ -14,23 +15,18 @@ import { TeamInvitationStickyToast } from './TeamInvitationStickyToast';
 import { useConsoleNotificationStore } from '../store/useConsoleNotificationStore';
 import WelcomeScreen from './WelcomeScreen';
 import { supabase, type Account } from '../lib/supabase';
-import { apiFetch } from '../lib/apiClient';
+import { apiFetch, getApiOrigin } from '../lib/apiClient';
 import { useAuth } from '../contexts/AuthContext';
 import { useTenantContext } from '../contexts/TenantContext';
+import { SellerBrandingProvider } from '../contexts/SellerBrandingContext';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001';
+const API_BASE_URL = getApiOrigin();
 
-const FULL_WIDTH_TABS = new Set([
-    'home',
-    'agency-console',
-    'team-roles',
-    'my-access',
-    'platform-tenants',
-    'notifications',
-    'ingestion-monitoring',
-]);
 const CONSOLE_ACTIVE_TAB_KEY = 'console.activeTab';
+
+/** Restored from sessionStorage; must not apply to users without platform admin. */
+const PLATFORM_ONLY_CONSOLE_TABS = new Set(['admin-dashboard', 'platform-tenants', 'ingestion-monitoring']);
 
 export function ConsolePage() {
     const { user } = useAuth();
@@ -40,6 +36,10 @@ export function ConsolePage() {
         loading: tenantLoading,
         hasAgencyAccess,
         manageableAdminTenants,
+        profileTenantId,
+        sellerFacingBrandingEligible,
+        isTenantAccessLocked,
+        tenantAccessLockReason,
     } = useTenantContext();
     const queryClient = useQueryClient();
 
@@ -60,9 +60,20 @@ export function ConsolePage() {
         }
     }, [isPlatformSuperAdmin]);
 
+    useLayoutEffect(() => {
+        if (!user?.id || tenantLoading) return;
+        if (!isPlatformSuperAdmin && PLATFORM_ONLY_CONSOLE_TABS.has(activeTab)) {
+            setActiveTab('home');
+        }
+    }, [user?.id, tenantLoading, isPlatformSuperAdmin, activeTab]);
+
     useEffect(() => {
         sessionStorage.setItem(CONSOLE_ACTIVE_TAB_KEY, activeTab);
     }, [activeTab]);
+
+    const handleConsoleTabChange = (tab: string) => {
+        setActiveTab(tab);
+    };
 
     const fetchNotifications = useConsoleNotificationStore((state) => state.fetchNotifications);
     const subscribeToNotifications = useConsoleNotificationStore((state) => state.subscribeToNotifications);
@@ -128,20 +139,16 @@ export function ConsolePage() {
         try {
             if (!user?.id) throw new Error('User not authenticated');
 
-            const { data: existingProfile } = await supabase.from('profiles').select('id').eq('id', user.id).single();
-
-            if (!existingProfile) {
-                const { error: profileError } = await supabase.from('profiles').insert({
-                    id: user.id,
-                    email: user.email,
-                    full_name: user.user_metadata?.full_name || user.email?.split('@')[0] || 'User',
-                    role: 'client',
-                    updated_at: new Date().toISOString(),
-                });
-                if (profileError) throw profileError;
+            const cached = queryClient.getQueryData<Account[]>(['accounts', user.id]);
+            if (cached?.length) {
+                return cached[0];
             }
 
-            const displayName = user.user_metadata?.full_name || user.email?.split('@')[0] || 'New Seller';
+            const metaName =
+                typeof user.user_metadata?.seller_org_name === 'string'
+                    ? user.user_metadata.seller_org_name.trim()
+                    : '';
+            const displayName = metaName.length > 0 ? metaName : 'New Seller';
             const { data: account, error: rpcError } = await supabase.rpc('create_seller_account_for_user', {
                 p_name: displayName,
                 p_email: user.email ?? null,
@@ -208,6 +215,11 @@ export function ConsolePage() {
         }
     }, [queryClient]);
 
+    /** Resolve GET /api/branding only for agency JWTs or sellers linked to an agency (see TenantContext). */
+    const consoleAgencyBrandingEnabled = sellerFacingBrandingEligible;
+
+    const consoleDocumentTitle = useMemo(() => ({ kind: 'console' as const }), []);
+
     if (!user?.id || tenantLoading) {
         return (
             <div className="flex items-center justify-center h-screen bg-gray-900">
@@ -238,30 +250,51 @@ export function ConsolePage() {
         );
     }
 
-    const mainFullWidth = FULL_WIDTH_TABS.has(activeTab);
-
     return (
-        <div className="flex h-screen bg-gray-900">
-            <Sidebar mode="console" activeTab={activeTab} onTabChange={setActiveTab} />
-            <ConsoleNotificationToast />
-            <TeamInvitationStickyToast activeTab={activeTab} onOpenNotifications={() => setActiveTab('notifications')} />
+        <SellerBrandingProvider
+            enabled={consoleAgencyBrandingEnabled}
+            brandingCacheKey={profileTenantId || '_'}
+            documentTitle={consoleAgencyBrandingEnabled ? consoleDocumentTitle : null}
+        >
+            <div className="flex h-screen brand-bg">
+                <Sidebar
+                    mode="console"
+                    activeTab={activeTab}
+                    onTabChange={handleConsoleTabChange}
+                />
+                <ConsoleNotificationToast />
+                <TeamInvitationStickyToast activeTab={activeTab} onOpenNotifications={() => handleConsoleTabChange('notifications')} />
 
-            <main className="flex-1 overflow-y-auto min-w-0 bg-gray-900">
-                <div className={mainFullWidth ? 'w-full min-h-full px-4 sm:px-5 lg:px-6 py-4' : 'p-8'}>
-                    {(() => {
-                        switch (activeTab) {
+                <main className="flex-1 min-w-0 w-full overflow-y-auto brand-bg relative">
+                    {isTenantAccessLocked && (
+                        <div className="absolute inset-0 z-20 flex items-start justify-center pointer-events-none p-6">
+                            <div className="max-w-2xl w-full rounded-2xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-amber-100 backdrop-blur-sm">
+                                Tenant is {tenantAccessLockReason ?? 'inactive'}.
+                                This console is locked until reactivation.
+                            </div>
+                        </div>
+                    )}
+                    <div
+                        className={`w-full min-w-0 px-4 sm:px-5 lg:px-6 py-4 box-border ${
+                            isTenantAccessLocked ? 'pointer-events-none blur-[2px] opacity-60' : ''
+                        }`}
+                    >
+                        {(() => {
+                            switch (activeTab) {
                             case 'home':
                                 return (
                                     <HomeConsoleView
                                         hasAgencyAccess={hasAgencyAccess}
                                         canManageTeamRoles={manageableAdminTenants.length > 0}
-                                        onNavigate={setActiveTab}
+                                        onNavigate={handleConsoleTabChange}
                                         memberships={memberships}
                                         onAddShop={handleConnectShop}
                                     />
                                 );
                             case 'agency-console':
                                 return <AgencyConsoleView />;
+                            case 'agency-branding':
+                                return <AgencyBrandingView onNavigate={handleConsoleTabChange} />;
                             case 'my-access':
                                 return <MyAccessView />;
                             case 'team-roles':
@@ -279,7 +312,7 @@ export function ConsolePage() {
                                     <p className="text-red-400">Ingestion monitoring requires a platform administrator.</p>
                                 );
                             case 'admin-dashboard':
-                                return <AdminDashboard onNavigateToTeamRoles={() => setActiveTab('team-roles')} />;
+                                return <AdminDashboard onNavigateToTeamRoles={() => handleConsoleTabChange('team-roles')} />;
                             case 'notifications':
                                 return <ConsoleNotificationsView />;
                             case 'profile':
@@ -289,15 +322,16 @@ export function ConsolePage() {
                                     <HomeConsoleView
                                         hasAgencyAccess={hasAgencyAccess}
                                         canManageTeamRoles={manageableAdminTenants.length > 0}
-                                        onNavigate={setActiveTab}
+                                        onNavigate={handleConsoleTabChange}
                                         memberships={memberships}
                                         onAddShop={handleConnectShop}
                                     />
                                 );
-                        }
-                    })()}
-                </div>
-            </main>
-        </div>
+                            }
+                        })()}
+                    </div>
+                </main>
+            </div>
+        </SellerBrandingProvider>
     );
 }

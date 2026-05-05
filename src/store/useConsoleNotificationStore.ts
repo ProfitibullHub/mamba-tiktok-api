@@ -25,6 +25,7 @@ interface ConsoleNotificationState {
     unsubscribeFromNotifications: () => void;
     markAsRead: (id: string) => Promise<void>;
     markAllAsRead: () => Promise<void>;
+    deleteNotification: (id: string) => Promise<void>;
     removeActiveToast: (id: string) => void;
     requestBrowserPermission: () => Promise<void>;
 }
@@ -184,6 +185,29 @@ export const useConsoleNotificationStore = create<ConsoleNotificationState>((set
             await supabase.from('user_notifications').update({ is_read: true }).in('id', unreadIds);
         } catch (err) {
             console.error('[ConsoleNotificationStore] Failed to mark all as read:', err);
+        }
+    },
+
+    deleteNotification: async (id: string) => {
+        const prev = get().notifications;
+        set((state) => {
+            const updated = state.notifications.filter((n) => n.id !== id);
+            return {
+                notifications: updated,
+                unreadCount: updated.filter((n) => !n.is_read).length,
+                activeToasts: state.activeToasts.filter((t) => t.id !== id),
+            };
+        });
+
+        try {
+            const { error } = await supabase.from('user_notifications').delete().eq('id', id);
+            if (error) throw error;
+        } catch (err) {
+            console.error('[ConsoleNotificationStore] Failed to delete notification:', err);
+            set({
+                notifications: prev,
+                unreadCount: prev.filter((n) => !n.is_read).length,
+            });
         }
     },
 

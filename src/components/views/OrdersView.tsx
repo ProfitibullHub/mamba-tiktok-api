@@ -310,8 +310,8 @@ export function OrdersView({ account, shopId, timezone = 'America/Los_Angeles', 
             {/* Header */}
             <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
                 <div>
-                    <h2 className="text-2xl font-bold text-white">Orders</h2>
-                    <p className="text-gray-400">Manage and track your shop orders</p>
+                    <h2 className="text-2xl font-bold brand-text">Orders</h2>
+                    <p className="brand-muted">Manage and track your shop orders</p>
                 </div>
                 <div className="flex items-center gap-3">
                     <DateRangePicker value={dateRange} onChange={setDateRange} />
@@ -325,7 +325,8 @@ export function OrdersView({ account, shopId, timezone = 'America/Los_Angeles', 
                         onClick={handleSync}
                         disabled={!canSyncShop || cacheMetadata.isSyncing || isLoading}
                         title={!canSyncShop ? 'You do not have access to sync this shop' : undefined}
-                        className="flex items-center space-x-2 px-4 py-2 bg-pink-600 hover:bg-pink-700 text-white rounded-lg transition-colors disabled:opacity-50"
+                        className="flex items-center space-x-2 px-4 py-2 rounded-lg transition-opacity disabled:opacity-50"
+                        style={{ backgroundColor: 'var(--brand-primary)', color: 'var(--brand-btn-text)' }}
                     >
                         <RefreshCw size={20} className={cacheMetadata.isSyncing ? "animate-spin" : ""} />
                         <span className="hidden sm:inline">{cacheMetadata.isSyncing ? 'Syncing...' : 'Sync'}</span>
@@ -337,7 +338,7 @@ export function OrdersView({ account, shopId, timezone = 'America/Los_Angeles', 
             <div className="space-y-2">
                 <button
                     onClick={() => setShowCharts(!showCharts)}
-                    className="flex items-center gap-2 text-sm text-gray-400 hover:text-white transition-colors"
+                    className="flex items-center gap-2 text-sm brand-nav-idle transition-colors"
                 >
                     <BarChart3 size={16} />
                     <span>Performance Charts</span>
@@ -359,71 +360,74 @@ export function OrdersView({ account, shopId, timezone = 'America/Los_Angeles', 
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
                 <div
                     className={`p-4 rounded-xl border cursor-pointer transition-all ${fulfillmentFilter === 'all' && statusFilter === 'all'
-                        ? 'bg-pink-500/20 border-pink-500'
-                        : 'bg-gray-800/50 border-gray-700 hover:border-pink-500/50'
+                        ? 'brand-primary-card'
+                        : 'brand-card brand-card-hover'
                         }`}
                     onClick={() => { setFulfillmentFilter('all'); setStatusFilter('all'); }}
                 >
                     <div className="flex items-center gap-1">
-                        <p className="text-sm text-gray-400">Total Orders</p>
+                        <p className="text-sm brand-muted">Total Orders</p>
                         <CalculationTooltip
                             source="TikTok Shop"
                             calculation="Count(orders) - Excludes Sample Orders"
                             api="GET /orders/search"
                         />
                     </div>
-                    <p className={`text-2xl font-bold ${fulfillmentFilter === 'all' && statusFilter === 'all' ? 'text-pink-400' : 'text-white'}`}>
+                    <p
+                        className="text-2xl font-bold"
+                        style={{ color: fulfillmentFilter === 'all' && statusFilter === 'all' ? 'var(--brand-primary)' : 'var(--brand-text)' }}
+                    >
                         {totalOrdersCount.toLocaleString()}
                     </p>
                 </div>
                 <div
                     className={`p-4 rounded-xl border cursor-pointer transition-all ${fulfillmentFilter === 'fbt'
-                        ? 'bg-cyan-500/20 border-cyan-500'
-                        : 'bg-gray-800/50 border-gray-700 hover:border-cyan-500/50'
+                        ? 'brand-state-info'
+                        : 'brand-card brand-card-hover'
                         }`}
                     onClick={() => setFulfillmentFilter(fulfillmentFilter === 'fbt' ? 'all' : 'fbt')}
                 >
                     <div className="flex items-center gap-2">
-                        <Box size={16} className="text-cyan-400" />
-                        <p className="text-sm text-gray-400">FBT Orders</p>
+                        <Box size={16} style={{ color: 'var(--brand-info-text)' }} />
+                        <p className="text-sm brand-muted">FBT Orders</p>
                         <CalculationTooltip
                             source="TikTok Shop"
                             calculation="is_fbt=true OR fulfillment_type=FBT"
                             api="GET /orders/search"
                         />
                     </div>
-                    <p className={`text-2xl font-bold ${fulfillmentFilter === 'fbt' ? 'text-cyan-400' : 'text-white'}`}>
+                    <p className="text-2xl font-bold" style={{ color: fulfillmentFilter === 'fbt' ? 'var(--brand-info-text)' : 'var(--brand-text)' }}>
                         {fbtOrdersCount.toLocaleString()}
                     </p>
                 </div>
                 <div
                     className={`p-4 rounded-xl border cursor-pointer transition-all ${fulfillmentFilter === 'seller'
-                        ? 'bg-purple-500/20 border-purple-500'
-                        : 'bg-gray-800/50 border-gray-700 hover:border-purple-500/50'
+                        ? 'brand-secondary-card'
+                        : 'brand-card brand-card-hover'
                         }`}
                     onClick={() => setFulfillmentFilter(fulfillmentFilter === 'seller' ? 'all' : 'seller')}
                 >
                     <div className="flex items-center gap-2">
-                        <Truck size={16} className="text-purple-400" />
-                        <p className="text-sm text-gray-400">Seller Fulfilled</p>
+                        <Truck size={16} style={{ color: 'var(--brand-secondary)' }} />
+                        <p className="text-sm brand-muted">Seller Fulfilled</p>
                         <CalculationTooltip
                             source="TikTok Shop"
                             calculation="is_fbt=false"
                             api="GET /orders/search"
                         />
                     </div>
-                    <p className={`text-2xl font-bold ${fulfillmentFilter === 'seller' ? 'text-purple-400' : 'text-white'}`}>
+                    <p className="text-2xl font-bold" style={{ color: fulfillmentFilter === 'seller' ? 'var(--brand-secondary)' : 'var(--brand-text)' }}>
                         {sellerOrdersCount.toLocaleString()}
                     </p>
                 </div>
 
                 {/* Total Customers Card */}
-                <div className="p-4 rounded-xl border bg-gray-800/50 border-gray-700">
+                <div className="p-4 rounded-xl brand-card">
                     <div className="flex items-center gap-2">
-                        <Users size={16} className="text-pink-400" />
-                        <p className="text-sm text-gray-400">Total Customers</p>
+                        <Users size={16} style={{ color: 'var(--brand-primary)' }} />
+                        <p className="text-sm brand-muted">Total Customers</p>
                     </div>
-                    <p className="text-2xl font-bold text-white">{totalCustomers.toLocaleString()}</p>
+                    <p className="text-2xl font-bold brand-text">{totalCustomers.toLocaleString()}</p>
                 </div>
             </div>
 
@@ -431,56 +435,56 @@ export function OrdersView({ account, shopId, timezone = 'America/Los_Angeles', 
             <div className="grid grid-cols-3 gap-4">
                 <div
                     className={`p-4 rounded-xl border cursor-pointer transition-all ${paymentFilter === 'paid'
-                        ? 'bg-green-500/20 border-green-500'
-                        : 'bg-gray-800/50 border-gray-700 hover:border-green-500/50'
+                        ? 'brand-state-success'
+                        : 'brand-card brand-card-hover'
                         }`}
                     onClick={() => setPaymentFilter(paymentFilter === 'paid' ? 'all' : 'paid')}
                 >
                     <div className="flex items-center gap-2">
-                        <BadgeCheck size={16} className="text-green-400" />
-                        <p className="text-sm text-gray-400">Paid Orders</p>
+                        <BadgeCheck size={16} style={{ color: 'var(--brand-success-text)' }} />
+                        <p className="text-sm brand-muted">Paid Orders</p>
                         <CalculationTooltip
                             source="TikTok Shop"
                             calculation="paid_time IS NOT NULL"
                             api="GET /orders/search"
                         />
                     </div>
-                    <p className={`text-2xl font-bold ${paymentFilter === 'paid' ? 'text-green-400' : 'text-white'}`}>
+                    <p className="text-2xl font-bold" style={{ color: paymentFilter === 'paid' ? 'var(--brand-success-text)' : 'var(--brand-text)' }}>
                         {paidOrdersCount.toLocaleString()}
                     </p>
                 </div>
                 <div
                     className={`p-4 rounded-xl border cursor-pointer transition-all ${paymentFilter === 'unpaid'
-                        ? 'bg-red-500/20 border-red-500'
-                        : 'bg-gray-800/50 border-gray-700 hover:border-red-500/50'
+                        ? 'brand-state-danger'
+                        : 'brand-card brand-card-hover'
                         }`}
                     onClick={() => setPaymentFilter(paymentFilter === 'unpaid' ? 'all' : 'unpaid')}
                 >
                     <div className="flex items-center gap-2">
-                        <XCircle size={16} className="text-red-400" />
-                        <p className="text-sm text-gray-400">Unpaid Orders</p>
+                        <XCircle size={16} style={{ color: 'var(--brand-danger-text)' }} />
+                        <p className="text-sm brand-muted">Unpaid Orders</p>
                         <CalculationTooltip
                             source="TikTok Shop"
                             calculation="paid_time IS NULL"
                             api="GET /orders/search"
                         />
                     </div>
-                    <p className={`text-2xl font-bold ${paymentFilter === 'unpaid' ? 'text-red-400' : 'text-white'}`}>
+                    <p className="text-2xl font-bold" style={{ color: paymentFilter === 'unpaid' ? 'var(--brand-danger-text)' : 'var(--brand-text)' }}>
                         {unpaidOrdersCount.toLocaleString()}
                     </p>
                 </div>
                 <div
                     className={`p-4 rounded-xl border cursor-pointer transition-all ${paymentFilter === 'all'
-                        ? 'bg-blue-500/20 border-blue-500'
-                        : 'bg-gray-800/50 border-gray-700 hover:border-blue-500/50'
+                        ? 'brand-state-info'
+                        : 'brand-card brand-card-hover'
                         }`}
                     onClick={() => setPaymentFilter('all')}
                 >
                     <div className="flex items-center gap-2">
-                        <Filter size={16} className="text-blue-400" />
-                        <p className="text-sm text-gray-400">All Orders</p>
+                        <Filter size={16} style={{ color: 'var(--brand-info-text)' }} />
+                        <p className="text-sm brand-muted">All Orders</p>
                     </div>
-                    <p className={`text-2xl font-bold ${paymentFilter === 'all' ? 'text-blue-400' : 'text-white'}`}>
+                    <p className="text-2xl font-bold" style={{ color: paymentFilter === 'all' ? 'var(--brand-info-text)' : 'var(--brand-text)' }}>
                         {dateFilteredOrders.length.toLocaleString()}
                     </p>
                 </div>
@@ -491,24 +495,24 @@ export function OrdersView({ account, shopId, timezone = 'America/Los_Angeles', 
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
                 <div
                     className={`p-4 rounded-xl border cursor-pointer transition-all ${statusFilter === 'ON_HOLD'
-                        ? 'bg-orange-500/20 border-orange-500'
-                        : 'bg-gray-800/50 border-gray-700 hover:border-orange-500/50'
+                        ? 'brand-state-warning'
+                        : 'brand-card brand-card-hover'
                         }`}
                     onClick={() => setStatusFilter(statusFilter === 'ON_HOLD' ? 'all' : 'ON_HOLD')}
                 >
                     <div className="flex items-center gap-1">
-                        <p className="text-sm text-gray-400">On Hold</p>
+                        <p className="text-sm brand-muted">On Hold</p>
                         <CalculationTooltip
                             source="TikTok Shop"
                             calculation="status=ON_HOLD or PARTIALLY_SHIPPING"
                             api="GET /orders/search"
                         />
                     </div>
-                    <p className={`text-2xl font-bold ${statusFilter === 'ON_HOLD' ? 'text-orange-400' : onHoldCount > 0 ? 'text-orange-400' : 'text-white'}`}>
+                    <p className="text-2xl font-bold" style={{ color: statusFilter === 'ON_HOLD' || onHoldCount > 0 ? 'var(--brand-warning-text)' : 'var(--brand-text)' }}>
                         {onHoldCount.toLocaleString()}
                     </p>
                     {onHoldCount > 0 && statusFilter !== 'ON_HOLD' && (
-                        <p className="text-xs text-orange-400 mt-1">Needs attention</p>
+                        <p className="text-xs mt-1" style={{ color: 'var(--brand-warning-text)' }}>Needs attention</p>
                     )}
                 </div>
 
@@ -517,21 +521,21 @@ export function OrdersView({ account, shopId, timezone = 'America/Los_Angeles', 
                 {/* Sample Orders Card */}
                 <div
                     className={`p-4 rounded-xl border cursor-pointer transition-all ${statusFilter === 'SAMPLE'
-                        ? 'bg-purple-500/20 border-purple-500'
-                        : 'bg-gray-800/50 border-gray-700 hover:border-purple-500/50'
+                        ? 'brand-secondary-card'
+                        : 'brand-card brand-card-hover'
                         }`}
                     onClick={() => { setFulfillmentFilter('all'); setStatusFilter('SAMPLE'); }}
                 >
                     <div className="flex items-center gap-2">
-                        <Box size={16} className="text-purple-400" />
-                        <p className="text-sm text-gray-400">Sample Orders</p>
+                        <Box size={16} style={{ color: 'var(--brand-secondary)' }} />
+                        <p className="text-sm brand-muted">Sample Orders</p>
                         <CalculationTooltip
                             source="TikTok Shop"
                             calculation="is_sample_order=true"
                             api="GET /orders/search"
                         />
                     </div>
-                    <p className={`text-2xl font-bold ${statusFilter === 'SAMPLE' ? 'text-purple-400' : 'text-white'}`}>
+                    <p className="text-2xl font-bold" style={{ color: statusFilter === 'SAMPLE' ? 'var(--brand-secondary)' : 'var(--brand-text)' }}>
                         {sampleOrdersCount}
                     </p>
                 </div>
@@ -539,84 +543,84 @@ export function OrdersView({ account, shopId, timezone = 'America/Los_Angeles', 
                 {/* Cancelled/Refunded Orders Card */}
                 <div
                     className={`p-4 rounded-xl border cursor-pointer transition-all ${statusFilter === 'CANCELLED_REFUNDED'
-                        ? 'bg-red-500/20 border-red-500'
-                        : 'bg-gray-800/50 border-gray-700 hover:border-red-500/50'
+                        ? 'brand-state-danger'
+                        : 'brand-card brand-card-hover'
                         }`}
                     onClick={() => { setFulfillmentFilter('all'); setStatusFilter('CANCELLED_REFUNDED'); }}
                 >
                     <div className="flex items-center gap-2">
-                        <XCircle size={16} className="text-red-400" />
-                        <p className="text-sm text-gray-400">Cancelled/Refunded</p>
+                        <XCircle size={16} style={{ color: 'var(--brand-danger-text)' }} />
+                        <p className="text-sm brand-muted">Cancelled/Refunded</p>
                         <CalculationTooltip
                             source="TikTok Shop"
                             calculation="CANCELLED status, cancel_reason, or cancellation_initiator"
                             api="GET /orders/search"
                         />
                     </div>
-                    <p className={`text-2xl font-bold ${statusFilter === 'CANCELLED_REFUNDED' ? 'text-red-400' : 'text-white'}`}>
+                    <p className="text-2xl font-bold" style={{ color: statusFilter === 'CANCELLED_REFUNDED' ? 'var(--brand-danger-text)' : 'var(--brand-text)' }}>
                         {cancelledRefundedCount}
                     </p>
                 </div>
             </div>
 
             {/* Status Investigation Section */}
-            <div className="bg-blue-500/10 border border-blue-500/30 rounded-xl p-4">
-                <h3 className="text-sm font-semibold text-blue-400 mb-3 flex items-center gap-2">
+            <div className="brand-state-info rounded-xl p-4">
+                <h3 className="text-sm font-semibold mb-3 flex items-center gap-2">
                     <BarChart3 size={16} />
                     Status Breakdown (for date range selected above)
                 </h3>
                 <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3">
-                    <div className="p-3 rounded-lg bg-gray-800/50 border border-red-700/50">
-                        <p className="text-xs text-gray-400">UNPAID</p>
-                        <p className="text-xl font-bold text-red-400">{unpaidStatusCount.toLocaleString()}</p>
+                    <div className="p-3 rounded-lg brand-card">
+                        <p className="text-xs brand-muted">UNPAID</p>
+                        <p className="text-xl font-bold brand-loss">{unpaidStatusCount.toLocaleString()}</p>
                     </div>
-                    <div className="p-3 rounded-lg bg-gray-800/50 border border-yellow-700/50">
-                        <p className="text-xs text-gray-400">ON_HOLD</p>
-                        <p className="text-xl font-bold text-yellow-400">{onHoldStatusCount.toLocaleString()}</p>
+                    <div className="p-3 rounded-lg brand-card">
+                        <p className="text-xs brand-muted">ON_HOLD</p>
+                        <p className="text-xl font-bold" style={{ color: 'var(--brand-warning-text)' }}>{onHoldStatusCount.toLocaleString()}</p>
                     </div>
-                    <div className="p-3 rounded-lg bg-gray-800/50 border border-blue-700/50">
-                        <p className="text-xs text-gray-400">AWAITING_SHIPMENT</p>
-                        <p className="text-xl font-bold text-blue-400">{awaitingShipmentStatusCount.toLocaleString()}</p>
+                    <div className="p-3 rounded-lg brand-card">
+                        <p className="text-xs brand-muted">AWAITING_SHIPMENT</p>
+                        <p className="text-xl font-bold" style={{ color: 'var(--brand-info-text)' }}>{awaitingShipmentStatusCount.toLocaleString()}</p>
                     </div>
-                    <div className="p-3 rounded-lg bg-gray-800/50 border border-purple-700/50">
-                        <p className="text-xs text-gray-400">IN_TRANSIT</p>
-                        <p className="text-xl font-bold text-purple-400">{inTransitStatusCount.toLocaleString()}</p>
+                    <div className="p-3 rounded-lg brand-card">
+                        <p className="text-xs brand-muted">IN_TRANSIT</p>
+                        <p className="text-xl font-bold" style={{ color: 'var(--brand-secondary)' }}>{inTransitStatusCount.toLocaleString()}</p>
                     </div>
-                    <div className="p-3 rounded-lg bg-gray-800/50 border border-cyan-700/50">
-                        <p className="text-xs text-gray-400">DELIVERED</p>
-                        <p className="text-xl font-bold text-cyan-400">{deliveredStatusCount.toLocaleString()}</p>
+                    <div className="p-3 rounded-lg brand-card">
+                        <p className="text-xs brand-muted">DELIVERED</p>
+                        <p className="text-xl font-bold" style={{ color: 'var(--brand-info-text)' }}>{deliveredStatusCount.toLocaleString()}</p>
                     </div>
-                    <div className="p-3 rounded-lg bg-gray-800/50 border border-green-700/50">
-                        <p className="text-xs text-gray-400">COMPLETED</p>
-                        <p className="text-xl font-bold text-green-400">{completedStatusCount.toLocaleString()}</p>
+                    <div className="p-3 rounded-lg brand-card">
+                        <p className="text-xs brand-muted">COMPLETED</p>
+                        <p className="text-xl font-bold brand-profit">{completedStatusCount.toLocaleString()}</p>
                     </div>
-                    <div className="p-3 rounded-lg bg-gray-800/50 border border-orange-700/50">
-                        <p className="text-xs text-gray-400">CANCELLED</p>
-                        <p className="text-xl font-bold text-orange-400">{cancelledStatusCount.toLocaleString()}</p>
+                    <div className="p-3 rounded-lg brand-card">
+                        <p className="text-xs brand-muted">CANCELLED</p>
+                        <p className="text-xl font-bold brand-loss">{cancelledStatusCount.toLocaleString()}</p>
                     </div>
                 </div>
             </div>
 
             {/* Filters */}
-            <div className="flex flex-col md:flex-row gap-4 bg-gray-800/50 p-4 rounded-xl border border-gray-700">
+            <div className="flex flex-col md:flex-row gap-4 brand-toolbar p-4 rounded-xl">
                 <div className="relative flex-1">
-                    <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400" size={20} />
+                    <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 brand-muted" size={20} />
                     <input
                         type="text"
                         placeholder="Search by Order ID or Product..."
                         value={searchTerm}
                         onChange={(e) => setSearchTerm(e.target.value)}
-                        className="w-full bg-gray-900 border border-gray-700 text-white pl-10 pr-4 py-2 rounded-lg focus:outline-none focus:border-pink-500"
+                        className="w-full brand-card brand-text brand-input pl-10 pr-4 py-2 rounded-lg focus:outline-none brand-focus-ring"
                     />
                 </div>
                 <div className="flex gap-4">
                     {/* Status Filter */}
                     <div className="relative">
-                        <Filter className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400" size={20} />
+                        <Filter className="absolute left-3 top-1/2 transform -translate-y-1/2 brand-muted" size={20} />
                         <select
                             value={statusFilter}
                             onChange={(e) => setStatusFilter(e.target.value)}
-                            className="bg-gray-900 border border-gray-700 text-white pl-10 pr-8 py-2 rounded-lg focus:outline-none focus:border-pink-500 appearance-none cursor-pointer"
+                            className="brand-card brand-text pl-10 pr-8 py-2 rounded-lg focus:outline-none appearance-none cursor-pointer brand-focus-ring"
                         >
                             <option value="all">All Status</option>
                             <option value="UNPAID">Unpaid</option>
@@ -633,11 +637,11 @@ export function OrdersView({ account, shopId, timezone = 'America/Los_Angeles', 
 
                     {/* Fulfillment Filter */}
                     <div className="relative">
-                        <Box className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400" size={20} />
+                        <Box className="absolute left-3 top-1/2 transform -translate-y-1/2 brand-muted" size={20} />
                         <select
                             value={fulfillmentFilter}
                             onChange={(e) => setFulfillmentFilter(e.target.value)}
-                            className="bg-gray-900 border border-gray-700 text-white pl-10 pr-8 py-2 rounded-lg focus:outline-none focus:border-pink-500 appearance-none cursor-pointer"
+                            className="brand-card brand-text pl-10 pr-8 py-2 rounded-lg focus:outline-none appearance-none cursor-pointer brand-focus-ring"
                         >
                             <option value="all">All Fulfillment</option>
                             <option value="fbt">FBT (TikTok)</option>
@@ -653,8 +657,8 @@ export function OrdersView({ account, shopId, timezone = 'America/Los_Angeles', 
                     <div className="flex flex-wrap items-center gap-2">
                         {statusFilter !== 'all' && (
                             <span className={`px-3 py-1 rounded-full text-sm font-medium ${statusFilter === 'ON_HOLD'
-                                ? 'bg-orange-500/20 text-orange-400 border border-orange-500/30'
-                                : 'bg-gray-700 text-gray-300 border border-gray-600'
+                                ? 'brand-state-warning'
+                                : 'brand-card brand-text'
                                 }`}>
                                 Status: {statusFilter.replace(/_/g, ' ')}
                                 {isOnHoldFilter && (
@@ -664,15 +668,15 @@ export function OrdersView({ account, shopId, timezone = 'America/Los_Angeles', 
                         )}
                         {fulfillmentFilter !== 'all' && (
                             <span className={`px-3 py-1 rounded-full text-sm font-medium ${fulfillmentFilter === 'fbt'
-                                ? 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/30'
-                                : 'bg-purple-500/20 text-purple-400 border border-purple-500/30'
+                                ? 'brand-state-info'
+                                : 'brand-secondary-card'
                                 }`}>
                                 {fulfillmentFilter === 'fbt' ? 'FBT Orders Only' : 'Seller Fulfilled Only'}
                             </span>
                         )}
                         <button
                             onClick={() => { setFulfillmentFilter('all'); setStatusFilter('all'); }}
-                            className="text-gray-400 hover:text-white text-sm"
+                            className="brand-nav-idle text-sm"
                         >
                             Clear all filters
                         </button>
@@ -684,7 +688,10 @@ export function OrdersView({ account, shopId, timezone = 'America/Los_Angeles', 
             {
                 isLoading && orders.length === 0 ? (
                     <div className="flex justify-center items-center h-64">
-                        <div className="animate-spin rounded-full h-12 w-12 border-4 border-pink-500 border-t-transparent"></div>
+                        <div
+                            className="animate-spin rounded-full h-12 w-12 border-4 border-t-transparent"
+                            style={{ borderColor: 'var(--brand-primary)', borderTopColor: 'transparent' }}
+                        ></div>
                     </div>
                 ) : filteredOrders.length > 0 ? (
                     <>
@@ -698,17 +705,17 @@ export function OrdersView({ account, shopId, timezone = 'America/Los_Angeles', 
 
                         {/* List View */}
                         {effectiveViewMode === 'list' && (
-                            <div className="bg-gray-800/30 rounded-xl border border-gray-700 overflow-hidden">
+                            <div className="brand-card rounded-xl overflow-hidden">
                                 <div className="overflow-x-auto">
                                     <table className="w-full">
-                                        <thead className="bg-gray-900/50">
+                                        <thead className="brand-toolbar">
                                             <tr>
-                                                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Order</th>
-                                                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Customer</th>
-                                                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Products</th>
-                                                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Status</th>
-                                                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Fulfillment</th>
-                                                <th className="px-4 py-3 text-right text-xs font-medium text-gray-400 uppercase">Amount</th>
+                                                <th className="px-4 py-3 text-left text-xs font-medium brand-muted uppercase">Order</th>
+                                                <th className="px-4 py-3 text-left text-xs font-medium brand-muted uppercase">Customer</th>
+                                                <th className="px-4 py-3 text-left text-xs font-medium brand-muted uppercase">Products</th>
+                                                <th className="px-4 py-3 text-left text-xs font-medium brand-muted uppercase">Status</th>
+                                                <th className="px-4 py-3 text-left text-xs font-medium brand-muted uppercase">Fulfillment</th>
+                                                <th className="px-4 py-3 text-right text-xs font-medium brand-muted uppercase">Amount</th>
                                             </tr>
                                         </thead>
                                         <tbody>
@@ -744,17 +751,17 @@ export function OrdersView({ account, shopId, timezone = 'America/Los_Angeles', 
                                 <button
                                     onClick={() => setCurrentPage(prev => Math.max(prev - 1, 1))}
                                     disabled={currentPage === 1}
-                                    className="px-4 py-2 bg-gray-800 text-white rounded-lg disabled:opacity-50 hover:bg-gray-700 transition-colors"
+                                    className="px-4 py-2 brand-card brand-text brand-card-hover rounded-lg disabled:opacity-50 transition-colors"
                                 >
                                     Previous
                                 </button>
-                                <span className="text-gray-400">
+                                <span className="brand-muted">
                                     Page {currentPage} of {totalPages} ({filteredOrders.length} orders)
                                 </span>
                                 <button
                                     onClick={() => setCurrentPage(prev => Math.min(prev + 1, totalPages))}
                                     disabled={currentPage === totalPages}
-                                    className="px-4 py-2 bg-gray-800 text-white rounded-lg disabled:opacity-50 hover:bg-gray-700 transition-colors"
+                                    className="px-4 py-2 brand-card brand-text brand-card-hover rounded-lg disabled:opacity-50 transition-colors"
                                 >
                                     Next
                                 </button>
@@ -762,8 +769,8 @@ export function OrdersView({ account, shopId, timezone = 'America/Los_Angeles', 
                         )}
                     </>
                 ) : (
-                    <div className="text-center py-12 bg-gray-800/30 rounded-xl border border-gray-700 border-dashed">
-                        <p className="text-gray-400 text-lg">
+                    <div className="text-center py-12 rounded-xl border border-dashed brand-card">
+                        <p className="brand-muted text-lg">
                             {fulfillmentFilter === 'fbt'
                                 ? 'No FBT orders found. Only orders fulfilled by TikTok will appear here.'
                                 : fulfillmentFilter === 'seller'
@@ -782,7 +789,7 @@ export function OrdersView({ account, shopId, timezone = 'America/Los_Angeles', 
             {
                 selectedOrder && (
                     <div className="fixed inset-0 z-50 flex justify-end">
-                        <div className="absolute inset-0 bg-gray-900/60 backdrop-blur-sm" onClick={() => {
+                        <div className="absolute inset-0" style={{ backgroundColor: 'var(--brand-bg)', opacity: 0.72 }} onClick={() => {
                             setSelectedOrder(null);
                             if (onClearSelection) onClearSelection();
                         }} />

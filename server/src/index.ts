@@ -60,6 +60,7 @@ import tiktokShopDataRoutes from './routes/tiktok-shop-data.routes.js';
 import tiktokShopFinanceRoutes from './routes/tiktok-shop-finance.routes.js';
 import adminRoutes from './routes/admin.routes.js';
 import teamRoutes from './routes/team.routes.js';
+import brandingRoutes from './routes/branding.routes.js';
 import reportsRoutes from './routes/reports.routes.js';
 import billingRoutes from './routes/billing.routes.js';
 import tiktokAdsRoutes from './routes/tiktok-ads.routes.js';
@@ -178,6 +179,7 @@ app.use('/api/tiktok-ads', tiktokAdsRoutes);
 // Admin / platform — separate limit
 app.use('/api/admin', adminLimiter, adminRoutes);
 app.use('/api/team', adminLimiter, teamRoutes);
+app.use('/api/branding', adminLimiter, brandingRoutes);
 app.use('/api/reports', reportsRoutes);
 app.use('/api/billing', billingRoutes);
 app.use('/api/observability', observabilityRoutes);
@@ -186,8 +188,33 @@ app.use('/api/observability', observabilityRoutes);
 app.use('/api/tiktok-shop/debug', adminLimiter, tiktokDebugRoutes);
 
 // ── 404 handler ───────────────────────────────────────────────────────────────
-app.use((_req, res) => {
-    res.status(404).json({ success: false, error: 'Endpoint not found' });
+app.use((req, res) => {
+    res.status(404).json({
+        success: false,
+        error: 'Endpoint not found',
+        details: {
+            method: req.method,
+            path: req.originalUrl || req.path,
+            message: 'The requested API route does not exist for this HTTP method.',
+        },
+        hints: [
+            'Check path prefix: most routes start with /api/... ',
+            'Check method (GET/POST/PATCH/DELETE) matches the route definition.',
+            'Use GET /health to verify backend availability.',
+        ],
+        knownRoots: [
+            '/health',
+            '/api/tiktok-shop',
+            '/api/tiktok-shop/finance',
+            '/api/tiktok-ads',
+            '/api/admin',
+            '/api/team',
+            '/api/branding',
+            '/api/reports',
+            '/api/billing',
+            '/api/observability',
+        ],
+    });
 });
 
 // ── Sentry error handler (must be LAST, before custom error handler) ──────────

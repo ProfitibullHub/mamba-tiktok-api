@@ -4,3 +4,9 @@ export const FEATURE_TIKTOK_ADS = 'tiktok_ads';
 
 /** Permission seeded in DB (see tenants_accounts_memberships migration). */
 export const ACTION_TIKTOK_AUTH = 'tiktok.auth';
+
+/** Read synced Shop dashboard (GET/HEAD); Seller User has this, not tiktok.auth. */
+export const ACTION_TIKTOK_SHOP_DATA = 'tiktok.shop.data';
+
+/** Read synced Ads dashboard (GET/HEAD); Seller User has this, not tiktok.auth. */
+export const ACTION_TIKTOK_ADS_DATA = 'tiktok.ads.data';

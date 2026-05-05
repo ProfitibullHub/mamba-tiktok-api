@@ -2,9 +2,17 @@ import { useShopStore } from '../store/useShopStore';
 import { Loader2, CheckCircle2, Package, ShoppingCart, DollarSign, XCircle } from 'lucide-react';
 
 export function SyncProgressBar() {
-    const { syncProgress, cancelSync } = useShopStore();
+    const syncProgress = useShopStore((s) => s.syncProgress);
+    const syncProgressShopId = useShopStore((s) => s.syncProgressShopId);
+    const lastFetchShopId = useShopStore((s) => s.lastFetchShopId);
+    const cancelSync = useShopStore((s) => s.cancelSync);
 
-    const showProgress = syncProgress.isActive || !!syncProgress.message;
+    const shopScoped =
+        !!syncProgressShopId &&
+        !!lastFetchShopId &&
+        syncProgressShopId === lastFetchShopId;
+    const showProgress =
+        shopScoped && (syncProgress.isActive || !!syncProgress.message);
 
     if (!showProgress) return null;
 

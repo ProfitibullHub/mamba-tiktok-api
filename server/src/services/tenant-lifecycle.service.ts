@@ -15,15 +15,20 @@ export function tenantStatusTriggersLifecycle(
     };
 }
 
-export async function unlinkSellerFromAgencyLifecycle(agencyTenantId: string, sellerTenantId: string): Promise<void> {
+export async function unlinkSellerFromAgencyLifecycle(
+    agencyTenantId: string,
+    sellerTenantId: string,
+    actorId: string
+): Promise<void> {
     const { error: unlinkErr } = await supabase.rpc('revoke_seller_agency_link', {
         p_agency_tenant_id: agencyTenantId,
         p_seller_tenant_id: sellerTenantId,
+        p_actor_id: actorId,
     });
     if (unlinkErr) throw unlinkErr;
 }
 
-export async function deactivateAgencyLifecycle(agencyTenantId: string): Promise<{ unlinkedSellerIds: string[] }> {
+export async function deactivateAgencyLifecycle(agencyTenantId: string, _actorId: string): Promise<{ unlinkedSellerIds: string[] }> {
     const { data: linkedSellers, error } = await supabase
         .from('tenants')
         .select('id')
@@ -33,14 +38,15 @@ export async function deactivateAgencyLifecycle(agencyTenantId: string): Promise
     if (error) throw error;
 
     const sellerIds = (linkedSellers || []).map((row: any) => row.id as string);
-    for (const sellerId of sellerIds) {
-        await unlinkSellerFromAgencyLifecycle(agencyTenantId, sellerId);
-    }
-
+    // Keep seller links intact when an agency is set inactive/suspended.
+    // Access is blocked by tenant status checks and is restored on re-activation.
     return { unlinkedSellerIds: sellerIds };
 }
 
-export async function deactivateSellerLifecycle(sellerTenantId: string): Promise<{ revokedAgencyTenantId: string | null }> {
+export async function deactivateSellerLifecycle(
+    sellerTenantId: string,
+    _actorId: string
+): Promise<{ revokedAgencyTenantId: string | null }> {
     const { data: seller, error } = await supabase
         .from('tenants')
         .select('parent_tenant_id')
@@ -50,9 +56,6 @@ export async function deactivateSellerLifecycle(sellerTenantId: string): Promise
     if (error) throw error;
 
     const agencyTenantId = (seller?.parent_tenant_id as string | null) ?? null;
-    if (agencyTenantId) {
-        await unlinkSellerFromAgencyLifecycle(agencyTenantId, sellerTenantId);
-    }
-
+    // Preserve link relationship; seller/agency access is blocked by tenant status.
     return { revokedAgencyTenantId: agencyTenantId };
 }

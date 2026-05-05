@@ -1,4 +1,4 @@
-import { DollarSign, TrendingUp, TrendingDown, Wallet, PieChart, Percent, AlertTriangle, ChevronDown, ChevronUp, Package, Truck, Receipt, Users, Megaphone, Building2, SlidersHorizontal, RotateCcw, Download, Plus, Trash2, Calendar, Lock, CircleDollarSign } from 'lucide-react';
+import { DollarSign, TrendingUp, TrendingDown, Minus, Wallet, PieChart, Percent, AlertTriangle, ChevronDown, ChevronUp, Package, Truck, Receipt, Users, Megaphone, Building2, SlidersHorizontal, RotateCcw, Download, Plus, Trash2, Calendar, Lock, CircleDollarSign, Loader2, RefreshCw } from 'lucide-react';
 // Note: LayoutGrid, Layers are used by the View Mode Toggle — re-add to import when uncommenting the toggle
 import { useState, useEffect, useMemo, useCallback } from 'react';
 import { useShopStore, Order } from '../../store/useShopStore';
@@ -8,11 +8,11 @@ import {
   formatShopDateISO,
   formatShopDateTime,
   getShopDayStartTimestamp,
+  getShopDayEndExclusiveTimestamp,
   getDateRangeFromPreset,
   previousCalendarDayISO,
 } from '../../utils/dateUtils';
 import { CalculationTooltip } from '../CalculationTooltip';
-import { RefreshCw } from 'lucide-react';
 import { Account } from '../../lib/supabase';
 import { calculateOrderGMV } from '../../utils/gmvCalculations';
 import { exportToCSV, exportToExcel, exportToPDF, ExportData } from '../../utils/exportUtils';
@@ -33,9 +33,37 @@ import {
 } from '../../utils/plFeeAggregation';
 import { computeAgencyFeesRollup } from '../../utils/agencyFeeProration';
 import { buildTiktokStatementExportRows } from '../../utils/tiktokStatementExportRows';
+import { useSellerBranding } from '../../contexts/SellerBrandingContext';
+import { scopedPlDataFromCache } from '../../utils/plDataRangeGuard';
 
 // Use paid_time for filtering (matches backend which loads by paid_time)
 const getOrderTs = (o: Order): number => Number(o.paid_time || o.created_time);
+
+/** P&L date default is separate from Overview / dashboard (`mamba:default_date_preset`). */
+const PL_DEFAULT_PRESET_IDS = new Set(['today', 'yesterday', 'last7', 'last30', 'mtd', 'lastMonth']);
+
+function plDefaultPresetStorageKey(shopId: string | undefined): string {
+  return `mamba:pl_default_date_preset:${shopId || 'default'}`;
+}
+
+function readPlDefaultDateRange(shopId: string | undefined, timezone: string): DateRange {
+  try {
+    const raw = localStorage.getItem(plDefaultPresetStorageKey(shopId));
+    const preset = raw && PL_DEFAULT_PRESET_IDS.has(raw) ? raw : 'last30';
+    return getDateRangeFromPreset(preset, timezone);
+  } catch {
+    return getDateRangeFromPreset('last30', timezone);
+  }
+}
+
+/** Inclusive calendar-day span for YYYY-MM-DD (noon anchors avoid DST edge glitches). */
+function inclusiveCalendarDaysInRange(startYmd: string, endYmd: string): number {
+  const start = new Date(`${startYmd}T12:00:00`);
+  const end = new Date(`${endYmd}T12:00:00`);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return 1;
+  if (end < start) return 1;
+  return Math.floor((end.getTime() - start.getTime()) / 86400000) + 1;
+}
 
 interface ProfitLossViewProps {
   account: Account;
@@ -71,13 +99,56 @@ interface PLData {
     currency: string;
     has_complete_data: boolean;
   };
+  financial_visibility?: {
+    can_view_cogs?: boolean;
+    can_view_margin?: boolean;
+    can_view_custom_line_items?: boolean;
+    restricted_fields?: string[];
+  };
+  restriction_notice?: string;
+}
+
+const PL_AMOUNT_EPS = 0.005;
+const PL_PCT_EPS = 0.05;
+
+/** Signed dollars / counts: positive green, negative red, ~zero yellow (warning tone). */
+function plSignedMetricClass(amount: number): string {
+  if (Math.abs(amount) < PL_AMOUNT_EPS) return 'brand-metric-zero';
+  return amount > 0 ? 'brand-profit' : 'brand-loss';
+}
+
+/** Percentages (margins): same semantics as signed metrics. */
+function plSignedPctClass(pct: number): string {
+  if (Math.abs(pct) < PL_PCT_EPS) return 'brand-metric-zero';
+  return pct > 0 ? 'brand-profit' : 'brand-loss';
+}
+
+/** Costs shown as positive dollar amounts: spend → loss tone; credits negative → profit tone. */
+function plExpenseMetricClass(amount: number): string {
+  if (Math.abs(amount) < PL_AMOUNT_EPS) return 'brand-metric-zero';
+  return amount > 0 ? 'brand-loss' : 'brand-profit';
+}
+
+/** Background + border + glyph color for metric icon tiles (matches value semantics). */
+function plSemanticToIconTileClass(semantic: string): string {
+  switch (semantic) {
+    case 'brand-profit':
+      return 'brand-icon-tile-profit';
+    case 'brand-loss':
+      return 'brand-icon-tile-loss';
+    case 'brand-metric-zero':
+      return 'brand-icon-tile-zero';
+    case 'brand-muted':
+    case 'brand-text':
+    default:
+      return 'brand-icon-tile-neutral';
+  }
 }
 
 
 // Expandable List Item Component
 interface ExpandableItemProps {
   icon: React.ReactNode;
-  iconBgColor: string;
   title: string;
   subtitle: string;
   value: string;
@@ -93,7 +164,6 @@ interface ExpandableItemProps {
 
 function ExpandableItem({
   icon,
-  iconBgColor,
   title,
   subtitle,
   value,
@@ -105,18 +175,18 @@ function ExpandableItem({
   const [isExpanded, setIsExpanded] = useState(false);
 
   return (
-    <div className="border-b border-gray-700 last:border-b-0">
+    <div className="border-b last:border-b-0" style={{ borderColor: 'var(--brand-card-border)' }}>
       <div
-        className={`flex items-center justify-between py-3 ${expandedContent ? 'cursor-pointer hover:bg-gray-700/30 transition-colors rounded-lg px-2 -mx-2' : ''}`}
+        className={`flex items-center justify-between py-3 ${expandedContent ? 'cursor-pointer brand-row-hover transition-colors rounded-lg px-2 -mx-2' : ''}`}
         onClick={() => expandedContent && setIsExpanded(!isExpanded)}
       >
         <div className="flex items-center gap-3">
-          <div className={`w-10 h-10 rounded-lg ${iconBgColor} flex items-center justify-center`}>
+          <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${plSemanticToIconTileClass(valueColor)}`}>
             {icon}
           </div>
           <div>
             <div className="flex items-center gap-2">
-              <p className="text-white font-medium">{title}</p>
+              <p className="brand-text font-medium">{title}</p>
               {tooltip && (
                 <CalculationTooltip
                   source={tooltip.source}
@@ -125,12 +195,12 @@ function ExpandableItem({
                 />
               )}
               {expandedContent && (
-                <span className="text-gray-500">
+                <span className="brand-muted">
                   {isExpanded ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
                 </span>
               )}
             </div>
-            <p className="text-sm text-gray-400">{subtitle}</p>
+            <p className="text-sm brand-muted">{subtitle}</p>
           </div>
         </div>
         <p className={`text-xl font-bold ${valueColor}`}>
@@ -140,7 +210,7 @@ function ExpandableItem({
 
       {isExpanded && expandedContent && (
         <div className="ml-13 pl-4 pb-3 animate-in slide-in-from-top-2 duration-200">
-          <div className="bg-gray-900/50 rounded-lg p-4 border border-gray-700/50 ml-10">
+          <div className="brand-card rounded-lg p-4 ml-10">
             {expandedContent}
           </div>
         </div>
@@ -152,17 +222,17 @@ function ExpandableItem({
 /**
  * Renders a list of key-value rows, filtering out zero values
  */
-function BreakdownRows({ items, color = 'text-gray-300' }: { items: { label: string; value: number }[]; color?: string }) {
+function BreakdownRows({ items }: { items: { label: string; value: number }[] }) {
   const nonZero = items.filter(i => Math.abs(i.value) >= 0.01);
   if (nonZero.length === 0) {
-    return <p className="text-gray-500 text-sm">No data in this period</p>;
+    return <p className="brand-muted text-sm">No data in this period</p>;
   }
   return (
     <div className="space-y-2 text-sm">
       {nonZero.map((item, i) => (
         <div key={i} className="flex justify-between">
-          <span className="text-gray-400">{item.label}</span>
-          <span className={item.value < 0 ? 'text-red-400' : color}>
+          <span className="brand-muted">{item.label}</span>
+          <span className={plExpenseMetricClass(item.value)}>
             {item.value < 0 ? '-' : ''}${Math.abs(item.value).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
           </span>
         </div>
@@ -258,25 +328,6 @@ const SERVICE_LABELS: Record<string, string> = {
   customer_service_fee: 'Customer Service Fee',
 };
 
-/** Statement `revenue` rollup keys → labels (TikTok settlement transactions). */
-const STATEMENT_REVENUE_LABELS: Record<string, string> = {
-  subtotal_before_discount: 'Gross sales',
-  refund_subtotal_before_discount: 'Gross sales refund',
-  seller_discount: 'Seller discount',
-  seller_discount_refund: 'Seller discount refund',
-  cod_service_fee: 'COD service fee',
-  refund_cod_service_fee: 'Refund COD service fee',
-};
-
-const STATEMENT_REVENUE_KEY_ORDER = [
-  'subtotal_before_discount',
-  'refund_subtotal_before_discount',
-  'seller_discount',
-  'seller_discount_refund',
-  'cod_service_fee',
-  'refund_cod_service_fee',
-] as const;
-
 /** YYYY-MM-DD → DD-MM-YYYY for user-facing copy */
 function formatYmdAsDdMmYyyy(ymd: string): string {
   const parts = ymd.split('-').map(Number);
@@ -305,55 +356,20 @@ function labelPlDateRangeForSyncPrompt(startDate: string, endDate: string, timez
   return `${a} – ${b}`;
 }
 
-function buildStatementRevenueRows(rev: Record<string, number> | undefined): { label: string; value: number }[] {
-  if (!rev) return [];
-  const rows: { label: string; value: number }[] = [];
-  const seen = new Set<string>();
-  for (const k of STATEMENT_REVENUE_KEY_ORDER) {
-    const v = rev[k];
-    if (v != null && Math.abs(v) >= 0.005) {
-      rows.push({
-        label: STATEMENT_REVENUE_LABELS[k] || k.replace(/_/g, ' '),
-        value: v,
-      });
-      seen.add(k);
-    }
-  }
-  for (const k of Object.keys(rev).sort()) {
-    if (seen.has(k) || Math.abs(rev[k] ?? 0) < 0.005) continue;
-    rows.push({
-      label: STATEMENT_REVENUE_LABELS[k] || k.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
-      value: rev[k] ?? 0,
-    });
-  }
-  return rows;
-}
-
 export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angeles' }: ProfitLossViewProps) {
-  const [dateRange, setDateRange] = useState<DateRange>(() => {
-    try {
-      const preset = localStorage.getItem(`mamba:default_date_preset:${shopId || 'default'}`) || 'today';
-      return getDateRangeFromPreset(preset, timezone);
-    } catch {
-      return getDateRangeFromPreset('today', timezone);
-    }
-  });
+  const [dateRange, setDateRange] = useState<DateRange>(() => readPlDefaultDateRange(shopId, timezone));
 
   const applyDateRange = useCallback((r: DateRange) => {
     setDateRange(r);
   }, []);
 
-  // P&L date range is not persisted across refresh (unlike Finance Debug). Reset when shop or timezone changes.
+  // Reset P&L range when shop or timezone changes (default: last 30 days in shop TZ, not dashboard preset).
   useEffect(() => {
-    try {
-      const preset = localStorage.getItem(`mamba:default_date_preset:${shopId || 'default'}`) || 'today';
-      setDateRange(getDateRangeFromPreset(preset, timezone));
-    } catch {
-      setDateRange(getDateRangeFromPreset('today', timezone));
-    }
+    setDateRange(readPlDefaultDateRange(shopId, timezone));
   }, [shopId, timezone]);
   const [showExportMenu, setShowExportMenu] = useState(false);
-  const [expandedHero, setExpandedHero] = useState<'gmv' | 'netSales' | 'netProfit' | null>(null);
+  const { data: sellerBrand } = useSellerBranding();
+  const [expandedHero, setExpandedHero] = useState<'gmv' | 'grossProfit' | 'netProfit' | null>(null);
   // Shared toggle:  include cancelled orders in financials (synced with OverviewView via localStorage + custom event)
   const [includeCancelledFinancials, setIncludeCancelledFinancials] = useState<boolean>(() => {
     try {
@@ -381,15 +397,42 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
   const syncData = useShopStore(state => state.syncData);
   const cacheMetadata = useShopStore(state => state.cacheMetadata);
   const fetchShopData = useShopStore(state => state.fetchShopData);
+  const isFetchingDateRange = useShopStore(state => state.isFetchingDateRange);
+  const dateRangeFetchShopId = useShopStore(state => state.dateRangeFetchShopId);
+  const fetchDateRange = useShopStore(state => state.fetchDateRange);
+  const dataLoadIncomplete = useShopStore(state => state.dataLoadIncomplete);
+  const syncProgress = useShopStore(state => state.syncProgress);
+  const syncProgressShopId = useShopStore(state => state.syncProgressShopId);
+  const metrics = useShopStore(state => state.metrics);
+  const lastFetchShopId = useShopStore(state => state.lastFetchShopId);
 
   // P&L data from Zustand store (persists across navigations, no flickering)
-  const plData = useShopStore(state => state.plData) as PLData | null;
+  const plDataRaw = useShopStore(state => state.plData) as PLData | null;
+  const plDataKey = useShopStore(state => state.plDataKey);
+  const plDataCache = useShopStore(state => state.plDataCache);
   const plLoading = useShopStore(state => state.plLoading);
   const error = useShopStore(state => state.plError);
   const fetchPLData = useShopStore(state => state.fetchPLData);
 
+  const plData = useMemo(
+    () => scopedPlDataFromCache(plDataRaw, plDataKey, plDataCache, account.id, shopId, dateRange.startDate, dateRange.endDate) as PLData | null,
+    [plDataRaw, plDataKey, plDataCache, account.id, shopId, dateRange.startDate, dateRange.endDate]
+  );
+
+  const canViewCogs = plData?.financial_visibility?.can_view_cogs !== false;
+  const canViewMargin = plData?.financial_visibility?.can_view_margin !== false;
+  const restrictedFieldSet = useMemo(
+    () => new Set(plData?.financial_visibility?.restricted_fields || []),
+    [plData?.financial_visibility?.restricted_fields]
+  );
+  const isRestricted = useCallback((field: string) => restrictedFieldSet.has(field), [restrictedFieldSet]);
+
   // Manual Affiliate Settlements
   const affiliateSettlements = useShopStore(state => state.finance.affiliateSettlements);
+  const affiliateSettlementsInRange = useMemo(
+    () => affiliateSettlements.filter(s => s.date >= dateRange.startDate && s.date <= dateRange.endDate),
+    [affiliateSettlements, dateRange.startDate, dateRange.endDate]
+  );
   const fetchAffiliateSettlements = useShopStore(state => state.fetchAffiliateSettlements);
   const deleteAffiliateSettlement = useShopStore(state => state.deleteAffiliateSettlement);
   const [isAffiliateModalOpen, setIsAffiliateModalOpen] = useState(false);
@@ -429,6 +472,83 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
     fetchAgencyFees(account.id, shopId, dateRange.startDate, dateRange.endDate);
   };
 
+  /** Orders for this view are loaded in batches; surface ~calendar-day coverage from load progress. */
+  const plOrdersLoadProgress = useMemo(() => {
+    if (!shopId) return null;
+    const rangeMatches =
+      fetchDateRange.startDate === dateRange.startDate &&
+      fetchDateRange.endDate === dateRange.endDate &&
+      lastFetchShopId === shopId;
+
+    if (!rangeMatches) return null;
+
+    const totalDays = inclusiveCalendarDaysInRange(dateRange.startDate, dateRange.endDate);
+    const rangeStart = getShopDayStartTimestamp(dateRange.startDate, timezone);
+    const rangeEndExc = getShopDayEndExclusiveTimestamp(dateRange.endDate, timezone);
+    const ordersInRange = orders.reduce((n, o) => {
+      const ts = getOrderTs(o);
+      return ts >= rangeStart && ts < rangeEndExc ? n + 1 : n;
+    }, 0);
+
+    const chunking =
+      syncProgressShopId === shopId &&
+      syncProgress.isActive &&
+      syncProgress.currentStep === 'orders' &&
+      !cacheMetadata.isSyncing;
+    const httpWait = isFetchingDateRange && dateRangeFetchShopId === shopId;
+    const incompleteOnly = dataLoadIncomplete && !chunking && !httpWait;
+
+    if (!chunking && !httpWait && !incompleteOnly) return null;
+
+    const ordersExpected = Math.max(1, syncProgress.ordersTotal || metrics.totalOrders || ordersInRange);
+    const loadedCount = chunking || httpWait ? Math.max(syncProgress.ordersFetched, ordersInRange) : ordersInRange;
+    const ratio = Math.min(1, loadedCount / ordersExpected);
+    const estDaysShown = httpWait ? 0 : Math.max(1, Math.min(totalDays, Math.round(ratio * totalDays)));
+    const estDaysRemaining = Math.max(0, totalDays - estDaysShown);
+
+    if (incompleteOnly) {
+      return {
+        kind: 'incomplete' as const,
+        totalDays,
+        ordersLoaded: loadedCount,
+        ordersExpected,
+        message: syncProgress.message || `Loaded ${loadedCount} of ${ordersExpected} orders for this range.`,
+      };
+    }
+
+    return {
+      kind: 'loading' as const,
+      totalDays,
+      httpWait,
+      ordersLoaded: loadedCount,
+      ordersExpected,
+      ratio,
+      estDaysShown,
+      estDaysRemaining,
+    };
+  }, [
+    shopId,
+    dateRange.startDate,
+    dateRange.endDate,
+    timezone,
+    fetchDateRange.startDate,
+    fetchDateRange.endDate,
+    lastFetchShopId,
+    isFetchingDateRange,
+    dateRangeFetchShopId,
+    syncProgressShopId,
+    dataLoadIncomplete,
+    syncProgress.isActive,
+    syncProgress.currentStep,
+    syncProgress.ordersFetched,
+    syncProgress.ordersTotal,
+    syncProgress.message,
+    cacheMetadata.isSyncing,
+    metrics.totalOrders,
+    orders,
+    dataVersion,
+  ]);
+
   // Fetch P&L data when params change (store handles caching & dedup)
   useEffect(() => {
     if (shopId) {
@@ -443,6 +563,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
       }
     }
   }, [account.id, shopId, dateRange, fetchShopData, fetchPLData, loadMarketingFromDB, marketingLoaded, fetchAffiliateSettlements]);
+
 
   // Calculate COGS from orders (useMemo avoids extra re-renders)
   const cogsStats = useMemo(() => {
@@ -722,7 +843,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
     const autoAffiliateCommission = expenseFromNet(autoAffiliateNet);
 
     // Calculate Manual Affiliate Retainers
-    const manualAffiliateRetainers = affiliateSettlements.reduce((sum, s) => sum + Number(s.amount), 0);
+    const manualAffiliateRetainers = affiliateSettlementsInRange.reduce((sum, s) => sum + Number(s.amount), 0);
 
     // Total Affiliate Cost (treated as COGS - deducted from revenue to get Gross Profit)
     const totalAffiliateCost = autoAffiliateCommission + manualAffiliateRetainers;
@@ -807,7 +928,12 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
       { label: 'Platform discounts', value: -gmvComponents.platformDiscounts },
     ];
 
-    const heroNetSalesLines = buildStatementRevenueRows(plData?.revenue);
+    const heroGrossProfitLines: { label: string; value: number }[] = [
+      { label: 'Net revenue (orders, after refunds)', value: netRevenue },
+      { label: 'Product COGS', value: -totalCogs },
+      { label: 'Product shipping cost', value: -totalProductShippingCost },
+      { label: 'Affiliate commissions (auto + manual)', value: -totalAffiliateCost },
+    ];
 
     // Packaging/Supplies (manual input - not available yet, set to 0)
     const packagingSupplies = 0;
@@ -945,10 +1071,10 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
         operatingIncome,
         operatingIncomePct,
         heroGmvLines,
-        heroNetSalesLines,
+        heroGrossProfitLines,
         heroNetProfitLines,
       };
-  }, [orders, cogsStats, dateRange, dataVersion, affiliateSettlements, agencyFees, plData, includeCancelledFinancials, marketingDaily, timezone]);
+  }, [orders, cogsStats, dateRange, dataVersion, affiliateSettlementsInRange, agencyFees, plData, includeCancelledFinancials, marketingDaily, timezone]);
 
   // Destructure for easier usage in render
   const {
@@ -967,6 +1093,8 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
     agencyFeeLines,
     agencyFeeSummaryNotes,
   } = financials;
+
+  const restrictionNotice = plData?.restriction_notice || null;
 
   const handleDeleteRetainer = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
@@ -1149,7 +1277,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
 
         // ===== PROFITABILITY =====
         ['═══ PROFITABILITY ═══', ''],
-        ['Net Sales (TikTok statements)', formatCurrency(financials.statementNetSales)],
+        ['TikTok statement net sales (reference)', formatCurrency(financials.statementNetSales)],
         ['Total Settlement Amount (TikTok)', formatCurrency(financials.settlementAmount)],
         ['Net Profit', formatCurrency(financials.netProfit)],
         ['ROI', formatPercent(financials.roi)],
@@ -1166,6 +1294,43 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
       ]
     };
 
+    if (!canViewCogs || !canViewMargin) {
+      const blocked = new Set<string>();
+      if (!canViewCogs) {
+        blocked.add('Total COGS');
+        blocked.add('  Regular Orders COGS');
+        blocked.add('  Sample Orders COGS');
+        blocked.add('Product Costs (COGS)');
+      }
+      if (!canViewMargin) {
+        blocked.add('Gross Margin');
+      }
+      exportData.rows = exportData.rows.filter((r) => !blocked.has(String(r[0])));
+      exportData.rows.push(['', '']);
+      exportData.rows.push(['Restriction Notice', 'Some financial fields were excluded by seller visibility policy.']);
+    }
+    const restrictedFieldLabels: Record<string, string[]> = {
+      platform_fees: ['Platform Fees'],
+      agency_fees: ['Agency Fees'],
+      ad_spend: ['Ad Spend'],
+      shipping_costs: ['Shipping Costs'],
+      affiliate_commissions: ['Affiliate Fees', 'Affiliate Commissions'],
+      gross_profit: ['Gross Profit'],
+      net_profit: ['Net Profit'],
+    };
+    const policyFields = Array.isArray(plData?.financial_visibility?.restricted_fields)
+      ? plData!.financial_visibility!.restricted_fields!
+      : [];
+    if (policyFields.length > 0) {
+      const blockedByPolicy = new Set<string>();
+      for (const f of policyFields) {
+        for (const label of restrictedFieldLabels[f] || []) blockedByPolicy.add(label);
+      }
+      if (blockedByPolicy.size > 0) {
+        exportData.rows = exportData.rows.filter((r) => !blockedByPolicy.has(String(r[0])));
+      }
+    }
+
     const filename = `PL_Statement_${dateRange.startDate}_to_${dateRange.endDate}`;
 
     switch (format) {
@@ -1180,11 +1345,16 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
           exportData,
           `${filename}.pdf`,
           'Profit & Loss Statement',
-          `${account.name} | ${dateRange.startDate} to ${dateRange.endDate}`
+          `${account.name} | ${dateRange.startDate} to ${dateRange.endDate}`,
+          {
+            brandName: sellerBrand.displayName || 'Mamba',
+            primaryColor: sellerBrand.primaryColor,
+            logoUrl: sellerBrand.logoSignedUrl || null,
+          }
         );
         break;
     }
-  }, [dateRange, financials, account.name, cogsStats, plData, orders, timezone]);
+  }, [dateRange, financials, account.name, cogsStats, plData, orders, timezone, sellerBrand.displayName, sellerBrand.primaryColor, canViewCogs, canViewMargin]);
 
 
   // Simulated P&L calculation
@@ -1262,12 +1432,12 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
     operatingIncomePct,
     netProfit,
     heroGmvLines,
-    heroNetSalesLines,
+    heroGrossProfitLines,
     heroNetProfitLines,
     refunds,
   } = financials;
 
-  const toggleHero = useCallback((k: 'gmv' | 'netSales' | 'netProfit') => {
+  const toggleHero = useCallback((k: 'gmv' | 'grossProfit' | 'netProfit') => {
     setExpandedHero(prev => (prev === k ? null : k));
   }, []);
 
@@ -1414,12 +1584,12 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
           {/* Ads Balance Display */}
           {advertiserInfo && (
             <div className="hidden md:flex items-center gap-2 px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg mr-2" title="Source: TikTok Business API">
-              <div className="p-1 bg-green-500/10 rounded">
-                <Wallet className="w-3 h-3 text-green-400" />
+              <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${plSemanticToIconTileClass(plSignedMetricClass(advertiserInfo.balance))}`}>
+                <Wallet className="w-3.5 h-3.5 shrink-0" />
               </div>
               <div className="flex flex-col">
                 <span className="text-[10px] text-gray-400 uppercase tracking-wider font-semibold">Ads Balance</span>
-                <span className="text-sm font-bold text-white">{formatCurrency(advertiserInfo.balance)}</span>
+                <span className={`text-sm font-bold ${plSignedMetricClass(advertiserInfo.balance)}`}>{formatCurrency(advertiserInfo.balance)}</span>
               </div>
             </div>
           )}
@@ -1440,7 +1610,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                 ? 'You do not have access to sync this shop'
                 : 'Full re-sync: fetches all settlements with complete transaction details (affiliate commissions, platform fees, etc.)'
             }
-            className="flex items-center space-x-2 px-3 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg transition-colors disabled:opacity-50 text-sm"
+            className="flex items-center space-x-2 px-3 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg transition-colors disabled:opacity-50 text-sm"
           >
             <RotateCcw size={16} className={cacheMetadata.isSyncing ? "animate-spin" : ""} />
             <span>Full Sync</span>
@@ -1450,7 +1620,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
           <div className="relative">
             <button
               onClick={() => setShowExportMenu(!showExportMenu)}
-              className="flex items-center space-x-2 px-4 py-2 bg-pink-600 hover:bg-pink-700 text-white rounded-lg transition-colors"
+              className="flex items-center space-x-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg transition-colors"
             >
               <Download size={20} />
               <span>Export</span>
@@ -1484,7 +1654,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
           <button
             onClick={handleTodayClick}
             className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all border ${isTodayActive()
-              ? 'bg-pink-600 hover:bg-pink-700 text-white border-pink-500 shadow-lg shadow-pink-900/20'
+              ? 'bg-gray-600 hover:bg-gray-500 text-white border-gray-500 shadow-md shadow-black/20'
               : 'bg-gray-800 border-gray-700 text-gray-300 hover:bg-gray-700 hover:text-white hover:border-gray-600'
               }`}
           >
@@ -1494,7 +1664,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
           <button
             onClick={handleYesterdayClick}
             className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all border ${isYesterdayActive()
-              ? 'bg-pink-600 hover:bg-pink-700 text-white border-pink-500 shadow-lg shadow-pink-900/20'
+              ? 'bg-gray-600 hover:bg-gray-500 text-white border-gray-500 shadow-md shadow-black/20'
               : 'bg-gray-800 border-gray-700 text-gray-300 hover:bg-gray-700 hover:text-white hover:border-gray-600'
               }`}
           >
@@ -1506,6 +1676,93 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
         </div>
       </div>
 
+      {(plOrdersLoadProgress || plLoading) && shopId && (
+        <div
+          role="status"
+          aria-live="polite"
+          className={`rounded-xl border px-4 py-3 text-sm ${
+            plOrdersLoadProgress?.kind === 'incomplete'
+              ? 'border-amber-500/35 bg-amber-500/10 text-amber-100/95'
+              : 'border-gray-700 bg-gray-800/80 text-gray-300'
+          }`}
+        >
+          <div className="flex items-start gap-3">
+            {plOrdersLoadProgress?.kind === 'incomplete' ? (
+              <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-400" aria-hidden />
+            ) : (
+              <Loader2 className="w-4 h-4 shrink-0 mt-0.5 text-gray-400 animate-spin" aria-hidden />
+            )}
+            <div className="flex-1 min-w-0 space-y-2">
+              {plOrdersLoadProgress?.kind === 'loading' && (
+                <>
+                  {plOrdersLoadProgress.httpWait ? (
+                    <p className="text-gray-200">
+                      Fetching orders for this range ({plOrdersLoadProgress.totalDays} calendar day
+                      {plOrdersLoadProgress.totalDays === 1 ? '' : 's'})…
+                    </p>
+                  ) : (
+                    <>
+                      <p className="text-gray-200 leading-relaxed">
+                        Showing roughly{' '}
+                        <span className="font-semibold text-white tabular-nums">{plOrdersLoadProgress.estDaysShown}</span>
+                        {' '}of{' '}
+                        <span className="font-semibold text-white tabular-nums">{plOrdersLoadProgress.totalDays}</span>
+                        {' '}day{plOrdersLoadProgress.totalDays === 1 ? '' : 's'} of history in view —{' '}
+                        <span className="tabular-nums">{plOrdersLoadProgress.ordersLoaded.toLocaleString()}</span>
+                        {' / '}
+                        <span className="tabular-nums">{plOrdersLoadProgress.ordersExpected.toLocaleString()}</span>
+                        {' '}orders
+                        {plOrdersLoadProgress.estDaysRemaining > 0 ? (
+                          <>
+                            {' '}
+                            · about{' '}
+                            <span className="font-semibold brand-metric-zero tabular-nums">
+                              {plOrdersLoadProgress.estDaysRemaining}
+                            </span>
+                            {' '}
+                            more day{plOrdersLoadProgress.estDaysRemaining === 1 ? '' : 's'} still loading
+                          </>
+                        ) : null}
+                        .
+                      </p>
+                      <div className="h-1 rounded-full bg-gray-700/80 overflow-hidden">
+                        <div
+                          className="h-full rounded-full bg-gray-400 transition-[width] duration-300 ease-out"
+                          style={{ width: `${Math.round(Math.min(1, plOrdersLoadProgress.ratio) * 100)}%` }}
+                        />
+                      </div>
+                      <p className="text-[11px] text-gray-500 leading-snug">
+                        Day coverage is estimated from order load progress (batches of up to 500) versus the total
+                        expected for this date range; numbers update as each batch finishes.
+                      </p>
+                    </>
+                  )}
+                </>
+              )}
+              {plOrdersLoadProgress?.kind === 'incomplete' && (
+                <>
+                  <p className="font-medium text-amber-50">Order load stopped early</p>
+                  <p className="text-xs text-amber-100/90 leading-relaxed">{plOrdersLoadProgress.message}</p>
+                  <p className="text-[11px] text-amber-200/70">
+                    Profit &amp; Loss may be missing older orders for this range. Retry from the toolbar or run a sync,
+                    then pick this range again.
+                  </p>
+                </>
+              )}
+              {plLoading && (
+                <p
+                  className={`text-xs text-gray-400 leading-relaxed ${
+                    plOrdersLoadProgress ? 'border-t border-gray-700/60 pt-2 mt-0.5' : ''
+                  }`}
+                >
+                  Loading statement totals and fee breakdown for this range…
+                </p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Error state */}
       {error && (
         <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-4">
@@ -1516,10 +1773,19 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
         </div>
       )}
 
+      {restrictionNotice && (
+        <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-4">
+          <div className="flex items-center gap-3">
+            <Lock className="w-5 h-5 text-amber-300" />
+            <p className="text-amber-200 text-sm">{restrictionNotice}</p>
+          </div>
+        </div>
+      )}
+
       {/* Loading state - only shown on initial load when no cached data exists */}
       {plLoading && !plData && (
         <div className="flex justify-center items-center h-64">
-          <div className="animate-spin rounded-full h-12 w-12 border-4 border-pink-500 border-t-transparent"></div>
+          <div className="animate-spin rounded-full h-12 w-12 border-4 border-gray-500 border-t-transparent"></div>
         </div>
       )}
 
@@ -1527,14 +1793,14 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
       <>
 
         {/* COGS Warning */}
-        {cogsStats.total > 0 && cogsStats.withCogs < cogsStats.total && (
-          <div className="bg-gradient-to-r from-orange-500/10 to-amber-500/10 border border-orange-500/30 rounded-xl p-4">
+        {canViewCogs && cogsStats.total > 0 && cogsStats.withCogs < cogsStats.total && (
+          <div className="brand-secondary-card rounded-xl p-4 border" style={{ borderColor: 'var(--brand-warning-border)' }}>
             <div className="flex items-start gap-4">
-              <div className="p-2 bg-orange-500/20 rounded-lg">
-                <AlertTriangle className="w-6 h-6 text-orange-400" />
+              <div className="w-11 h-11 rounded-lg flex items-center justify-center shrink-0 brand-icon-tile-zero">
+                <AlertTriangle className="w-6 h-6 shrink-0" />
               </div>
               <div className="flex-1">
-                <h3 className="text-orange-300 font-semibold mb-1">
+                <h3 className="brand-text font-semibold mb-1">
                   Product Costs (COGS) Required for Accurate Calculations
                 </h3>
                 <p className="text-gray-400 text-sm mb-3">
@@ -1544,11 +1810,15 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                 <div className="flex items-center gap-4">
                   <div className="flex-1 bg-gray-800 rounded-full h-2 overflow-hidden">
                     <div
-                      className="bg-gradient-to-r from-orange-500 to-amber-500 h-full transition-all duration-500"
-                      style={{ width: `${cogsStats.total > 0 ? (cogsStats.withCogs / cogsStats.total) * 100 : 0}%` }}
+                      className="h-full transition-all duration-500"
+                      style={{
+                        width: `${cogsStats.total > 0 ? (cogsStats.withCogs / cogsStats.total) * 100 : 0}%`,
+                        backgroundColor: 'var(--brand-warning-text)',
+                        opacity: 0.85,
+                      }}
                     />
                   </div>
-                  <span className="text-orange-400 text-sm font-medium whitespace-nowrap">
+                  <span className="brand-text text-sm font-medium whitespace-nowrap">
                     {cogsStats.withCogs}/{cogsStats.total} Complete
                   </span>
                 </div>
@@ -1560,13 +1830,13 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
           </div>
         )}
 
-        {cogsStats.total > 0 && cogsStats.withCogs === cogsStats.total && (
-          <div className="bg-gradient-to-r from-green-500/10 to-emerald-500/10 border border-green-500/30 rounded-xl p-3">
+        {canViewCogs && cogsStats.total > 0 && cogsStats.withCogs === cogsStats.total && (
+          <div className="brand-secondary-card rounded-xl p-3 border">
             <div className="flex items-center gap-3">
-              <div className="p-1.5 bg-green-500/20 rounded-lg">
-                <DollarSign className="w-4 h-4 text-green-400" />
+              <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${plSemanticToIconTileClass('brand-profit')}`}>
+                <DollarSign className="w-4 h-4 shrink-0" />
               </div>
-              <p className="text-green-400 text-sm font-medium">
+              <p className="brand-profit text-sm font-medium">
                 All {cogsStats.total} products have COGS data &mdash; Profit calculations are accurate
               </p>
             </div>
@@ -1592,10 +1862,10 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
         {/* ═══════════════════ FULL DETAIL VIEW ═══════════════════ */}
         <>
 
-          {/* Top metrics: GMV, Net Sales, Net Profit (expandable breakdowns) */}
+          {/* Top metrics: GMV, Gross Profit, Net Profit (expandable breakdowns) */}
           <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
             {/* GMV Card */}
-            <div className="bg-gray-800/60 border border-gray-700 rounded-2xl overflow-hidden">
+            <div className="brand-card rounded-2xl overflow-hidden">
               <div
                 role="button"
                 tabIndex={0}
@@ -1606,45 +1876,45 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                     toggleHero('gmv');
                   }
                 }}
-                className="w-full p-6 md:p-8 text-left cursor-pointer hover:bg-gray-800/90 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/40"
+                className="w-full p-6 md:p-8 text-left cursor-pointer brand-row-hover transition-colors focus:outline-none brand-focus-ring"
                 aria-expanded={expandedHero === 'gmv'}
               >
                 <div className="flex items-start justify-between gap-2 mb-4">
                   <div className="flex items-center gap-3 min-w-0">
-                    <div className="p-2.5 bg-blue-500/20 rounded-xl shrink-0">
-                      <DollarSign className="w-6 h-6 text-blue-400" />
+                    <div className="p-2.5 rounded-xl shrink-0 brand-state-info">
+                      <DollarSign className="w-6 h-6" />
                     </div>
-                    <p className="text-gray-400 text-sm font-semibold uppercase tracking-widest">Gross Merchandise Value</p>
+                    <p className="brand-muted text-sm font-semibold uppercase tracking-widest">Gross Merchandise Value</p>
                   </div>
-                  <ChevronDown className={`w-5 h-5 shrink-0 text-gray-500 mt-1 transition-transform ${expandedHero === 'gmv' ? 'rotate-180' : ''}`} aria-hidden />
+                  <ChevronDown className={`w-5 h-5 shrink-0 brand-muted mt-1 transition-transform ${expandedHero === 'gmv' ? 'rotate-180' : ''}`} aria-hidden />
                 </div>
-                <p className="text-5xl font-bold text-white tracking-tight">{formatCurrency(financials.grossSalesGMV)}</p>
-                <p className="text-gray-500 text-sm mt-3">Total revenue generated from all orders · click for breakdown</p>
+                <p className="text-5xl font-bold brand-text tracking-tight">{formatCurrency(financials.grossSalesGMV)}</p>
+                <p className="brand-muted text-sm mt-3">Total revenue generated from all orders · click for breakdown</p>
               </div>
               {expandedHero === 'gmv' && (
-                <div className="px-6 md:px-8 pb-6 md:pb-8 pt-0 border-t border-gray-700/80 space-y-2 text-sm">
-                  <p className="text-gray-500 text-xs uppercase tracking-wide mb-2">How this total is built (orders in date range)</p>
+                <div className="px-6 md:px-8 pb-6 md:pb-8 pt-0 border-t space-y-2 text-sm" style={{ borderColor: 'var(--brand-card-border)' }}>
+                  <p className="brand-muted text-xs uppercase tracking-wide mb-2">How this total is built (orders in date range)</p>
                   {heroGmvLines.map((row, i) => (
                     <div key={i} className="flex justify-between gap-3">
-                      <span className="text-gray-400">{row.label}</span>
-                      <span className={`font-mono tabular-nums ${row.value < 0 ? 'text-red-400' : 'text-gray-200'}`}>
+                      <span className="brand-muted">{row.label}</span>
+                      <span className={`font-mono tabular-nums ${row.value < 0 ? 'brand-loss' : 'brand-text'}`}>
                         {row.value < 0 ? '-' : ''}{formatCurrency(Math.abs(row.value))}
                       </span>
                     </div>
                   ))}
-                  <div className="flex justify-between gap-3 pt-2 border-t border-gray-700 mt-2 font-semibold">
-                    <span className="text-white">Gross Merchandise Value</span>
-                    <span className="font-mono tabular-nums text-white">{formatCurrency(financials.grossSalesGMV)}</span>
+                  <div className="flex justify-between gap-3 pt-2 border-t mt-2 font-semibold" style={{ borderColor: 'var(--brand-card-border)' }}>
+                    <span className="brand-text">Gross Merchandise Value</span>
+                    <span className="font-mono tabular-nums brand-text">{formatCurrency(financials.grossSalesGMV)}</span>
                   </div>
                   {refunds > 0.005 && (
                     <>
                       <div className="flex justify-between gap-3 pt-2">
-                        <span className="text-gray-400">Refunds (cancelled/refunded orders)</span>
-                        <span className="font-mono tabular-nums text-red-400">-{formatCurrency(refunds)}</span>
+                        <span className="brand-muted">Refunds (cancelled/refunded orders)</span>
+                        <span className="font-mono tabular-nums brand-loss">-{formatCurrency(refunds)}</span>
                       </div>
                       <div className="flex justify-between gap-3 font-medium">
-                        <span className="text-gray-300">Net revenue (used downstream)</span>
-                        <span className="font-mono tabular-nums text-sky-400">{formatCurrency(netRevenue)}</span>
+                        <span className="brand-text">Net revenue (used downstream)</span>
+                        <span className="font-mono tabular-nums brand-profit">{formatCurrency(netRevenue)}</span>
                       </div>
                     </>
                   )}
@@ -1652,67 +1922,82 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
               )}
             </div>
 
-            {/* Net Sales Card */}
-            <div className="bg-gray-800/60 border border-sky-500/20 rounded-2xl overflow-hidden">
+            {/* Gross Profit Card */}
+            <div className="brand-card rounded-2xl overflow-hidden">
               <div
                 role="button"
                 tabIndex={0}
-                onClick={() => toggleHero('netSales')}
+                onClick={() => toggleHero('grossProfit')}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' || e.key === ' ') {
                     e.preventDefault();
-                    toggleHero('netSales');
+                    toggleHero('grossProfit');
                   }
                 }}
-                className="w-full p-6 md:p-8 text-left cursor-pointer hover:bg-gray-800/90 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-500/40"
-                aria-expanded={expandedHero === 'netSales'}
+                className="w-full p-6 md:p-8 text-left cursor-pointer brand-row-hover transition-colors focus:outline-none brand-focus-ring"
+                aria-expanded={expandedHero === 'grossProfit'}
               >
                 <div className="flex items-start justify-between gap-2 mb-4">
                   <div className="flex items-center gap-3 min-w-0">
-                    <div className="p-2.5 bg-sky-500/20 rounded-xl shrink-0">
-                      <Receipt className="w-6 h-6 text-sky-400" />
+                    <div className="p-2.5 rounded-xl shrink-0 brand-state-info">
+                      <Wallet className="w-6 h-6" />
                     </div>
-                    <p className="text-gray-400 text-sm font-semibold uppercase tracking-widest truncate">Net Sales</p>
+                    <p className="brand-muted text-sm font-semibold uppercase tracking-widest truncate">Gross Profit</p>
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
                     <span onClick={e => e.stopPropagation()} className="inline-flex">
                       <CalculationTooltip
-                        source="TikTok Shop settlements"
-                        calculation="Sum of net_sales_amount for all statements in the selected date range (synced from TikTok)."
-                        api="GET /finance/pl-data → statement_totals.total_net_sales"
+                        source="Calculated in app"
+                        calculation="Net revenue (orders, after refunds) − product COGS − product shipping cost − affiliate commissions (treated as COGS)."
+                        api="TikTok API: none (computed from orders + synced fee rollups)"
                       />
                     </span>
-                    <ChevronDown className={`w-5 h-5 text-gray-500 transition-transform ${expandedHero === 'netSales' ? 'rotate-180' : ''}`} aria-hidden />
+                    <ChevronDown className={`w-5 h-5 brand-muted transition-transform ${expandedHero === 'grossProfit' ? 'rotate-180' : ''}`} aria-hidden />
                   </div>
                 </div>
-                <p className="text-5xl font-bold text-sky-400 tracking-tight">{formatCurrency(financials.statementNetSales)}</p>
-                <p className="text-gray-500 text-sm mt-3">From statement data (TikTok) · click for breakdown</p>
+                {isRestricted('gross_profit') ? (
+                  <>
+                    <p className="text-5xl font-bold tracking-tight text-gray-400">Restricted</p>
+                    <p className="brand-muted text-sm mt-3">Hidden by seller visibility policy</p>
+                  </>
+                ) : (
+                  <>
+                    <p className={`text-5xl font-bold tracking-tight ${financials.grossProfit >= 0 ? 'brand-profit' : 'brand-loss'}`}>
+                      {financials.grossProfit < 0 ? '-' : ''}{formatCurrency(financials.grossProfit)}
+                    </p>
+                    <p className="brand-muted text-sm mt-3">After COGS, product shipping, and affiliate · click for breakdown</p>
+                  </>
+                )}
               </div>
-              {expandedHero === 'netSales' && (
-                <div className="px-6 md:px-8 pb-6 md:pb-8 pt-0 border-t border-gray-700/80 space-y-2 text-sm">
-                  <p className="text-gray-500 text-xs uppercase tracking-wide mb-2">Statement revenue rollups (synced transactions)</p>
-                  {heroNetSalesLines.length === 0 ? (
-                    <p className="text-gray-500 text-sm">No line-item revenue breakdown in synced data. The total above comes from TikTok settlement <code className="text-gray-400">net_sales_amount</code> per statement.</p>
-                  ) : (
-                    heroNetSalesLines.map((row, i) => (
-                      <div key={i} className="flex justify-between gap-3">
-                        <span className="text-gray-400">{row.label}</span>
-                        <span className={`font-mono tabular-nums ${row.value < 0 ? 'text-red-400' : 'text-gray-200'}`}>
-                          {row.value < 0 ? '-' : ''}{formatCurrency(Math.abs(row.value))}
-                        </span>
-                      </div>
-                    ))
-                  )}
-                  <div className="flex justify-between gap-3 pt-2 border-t border-gray-700 mt-2 font-semibold">
-                    <span className="text-white">Net sales (TikTok statements)</span>
-                    <span className="font-mono tabular-nums text-sky-400">{formatCurrency(financials.statementNetSales)}</span>
+              {expandedHero === 'grossProfit' && !isRestricted('gross_profit') && (
+                <div className="px-6 md:px-8 pb-6 md:pb-8 pt-0 border-t space-y-2 text-sm" style={{ borderColor: 'var(--brand-card-border)' }}>
+                  <p className="brand-muted text-xs uppercase tracking-wide mb-2">How gross profit is built</p>
+                  {heroGrossProfitLines.map((row, i) => (
+                    <div key={i} className="flex justify-between gap-3">
+                      <span className="brand-muted">{row.label}</span>
+                      <span className={`font-mono tabular-nums ${row.value < 0 ? 'brand-loss' : 'brand-text'}`}>
+                        {row.value < 0 ? '-' : ''}{formatCurrency(Math.abs(row.value))}
+                      </span>
+                    </div>
+                  ))}
+                  <div className="flex justify-between gap-3 pt-2 border-t mt-2 font-semibold" style={{ borderColor: 'var(--brand-card-border)' }}>
+                    <span className="brand-text">Gross profit</span>
+                    <span className={`font-mono tabular-nums ${financials.grossProfit >= 0 ? 'brand-profit' : 'brand-loss'}`}>
+                      {financials.grossProfit < 0 ? '-' : ''}{formatCurrency(Math.abs(financials.grossProfit))}
+                    </span>
                   </div>
                 </div>
               )}
             </div>
 
             {/* Net Profit Card */}
-            <div className={`rounded-2xl overflow-hidden border ${netProfit >= 0 ? 'bg-emerald-900/20 border-emerald-500/30' : 'bg-red-900/20 border-red-500/30'}`}>
+            <div
+              className="rounded-2xl overflow-hidden border"
+              style={{
+                backgroundColor: netProfit >= 0 ? 'var(--brand-success-bg)' : 'var(--brand-danger-bg)',
+                borderColor: netProfit >= 0 ? 'var(--brand-success-border)' : 'var(--brand-danger-border)',
+              }}
+            >
               <div
                 role="button"
                 tabIndex={0}
@@ -1723,46 +2008,57 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                     toggleHero('netProfit');
                   }
                 }}
-                className={`w-full p-6 md:p-8 text-left cursor-pointer transition-colors focus:outline-none focus-visible:ring-2 ${netProfit >= 0 ? 'hover:bg-emerald-900/25 focus-visible:ring-emerald-500/40' : 'hover:bg-red-900/25 focus-visible:ring-red-500/40'}`}
+                className="w-full p-6 md:p-8 text-left cursor-pointer transition-colors focus:outline-none brand-row-hover brand-focus-ring"
                 aria-expanded={expandedHero === 'netProfit'}
               >
                 <div className="flex items-start justify-between gap-2 mb-4">
                   <div className="flex items-center gap-3 min-w-0">
-                    <div className={`p-2.5 rounded-xl shrink-0 ${netProfit >= 0 ? 'bg-emerald-500/20' : 'bg-red-500/20'}`}>
+                    <div className={`p-2.5 rounded-xl shrink-0 ${netProfit >= 0 ? 'brand-state-success' : 'brand-state-danger'}`}>
                       {netProfit >= 0
-                        ? <TrendingUp className="w-6 h-6 text-emerald-400" />
-                        : <TrendingDown className="w-6 h-6 text-red-400" />}
+                        ? <TrendingUp className="w-6 h-6" />
+                        : <TrendingDown className="w-6 h-6" />}
                     </div>
-                    <p className="text-gray-400 text-sm font-semibold uppercase tracking-widest">Net Profit</p>
+                    <p className="brand-muted text-sm font-semibold uppercase tracking-widest">Net Profit</p>
                   </div>
-                  <ChevronDown className={`w-5 h-5 shrink-0 text-gray-500 mt-1 transition-transform ${expandedHero === 'netProfit' ? 'rotate-180' : ''}`} aria-hidden />
+                  <ChevronDown className={`w-5 h-5 shrink-0 brand-muted mt-1 transition-transform ${expandedHero === 'netProfit' ? 'rotate-180' : ''}`} aria-hidden />
                 </div>
-                <p className={`text-5xl font-bold tracking-tight ${netProfit >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                  {netProfit < 0 ? '-' : ''}{formatCurrency(netProfit)}
-                </p>
-                <div className="flex items-center gap-3 mt-3 flex-wrap">
-                  <span className={`text-sm font-medium ${netProfit >= 0 ? 'text-emerald-400/70' : 'text-red-400/70'}`}>
-                    {operatingIncomePct.toFixed(1)}% of net revenue
-                  </span>
-                  <span className="text-gray-600 text-xs">· After COGS, affiliate, and operating expenses · click for math</span>
-                </div>
+                {isRestricted('net_profit') ? (
+                  <>
+                    <p className="text-5xl font-bold tracking-tight text-gray-400">Restricted</p>
+                    <div className="flex items-center gap-3 mt-3 flex-wrap">
+                      <span className="text-sm font-medium text-gray-400">Hidden by seller visibility policy</span>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <p className={`text-5xl font-bold tracking-tight ${netProfit >= 0 ? 'brand-profit' : 'brand-loss'}`}>
+                      {netProfit < 0 ? '-' : ''}{formatCurrency(netProfit)}
+                    </p>
+                    <div className="flex items-center gap-3 mt-3 flex-wrap">
+                      <span className={`text-sm font-medium ${netProfit >= 0 ? 'brand-profit' : 'brand-loss'}`}>
+                        {operatingIncomePct.toFixed(1)}% of net revenue
+                      </span>
+                      <span className="brand-muted text-xs">· After COGS, affiliate, and operating expenses · click for math</span>
+                    </div>
+                  </>
+                )}
               </div>
-              {expandedHero === 'netProfit' && (
-                <div className="px-6 md:px-8 pb-6 md:pb-8 pt-0 border-t border-gray-700/50 space-y-2 text-sm">
-                  <p className="text-gray-500 text-xs uppercase tracking-wide mb-2">Net profit calculation</p>
+              {expandedHero === 'netProfit' && !isRestricted('net_profit') && (
+                <div className="px-6 md:px-8 pb-6 md:pb-8 pt-0 border-t space-y-2 text-sm" style={{ borderColor: 'var(--brand-card-border)' }}>
+                  <p className="brand-muted text-xs uppercase tracking-wide mb-2">Net profit calculation</p>
                   {heroNetProfitLines.map((row, i) => {
                     const isSub = row.emphasis === 'subtotal';
                     const isTot = row.emphasis === 'total';
                     const neg = row.value < -0.005;
                     const cls = isTot
-                      ? 'text-white font-bold text-base pt-2 border-t border-gray-600 mt-1'
+                      ? 'brand-text font-bold text-base pt-2 border-t mt-1'
                       : isSub
-                        ? 'text-white font-semibold pt-2 border-t border-gray-700 mt-1'
+                        ? 'brand-text font-semibold pt-2 border-t mt-1'
                         : '';
                     return (
                       <div key={i} className={`flex justify-between gap-3 ${cls}`}>
-                        <span className={isTot || isSub ? 'text-white' : 'text-gray-400'}>{row.label}</span>
-                        <span className={`font-mono tabular-nums ${isTot ? (netProfit >= 0 ? 'text-emerald-400' : 'text-red-400') : isSub ? 'text-blue-400' : neg ? 'text-red-400' : row.value > 0.005 ? 'text-emerald-400' : 'text-gray-200'}`}>
+                        <span className={isTot || isSub ? 'brand-text' : 'brand-muted'}>{row.label}</span>
+                        <span className={`font-mono tabular-nums ${isTot ? (netProfit >= 0 ? 'brand-profit' : 'brand-loss') : neg ? 'brand-loss' : row.value > 0.005 ? 'brand-profit' : 'brand-text'}`} style={isSub ? { color: 'var(--brand-info-text)' } : undefined}>
                           {row.value < 0 ? '-' : ''}{formatCurrency(Math.abs(row.value))}
                         </span>
                       </div>
@@ -1774,19 +2070,18 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
           </div>
 
           {/* ═══════════════════ REVENUE SECTION ═══════════════════ */}
-          <div className="bg-gray-800 rounded-xl border border-gray-700 p-6">
-            <h3 className="text-lg font-semibold text-white mb-2">Revenue</h3>
-            <p className="text-gray-500 text-sm mb-4">Breakdown of GMV (Gross Merchandise Value) = (Price × Items Sold) + Shipping Fees - Seller Discounts - Platform Discounts</p>
+          <div className="brand-card rounded-xl p-6">
+            <h3 className="text-lg font-semibold brand-text mb-2">Revenue</h3>
+            <p className="brand-muted text-sm mb-4">Breakdown of GMV (Gross Merchandise Value) = (Price × Items Sold) + Shipping Fees - Seller Discounts - Platform Discounts</p>
             <div className="space-y-1">
 
               {/* Original Product Price (Price × Items Sold) */}
               <ExpandableItem
-                icon={<Package className="w-5 h-5 text-white" />}
-                iconBgColor="bg-gradient-to-r from-blue-500 to-cyan-500"
+                icon={<Package className="w-5 h-5 shrink-0" />}
                 title="Product Price (Before Discounts)"
                 subtitle="Price × Items Sold"
                 value={formatCurrency(financials.gmvOriginalProductPrice)}
-                valueColor="text-blue-400"
+                valueColor={plSignedMetricClass(financials.gmvOriginalProductPrice)}
                 tooltip={{
                   source: "Orders",
                   calculation: "Sum(original_total_product_price)",
@@ -1796,12 +2091,11 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
 
               {/* Shipping Fees */}
               <ExpandableItem
-                icon={<Truck className="w-5 h-5 text-white" />}
-                iconBgColor="bg-gradient-to-r from-purple-500 to-indigo-500"
+                icon={<Truck className="w-5 h-5 shrink-0" />}
                 title="Shipping Fees"
                 subtitle="Total shipping charges"
                 value={formatCurrency(financials.gmvShippingFees)}
-                valueColor="text-purple-400"
+                valueColor={plSignedMetricClass(financials.gmvShippingFees)}
                 tooltip={{
                   source: "Orders",
                   calculation: "Sum(shipping_fee)",
@@ -1812,12 +2106,11 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
               {/* Seller Discounts */}
               {financials.gmvSellerDiscounts > 0 && (
                 <ExpandableItem
-                  icon={<DollarSign className="w-5 h-5 text-white" />}
-                  iconBgColor="bg-gradient-to-r from-orange-500 to-red-500"
+                  icon={<DollarSign className="w-5 h-5 shrink-0" />}
                   title="Seller Discounts"
                   subtitle="Promotional discounts by seller"
                   value={formatCurrency(financials.gmvSellerDiscounts)}
-                  valueColor="text-orange-400"
+                  valueColor={plExpenseMetricClass(financials.gmvSellerDiscounts)}
                   isNegative
                   tooltip={{
                     source: "Orders",
@@ -1830,12 +2123,11 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
               {/* Platform Discounts */}
               {financials.gmvPlatformDiscounts > 0 && (
                 <ExpandableItem
-                  icon={<DollarSign className="w-5 h-5 text-white" />}
-                  iconBgColor="bg-gradient-to-r from-pink-500 to-rose-500"
+                  icon={<DollarSign className="w-5 h-5 shrink-0" />}
                   title="Platform Discounts"
                   subtitle="Co-funded promotional discounts"
                   value={formatCurrency(financials.gmvPlatformDiscounts)}
-                  valueColor="text-pink-400"
+                  valueColor={plExpenseMetricClass(financials.gmvPlatformDiscounts)}
                   isNegative
                   tooltip={{
                     source: "Orders",
@@ -1847,12 +2139,11 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
 
               {financials.refunds > 0 && (
                 <ExpandableItem
-                  icon={<DollarSign className="w-5 h-5 text-white" />}
-                  iconBgColor="bg-gradient-to-r from-red-500 to-pink-500"
+                  icon={<DollarSign className="w-5 h-5 shrink-0" />}
                   title="Returns/Refunds"
                   subtitle="Cancelled and refunded orders (Ex. Tax)"
                   value={formatCurrency(financials.refunds)}
-                  valueColor="text-red-400"
+                  valueColor={plExpenseMetricClass(financials.refunds)}
                   isNegative
                   tooltip={{
                     source: "Orders",
@@ -1863,10 +2154,10 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
               )}
 
               {/* Total GMV — matches Overview GMV (grossSalesGMV = price + shipping - discounts) */}
-              <div className="flex items-center justify-between py-4 bg-green-500/10 rounded-lg px-4 mt-2">
+              <div className="flex items-center justify-between py-4 brand-card rounded-lg px-4 mt-2">
                 <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 rounded-lg bg-gradient-to-r from-green-500 to-emerald-500 flex items-center justify-center">
-                    <TrendingUp className="w-5 h-5 text-white" />
+                  <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${plSemanticToIconTileClass(plSignedMetricClass(financials.grossSalesGMV))}`}>
+                    <TrendingUp className="w-5 h-5 shrink-0" />
                   </div>
                   <div className="flex items-center gap-2">
                     <p className="text-lg font-bold text-white">Gross Merchandise Value (GMV)</p>
@@ -1877,28 +2168,28 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                     />
                   </div>
                 </div>
-                <p className="text-2xl font-bold text-green-400">{formatCurrency(financials.grossSalesGMV)}</p>
+                <p className={`text-2xl font-bold ${plSignedMetricClass(financials.grossSalesGMV)}`}>{formatCurrency(financials.grossSalesGMV)}</p>
               </div>
             </div>
           </div>
 
           {/* ═══════════════════ OPERATING EXPENSES ═══════════════════ */}
-          <div className="bg-gray-800 rounded-xl border border-gray-700 p-6">
-            <h3 className="text-lg font-semibold text-white mb-2">Operating Expenses</h3>
-            <p className="text-gray-500 text-sm mb-4">
+          <div className="brand-card rounded-xl p-6">
+            <h3 className="text-lg font-semibold brand-text mb-2">Operating Expenses</h3>
+            <p className="brand-muted text-sm mb-4">
               {hasTransactionData
                 ? 'Itemized from statement transaction data'
                 : 'Summary from settlement statements - sync to get itemized breakdowns'}
             </p>
             <div className="space-y-1">
               {/* Platform Fees & Commissions */}
+              {!isRestricted('platform_fees') && (
               <ExpandableItem
-                icon={<Receipt className="w-5 h-5 text-white" />}
-                iconBgColor="bg-gradient-to-r from-purple-500 to-pink-500"
+                icon={<Receipt className="w-5 h-5 shrink-0" />}
                 title="Platform Fees"
                 subtitle={hasTransactionData ? 'Itemized from transactions' : 'From settlement data'}
                 value={formatCurrency(hasTransactionData ? Math.abs(platformFees) : totalFees)}
-                valueColor="text-purple-400"
+                valueColor={plExpenseMetricClass(hasTransactionData ? Math.abs(platformFees) : totalFees)}
                 isNegative
                 tooltip={{
                   source: "Statement Transactions",
@@ -1915,22 +2206,22 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                         { label: 'Refund Administration Fee', value: plData?.fees?.refund_administration_fee || 0 },
                         { label: 'Credit Card Handling Fee', value: plData?.fees?.credit_card_handling_fee || 0 },
                       ]}
-                      color="text-purple-400"
                     />
                   ) : (
-                    <p className="text-gray-500 text-sm">Sync finance data to see itemized fee breakdown</p>
+                    <p className="brand-muted text-sm">Sync finance data to see itemized fee breakdown</p>
                   )
                 }
               />
+              )}
 
               {/* Agency Fees */}
+              {!isRestricted('agency_fees') && !isRestricted('custom_line_items') && (
               <ExpandableItem
-                icon={<Building2 className="w-5 h-5 text-white" />}
-                iconBgColor="bg-gradient-to-r from-blue-500 to-indigo-500"
+                icon={<Building2 className="w-5 h-5 shrink-0" />}
                 title="Agency Fees"
                 subtitle="Manual agency service fees"
                 value={formatCurrency(totalAgencyFees)}
-                valueColor="text-blue-400"
+                valueColor={plExpenseMetricClass(totalAgencyFees)}
                 isNegative
                 tooltip={{
                   source: "Manual Entry (prorated)",
@@ -1939,9 +2230,9 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                 }}
                 expandedContent={
                   <div className="space-y-4">
-                    <div className="bg-gray-800 rounded-lg p-3 border border-gray-700 space-y-2">
-                      <p className="text-xs font-semibold text-gray-300 uppercase tracking-wide">How this is calculated</p>
-                      <ul className="text-xs text-gray-400 space-y-1.5 list-disc pl-4 leading-relaxed">
+                    <div className="brand-card rounded-lg p-3 space-y-2">
+                      <p className="text-xs font-semibold brand-text uppercase tracking-wide">How this is calculated</p>
+                      <ul className="text-xs brand-muted space-y-1.5 list-disc pl-4 leading-relaxed">
                         {agencyFeeSummaryNotes.map((t, i) => (
                           <li key={i}>{t}</li>
                         ))}
@@ -1949,23 +2240,23 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                     </div>
 
                     {agencyFeeLines.length > 0 && (
-                      <div className="rounded-lg border border-gray-700 bg-gray-900/40 p-3 space-y-3">
-                        <p className="text-xs font-medium text-gray-300">
+                      <div className="rounded-lg border p-3 space-y-3 brand-card">
+                        <p className="text-xs font-medium brand-text">
                           Amounts for {dateRange.startDate} → {dateRange.endDate}
                         </p>
                         {agencyFeeLines.map((line) => (
-                          <div key={line.id} className="border-t border-gray-800 pt-3 first:border-t-0 first:pt-0">
+                          <div key={line.id} className="border-t pt-3 first:border-t-0 first:pt-0" style={{ borderColor: 'var(--brand-card-border)' }}>
                             <div className="flex justify-between gap-2 items-start">
                               <div>
-                                <p className="text-sm font-medium text-white">{line.agencyName}</p>
-                                <p className="text-[11px] text-gray-500 mt-0.5">
+                                <p className="text-sm font-medium brand-text">{line.agencyName}</p>
+                                <p className="text-[11px] brand-muted mt-0.5">
                                   Starts {line.feeStartDate} · {line.feeType}
                                   {line.feeType !== 'commission' ? ` · ${line.recurrence}` : ''}
                                 </p>
                               </div>
-                              <span className="text-sm font-semibold text-blue-400 shrink-0">{formatCurrency(line.total)}</span>
+                              <span className="text-sm font-semibold brand-loss shrink-0">{formatCurrency(line.total)}</span>
                             </div>
-                            <ul className="mt-2 space-y-1 text-[11px] text-gray-500 leading-snug">
+                            <ul className="mt-2 space-y-1 text-[11px] brand-muted leading-snug">
                               {line.notes.map((n, j) => (
                                 <li key={j}>{n}</li>
                               ))}
@@ -1975,16 +2266,16 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                       </div>
                     )}
 
-                    <div className="bg-gray-800/80 rounded-lg p-3 border border-gray-700">
-                      <p className="text-gray-400 text-xs leading-relaxed">
+                    <div className="brand-card rounded-lg p-3">
+                      <p className="brand-muted text-xs leading-relaxed">
                         These costs reduce net profit after gross profit. Edit definitions below; the card total always reflects proration for the selected range.
                       </p>
                     </div>
 
                     {/* Manual Agency Fees List */}
-                    <div className="border-t border-gray-700 pt-4">
+                    <div className="border-t pt-4" style={{ borderColor: 'var(--brand-card-border)' }}>
                       <div className="flex items-center justify-between mb-2">
-                        <h4 className="text-sm font-medium text-white">Configured fees</h4>
+                        <h4 className="text-sm font-medium brand-text">Configured fees</h4>
                         <button
                           type="button"
                           onClick={(e) => {
@@ -1993,7 +2284,8 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                           }}
                           disabled={!canMutateShop}
                           title={!canMutateShop ? 'Read-only for your role' : undefined}
-                          className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 active:bg-blue-500/30 rounded-lg transition-colors border border-blue-500/20 disabled:opacity-40 disabled:pointer-events-none"
+                          className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg transition-colors border disabled:opacity-40 disabled:pointer-events-none"
+                          style={{ backgroundColor: 'var(--brand-info-bg)', color: 'var(--brand-info-text)', borderColor: 'var(--brand-info-border)' }}
                         >
                           <Plus size={14} />
                           Add Fee
@@ -2001,17 +2293,17 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                       </div>
 
                       {agencyFees.length === 0 ? (
-                        <p className="text-gray-500 text-xs italic">No manual agency fees on file for this shop (through {dateRange.endDate}).</p>
+                        <p className="brand-muted text-xs italic">No manual agency fees on file for this shop (through {dateRange.endDate}).</p>
                       ) : (
                         <div className="space-y-2 max-h-60 overflow-y-auto pr-2 custom-scrollbar">
                           {agencyFees.map((fee) => {
                             const rolled = agencyFeeLines.find((l) => l.id === fee.id);
                             const periodAmt = rolled?.total ?? 0;
                             return (
-                              <div key={fee.id} className="flex items-center justify-between bg-gray-900/50 p-2 rounded border border-gray-800 gap-2">
+                              <div key={fee.id} className="flex items-center justify-between p-2 rounded border gap-2 brand-card">
                                 <div className="min-w-0">
-                                  <p className="text-sm text-gray-300 font-medium truncate">{fee.agency_name}</p>
-                                  <div className="flex flex-wrap items-center gap-x-2 text-xs text-gray-500">
+                                  <p className="text-sm brand-text font-medium truncate">{fee.agency_name}</p>
+                                  <div className="flex flex-wrap items-center gap-x-2 text-xs brand-muted">
                                     <span>Starts {fee.date}</span>
                                     {fee.description && (
                                       <>
@@ -2020,11 +2312,11 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                                       </>
                                     )}
                                   </div>
-                                  <p className="text-[11px] text-gray-600 mt-1">
-                                    This range: <span className="text-blue-400/90">{formatCurrency(periodAmt)}</span>
+                                  <p className="text-[11px] brand-muted mt-1">
+                                    This range: <span className="brand-loss">{formatCurrency(periodAmt)}</span>
                                     {fee.fee_type !== 'commission' &&
                                       Number(fee.retainer_amount ?? fee.amount ?? 0) > 0 && (
-                                      <span className="text-gray-600">
+                                      <span className="brand-muted">
                                         {' '}
                                         · retainer config ${Number(fee.retainer_amount ?? fee.amount).toFixed(2)}
                                       </span>
@@ -2043,7 +2335,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                                     }}
                                     disabled={!canMutateShop}
                                     title={!canMutateShop ? 'Read-only for your role' : 'Delete Fee'}
-                                    className="text-gray-600 hover:text-red-400 transition-colors p-1 disabled:opacity-30 disabled:pointer-events-none"
+                                    className="brand-muted transition-colors p-1 disabled:opacity-30 disabled:pointer-events-none"
                                   >
                                     <Trash2 size={14} />
                                   </button>
@@ -2057,19 +2349,18 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                   </div>
                 }
               />
+              )}
 
-              {/* Ad Spend / Marketing (always visible so total adds up) */}
+              {/* Ad Spend / Marketing */}
+              {!isRestricted('ad_spend') && (
               <ExpandableItem
-                icon={<Megaphone className="w-5 h-5 text-white" />}
-                iconBgColor={adSpend > 0
-                  ? "bg-gradient-to-r from-orange-500 to-red-500"
-                  : "bg-gradient-to-r from-gray-600 to-gray-500"}
+                icon={<Megaphone className="w-5 h-5 shrink-0" />}
                 title="Marketing / Ad Spend"
                 subtitle={adsConnected
                   ? `TikTok Ads API + Shop Settlement Deductions`
                   : "TikTok advertising costs (connect Ads account to populate)"}
                 value={formatCurrency(adSpend)}
-                valueColor={adSpend > 0 ? "text-orange-400" : "text-gray-500"}
+                valueColor={plExpenseMetricClass(adSpend)}
                 isNegative={adSpend > 0}
                 tooltip={{
                   source: adsConnected ? "TikTok Business API + Shop Settlements" : "Not Available",
@@ -2088,23 +2379,22 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                             value: Math.abs(plData?.fees?.[k] || 0)
                           }))
                       ]}
-                      color="text-orange-400"
                     />
                   ) : (
-                    <p className="text-gray-400 text-sm">Connect your TikTok Ads account in the Marketing tab to include ad spend in your P&L.</p>
+                    <p className="brand-muted text-sm">Connect your TikTok Ads account in the Marketing tab to include ad spend in your P&L.</p>
                   )
                 }
               />
+              )}
 
               {/* Service Fees */}
-              {serviceFees > 0 && (
+              {serviceFees > 0 && !isRestricted('platform_fees') && (
                 <ExpandableItem
-                  icon={<DollarSign className="w-5 h-5 text-white" />}
-                  iconBgColor="bg-gradient-to-r from-indigo-500 to-purple-500"
+                  icon={<DollarSign className="w-5 h-5 shrink-0" />}
                   title="Service Fees"
                   subtitle="TikTok service and promotion fees"
                   value={formatCurrency(serviceFees)}
-                  valueColor="text-indigo-400"
+                  valueColor={plExpenseMetricClass(serviceFees)}
                   isNegative
                   tooltip={{
                     source: "Statement Transactions",
@@ -2115,25 +2405,22 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                     serviceFeeItems.length > 0 ? (
                       <BreakdownRows
                         items={serviceFeeItems}
-                        color="text-indigo-400"
                       />
                     ) : (
-                      <p className="text-gray-400 text-sm">No detailed itemization available for these service fees.</p>
+                      <p className="brand-muted text-sm">No detailed itemization available for these service fees.</p>
                     )
                   }
                 />
               )}
 
               {/* Shipping Costs (includes FBT Fulfillment Fees) */}
+              {!isRestricted('shipping_costs') && (
               <ExpandableItem
-                icon={<Truck className="w-5 h-5 text-white" />}
-                iconBgColor={totalShipping > 0
-                  ? 'bg-gradient-to-r from-cyan-500 to-blue-500'
-                  : 'bg-gradient-to-r from-gray-600 to-gray-500'}
+                icon={<Truck className="w-5 h-5 shrink-0" />}
                 title="Shipping Costs"
                 subtitle={`${hasTransactionData ? 'Itemized shipping breakdown' : 'From settlement data'} (excl. FBT)`}
                 value={totalShipping > 0 ? formatCurrency(totalShipping) : '$0.00'}
-                valueColor={totalShipping > 0 ? 'text-cyan-400' : 'text-gray-500'}
+                valueColor={plExpenseMetricClass(totalShipping)}
                 isNegative={totalShipping > 0}
                 tooltip={{
                   source: "Statement Transactions",
@@ -2145,30 +2432,29 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                     {hasTransactionData ? (
                       <BreakdownRows
                         items={recordToItems(plData?.shipping, SHIPPING_LABELS)}
-                        color="text-cyan-400"
                       />
                     ) : (
-                      <p className="text-gray-500 text-sm">Sync finance data to see itemized shipping breakdown</p>
+                      <p className="brand-muted text-sm">Sync finance data to see itemized shipping breakdown</p>
                     )}
                     {/* Shipping subtotal (included in OpEx) */}
                     {totalShipping > 0 && (
-                      <div className="flex justify-between text-xs text-gray-400 pt-1 border-t border-gray-700/50 mt-2">
+                      <div className="flex justify-between text-xs brand-muted pt-1 border-t mt-2" style={{ borderColor: 'var(--brand-card-border)' }}>
                         <span>Shipping subtotal (in OpEx)</span>
                         <span>{formatCurrency(totalShipping)}</span>
                       </div>
                     )}
                     {/* FBT fees — shown for reference, excluded from OpEx calculation */}
                     {fbtFees > 0 && (
-                      <div className="mt-3 pt-3 border-t border-gray-700">
-                        <p className="text-xs text-gray-500 mb-2 uppercase tracking-wide">FBT Fees (excluded from OpEx)</p>
+                      <div className="mt-3 pt-3 border-t" style={{ borderColor: 'var(--brand-card-border)' }}>
+                        <p className="text-xs brand-muted mb-2 uppercase tracking-wide">FBT Fees (excluded from OpEx)</p>
                         <div className="flex justify-between text-sm opacity-50">
-                          <span className="line-through text-gray-400">FBT Fulfillment Fee</span>
-                          <span className="line-through text-gray-400">{formatCurrency(fbtFees)}</span>
+                          <span className="line-through brand-muted">FBT Fulfillment Fee</span>
+                          <span className="line-through brand-muted">{formatCurrency(fbtFees)}</span>
                         </div>
-                        <p className="text-gray-600 text-xs mt-1 line-through">
+                        <p className="brand-muted text-xs mt-1 line-through">
                           From {orders.filter((o: any) => o.fbt_fulfillment_fee && o.fbt_fulfillment_fee > 0).length} FBT orders
                         </p>
-                        <div className="flex justify-between text-xs text-gray-500 pt-2 mt-1 border-t border-gray-700/50">
+                        <div className="flex justify-between text-xs brand-muted pt-2 mt-1 border-t" style={{ borderColor: 'var(--brand-card-border)' }}>
                           <span>Total incl. FBT (reference only)</span>
                           <span>{formatCurrency(totalShipping + fbtFees)}</span>
                         </div>
@@ -2177,37 +2463,44 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                   </div>
                 }
               />
+              )}
 
 
               {/* Total Operating Expenses */}
-              <div className="flex items-center justify-between py-4 bg-red-500/10 rounded-lg px-4 mt-2">
+              <div className="flex items-center justify-between py-4 rounded-lg px-4 mt-2 brand-state-danger">
                 <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 rounded-lg bg-gradient-to-r from-red-500 to-pink-500 flex items-center justify-center">
-                    <TrendingDown className="w-5 h-5 text-white" />
+                  <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${plSemanticToIconTileClass(plExpenseMetricClass(operatingExpenses))}`}>
+                    <TrendingDown className="w-5 h-5 shrink-0" />
                   </div>
                   <div>
                     <div className="flex items-center gap-2">
-                      <p className="text-lg font-bold text-white">Total Operating Expenses</p>
+                      <p className="text-lg font-bold brand-text">Total Operating Expenses</p>
                       <CalculationTooltip
                         source="Calculated"
                         calculation="Platform Fees + Service Fees + Shipping + Marketing/Ad Spend + Agency Fees"
                         api="Calculated"
                       />
                     </div>
-                    <p className="text-xs text-gray-400">Platform, service fees + Shipping (excl. FBT) + Marketing + Agency (excludes Affiliate COGS, FBT & Taxes)</p>
+                    <p className="text-xs brand-muted">Platform, service fees + Shipping (excl. FBT) + Marketing + Agency (excludes Affiliate COGS, FBT & Taxes)</p>
                   </div>
                 </div>
-                <p className="text-2xl font-bold text-red-400">-{formatCurrency(operatingExpenses)}</p>
+                <p className={`text-2xl font-bold ${plExpenseMetricClass(operatingExpenses)}`}>-{formatCurrency(operatingExpenses)}</p>
               </div>
 
               {/* Operating Income */}
-              <div className="flex items-center justify-between py-4 bg-emerald-500/10 rounded-lg px-4 mt-2">
+              <div className={`flex items-center justify-between py-4 rounded-lg px-4 mt-2 ${operatingIncome >= 0 ? 'brand-state-success' : 'brand-state-danger'}`}>
                 <div className="flex items-center gap-3">
-                  <div className={`w-10 h-10 rounded-lg ${operatingIncome >= 0 ? 'bg-gradient-to-r from-emerald-500 to-teal-500' : 'bg-gradient-to-r from-red-500 to-pink-500'} flex items-center justify-center`}>
-                    {operatingIncome >= 0 ? <TrendingUp className="w-5 h-5 text-white" /> : <TrendingDown className="w-5 h-5 text-white" />}
+                  <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${plSemanticToIconTileClass(plSignedMetricClass(operatingIncome))}`}>
+                    {operatingIncome > PL_AMOUNT_EPS ? (
+                      <TrendingUp className="w-5 h-5 shrink-0" />
+                    ) : operatingIncome < -PL_AMOUNT_EPS ? (
+                      <TrendingDown className="w-5 h-5 shrink-0" />
+                    ) : (
+                      <Minus className="w-5 h-5 shrink-0" />
+                    )}
                   </div>
                   <div className="flex items-center gap-2">
-                    <p className="text-lg font-bold text-white">Operating Income</p>
+                    <p className="text-lg font-bold brand-text">Operating Income</p>
                     <CalculationTooltip
                       source="Calculated"
                       calculation="Gross Profit - Operating Expenses"
@@ -2216,27 +2509,34 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                   </div>
                 </div>
                 <div className="text-right">
-                  <p className={`text-2xl font-bold ${operatingIncome >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                    {operatingIncome < 0 ? '-' : ''}{formatCurrency(operatingIncome)}
-                  </p>
-                  <p className={`text-sm font-medium ${operatingIncome >= 0 ? 'text-emerald-400/70' : 'text-red-400/70'}`}>
-                    {formatPercent(operatingIncomePct)}
-                  </p>
+                  {isRestricted('net_profit') ? (
+                    <>
+                      <p className="text-2xl font-bold text-gray-400">Restricted</p>
+                      <p className="text-sm font-medium text-gray-400">Hidden by seller policy</p>
+                    </>
+                  ) : (
+                    <>
+                      <p className={`text-2xl font-bold ${plSignedMetricClass(operatingIncome)}`}>
+                        {operatingIncome < 0 ? '-' : ''}{formatCurrency(operatingIncome)}
+                      </p>
+                      <p className={`text-sm font-medium ${plSignedPctClass(operatingIncomePct)}`}>
+                        {formatPercent(operatingIncomePct)}
+                      </p>
+                    </>
+                  )}
                 </div>
               </div>
             </div>
           </div>
 
           {/* ═══════════════════ COST OF GOODS SOLD ═══════════════════ */}
-          <div className="bg-gray-800 rounded-xl border border-gray-700 p-6">
-            <h3 className="text-lg font-semibold text-white mb-2">Cost of Goods Sold</h3>
-            <p className="text-gray-500 text-sm mb-4">Your product costs (manually entered per product)</p>
+          {canViewCogs && (
+          <div className="brand-card rounded-xl p-6">
+            <h3 className="text-lg font-semibold brand-text mb-2">Cost of Goods Sold</h3>
+            <p className="brand-muted text-sm mb-4">Your product costs (manually entered per product)</p>
             <div className="space-y-1">
               <ExpandableItem
-                icon={<Package className="w-5 h-5 text-white" />}
-                iconBgColor={cogsStats.withCogs === cogsStats.total && cogsStats.total > 0
-                  ? 'bg-gradient-to-r from-green-500 to-emerald-500'
-                  : 'bg-gradient-to-r from-orange-500 to-red-500'}
+                icon={<Package className="w-5 h-5 shrink-0" />}
                 title="Product Costs (COGS)"
                 subtitle={cogsStats.total > 0
                   ? (cogsStats.withCogs > 0
@@ -2244,7 +2544,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                     : 'No COGS data set - add COGS to products')
                   : 'No products with sales found'}
                 value={cogsStats.withCogs > 0 ? formatCurrency(totalCogs) : '$0.00'}
-                valueColor={cogsStats.withCogs > 0 ? 'text-orange-400' : 'text-gray-500'}
+                valueColor={plExpenseMetricClass(totalCogs)}
                 tooltip={{
                   source: "Product Catalog",
                   calculation: "Sum(product.cogs x quantity_sold)",
@@ -2253,34 +2553,34 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                 expandedContent={
                   <div className="space-y-3 text-sm">
                     <div className="flex justify-between">
-                      <span className="text-gray-400">Products with COGS</span>
-                      <span className="text-green-400">{cogsStats.withCogs}</span>
+                      <span className="brand-muted">Products with COGS</span>
+                      <span className="brand-profit">{cogsStats.withCogs}</span>
                     </div>
                     <div className="flex justify-between">
-                      <span className="text-gray-400">Products missing COGS</span>
-                      <span className="text-orange-400">{cogsStats.total - cogsStats.withCogs}</span>
+                      <span className="brand-muted">Products missing COGS</span>
+                      <span className="brand-loss">{cogsStats.total - cogsStats.withCogs}</span>
                     </div>
                     <div className="flex justify-between">
-                      <span className="text-gray-400">Total Products with Sales</span>
-                      <span className="text-white">{cogsStats.total}</span>
+                      <span className="brand-muted">Total Products with Sales</span>
+                      <span className="brand-text">{cogsStats.total}</span>
                     </div>
-                    <div className="border-t border-gray-700 pt-2 flex justify-between font-medium">
-                      <span className="text-white">Calculated COGS</span>
-                      <span className="text-orange-400">{formatCurrency(totalCogs)}</span>
+                    <div className="border-t pt-2 flex justify-between font-medium" style={{ borderColor: 'var(--brand-card-border)' }}>
+                      <span className="brand-text">Calculated COGS</span>
+                      <span className="brand-loss">{formatCurrency(totalCogs)}</span>
                     </div>
-                    <p className="text-gray-500 text-xs">Go to Products &rarr; Click product &rarr; Add COGS value</p>
+                    <p className="brand-muted text-xs">Go to Products &rarr; Click product &rarr; Add COGS value</p>
                   </div>
                 }
               />
 
               {/* Affiliate Commissions (COGS) */}
+              {!isRestricted('affiliate_commissions') && !isRestricted('custom_line_items') && (
               <ExpandableItem
-                icon={<Users className="w-5 h-5 text-white" />}
-                iconBgColor="bg-gradient-to-r from-pink-500 to-rose-500"
+                icon={<Users className="w-5 h-5 shrink-0" />}
                 title="Affiliate Commissions"
                 subtitle="Commissions paid to affiliates & creators (Auto + Manual) — treated as COGS"
                 value={formatCurrency(totalAffiliateCost)}
-                valueColor="text-pink-400"
+                valueColor={plExpenseMetricClass(totalAffiliateCost)}
                 isNegative
                 tooltip={{
                   source: "Statement Transactions + Manual",
@@ -2302,13 +2602,12 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                         ),
                         { label: 'Manual Retainers', value: manualAffiliateRetainers },
                       ]}
-                      color="text-pink-400"
                     />
 
                     {/* Manual Retainers List */}
-                    <div className="mt-4 border-t border-gray-700 pt-4">
+                    <div className="mt-4 border-t pt-4" style={{ borderColor: 'var(--brand-card-border)' }}>
                       <div className="flex items-center justify-between mb-2">
-                        <h4 className="text-sm font-medium text-white">Manual Retainers</h4>
+                        <h4 className="text-sm font-medium brand-text">Manual Retainers</h4>
                         <button
                           type="button"
                           onClick={(e) => {
@@ -2317,22 +2616,23 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                           }}
                           disabled={!canMutateShop}
                           title={!canMutateShop ? 'Read-only for your role' : undefined}
-                          className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-pink-500/10 text-pink-400 hover:bg-pink-500/20 active:bg-pink-500/30 rounded-lg transition-colors border border-pink-500/20 disabled:opacity-40 disabled:pointer-events-none"
+                          className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg transition-colors border disabled:opacity-40 disabled:pointer-events-none"
+                          style={{ backgroundColor: 'var(--brand-interactive-hover-bg)', color: 'var(--brand-primary)', borderColor: 'var(--brand-card-border)' }}
                         >
                           <Plus size={14} />
                           Add Retainer
                         </button>
                       </div>
 
-                      {affiliateSettlements.length === 0 ? (
-                        <p className="text-gray-500 text-xs italic">No manual retainers for this period.</p>
+                      {affiliateSettlementsInRange.length === 0 ? (
+                        <p className="brand-muted text-xs italic">No manual retainers for this period.</p>
                       ) : (
                         <div className="space-y-2 max-h-60 overflow-y-auto pr-2 custom-scrollbar">
-                          {affiliateSettlements.map(settlement => (
-                            <div key={settlement.id} className="flex items-center justify-between bg-gray-900/50 p-2 rounded border border-gray-800">
+                          {affiliateSettlementsInRange.map(settlement => (
+                            <div key={settlement.id} className="flex items-center justify-between p-2 rounded border brand-card">
                               <div>
-                                <p className="text-sm text-gray-300 font-medium">{settlement.affiliate_name}</p>
-                                <div className="flex items-center gap-2 text-xs text-gray-500">
+                                <p className="text-sm brand-text font-medium">{settlement.affiliate_name}</p>
+                                <div className="flex items-center gap-2 text-xs brand-muted">
                                   <span>{settlement.date}</span>
                                   {settlement.description && (
                                     <>
@@ -2343,13 +2643,13 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                                 </div>
                               </div>
                               <div className="flex items-center gap-3">
-                                <span className="text-pink-400 text-sm font-medium">{formatCurrency(settlement.amount)}</span>
+                                <span className="brand-loss text-sm font-medium">{formatCurrency(settlement.amount)}</span>
                                 <button
                                   type="button"
                                   onClick={(e) => handleDeleteRetainer(settlement.id, e)}
                                   disabled={!canMutateShop}
                                   title={!canMutateShop ? 'Read-only for your role' : 'Delete Retainer'}
-                                  className="text-gray-600 hover:text-red-400 transition-colors p-1 disabled:opacity-30 disabled:pointer-events-none"
+                                  className="brand-muted transition-colors p-1 disabled:opacity-30 disabled:pointer-events-none"
                                 >
                                   <Trash2 size={14} />
                                 </button>
@@ -2362,15 +2662,16 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                   </div>
                 }
               />
+              )}
 
               {/* Gross Profit */}
-              <div className="flex items-center justify-between py-4 bg-blue-500/10 rounded-lg px-4 mt-2">
+              <div className="flex items-center justify-between py-4 rounded-lg px-4 mt-2 brand-state-info">
                 <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 rounded-lg bg-gradient-to-r from-blue-500 to-cyan-500 flex items-center justify-center">
-                    <Wallet className="w-5 h-5 text-white" />
+                  <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${plSemanticToIconTileClass(isRestricted('gross_profit') ? 'brand-muted' : plSignedMetricClass(grossProfit))}`}>
+                    <Wallet className="w-5 h-5 shrink-0" />
                   </div>
                   <div className="flex items-center gap-2">
-                    <p className="text-lg font-bold text-white">Gross Profit</p>
+                    <p className="text-lg font-bold brand-text">Gross Profit</p>
                     <CalculationTooltip
                       source="Calculated"
                       calculation="Net Revenue - COGS - Affiliate Commissions"
@@ -2379,37 +2680,46 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                   </div>
                 </div>
                 <div className="text-right">
-                  <p className={`text-2xl font-bold ${grossProfit >= 0 ? 'text-blue-400' : 'text-red-400'}`}>
-                    {grossProfit < 0 ? '-' : ''}{formatCurrency(grossProfit)}
-                  </p>
-                  <p className={`text-sm font-medium ${grossProfit >= 0 ? 'text-blue-400/70' : 'text-red-400/70'}`}>
-                    {formatPercent(grossProfitPct)}
-                  </p>
+                  {isRestricted('gross_profit') ? (
+                    <>
+                      <p className="text-2xl font-bold text-gray-400">Restricted</p>
+                      <p className="text-sm font-medium text-gray-400">Hidden by seller policy</p>
+                    </>
+                  ) : (
+                    <>
+                      <p className={`text-2xl font-bold ${plSignedMetricClass(grossProfit)}`}>
+                        {grossProfit < 0 ? '-' : ''}{formatCurrency(grossProfit)}
+                      </p>
+                      <p className={`text-sm font-medium ${plSignedPctClass(grossProfitPct)}`}>
+                        {formatPercent(grossProfitPct)}
+                      </p>
+                    </>
+                  )}
                 </div>
               </div>
             </div>
           </div>
+          )}
 
           {/* ═══════════════════ SAMPLE ORDERS ═══════════════════ */}
-          <div className="bg-gray-800 rounded-xl border border-blue-500/30 p-6">
-            <h3 className="text-lg font-semibold text-white mb-2">Sample Orders</h3>
-            <p className="text-gray-500 text-sm mb-4">Orders marked as samples (excluded from P&L calculations)</p>
+          <div className="brand-card rounded-xl p-6">
+            <h3 className="text-lg font-semibold brand-text mb-2">Sample Orders</h3>
+            <p className="brand-muted text-sm mb-4">Orders marked as samples (excluded from P&L calculations)</p>
 
             {cogsStats.sampleOrders.count === 0 ? (
-              <div className="bg-blue-500/10 rounded-lg p-4 border border-blue-500/30">
-                <p className="text-blue-300 text-sm text-center">
+              <div className="brand-state-info rounded-lg p-4">
+                <p className="brand-text text-sm text-center">
                   No sample orders found in this date range
                 </p>
               </div>
             ) : (
               <div className="space-y-1">
                 <ExpandableItem
-                  icon={<Package className="w-5 h-5 text-white" />}
-                  iconBgColor="bg-gradient-to-r from-blue-500 to-cyan-500"
+                  icon={<Package className="w-5 h-5 shrink-0" />}
                   title="Sample Order Count"
                   subtitle={`${cogsStats.sampleOrders.count} sample order${cogsStats.sampleOrders.count !== 1 ? 's' : ''} across ${cogsStats.sampleOrders.skuBreakdown.length} SKU${cogsStats.sampleOrders.skuBreakdown.length !== 1 ? 's' : ''}`}
                   value={cogsStats.sampleOrders.count.toString()}
-                  valueColor="text-blue-400"
+                  valueColor="brand-text"
                   tooltip={{
                     source: "Orders",
                     calculation: "Count(orders where is_sample_order=true)",
@@ -2419,7 +2729,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                     cogsStats.sampleOrders.skuBreakdown.length > 0 ? (
                       <div className="space-y-2 text-sm">
                         {/* Header */}
-                        <div className="flex items-center gap-3 text-xs text-gray-500 uppercase tracking-wider pb-1 border-b border-gray-700">
+                        <div className="flex items-center gap-3 text-xs brand-muted uppercase tracking-wider pb-1 border-b" style={{ borderColor: 'var(--brand-card-border)' }}>
                           <span className="flex-1">Product / SKU</span>
                           <span className="w-12 text-center">Qty</span>
                           <span className="w-20 text-right">Unit COGS</span>
@@ -2432,34 +2742,34 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                               {sku.skuImage ? (
                                 <img src={sku.skuImage} alt="" className="w-7 h-7 rounded object-cover flex-shrink-0" />
                               ) : (
-                                <div className="w-7 h-7 rounded bg-gray-700 flex items-center justify-center flex-shrink-0">
-                                  <Package className="w-3.5 h-3.5 text-gray-500" />
+                                <div className="w-7 h-7 rounded brand-card flex items-center justify-center flex-shrink-0">
+                                  <Package className="w-3.5 h-3.5 brand-muted" />
                                 </div>
                               )}
                               <div className="min-w-0">
-                                <p className="text-white truncate text-xs">{sku.productName}</p>
+                                <p className="brand-text truncate text-xs">{sku.productName}</p>
                                 {sku.skuName && (
-                                  <p className="text-gray-500 truncate text-xs">{sku.skuName}</p>
+                                  <p className="brand-muted truncate text-xs">{sku.skuName}</p>
                                 )}
                               </div>
                             </div>
-                            <span className="w-12 text-center text-white font-medium">x{sku.quantity}</span>
-                            <span className={`w-20 text-right ${sku.unitCogs > 0 ? 'text-orange-400' : 'text-gray-600'}`}>
+                            <span className="w-12 text-center brand-text font-medium">x{sku.quantity}</span>
+                            <span className={`w-20 text-right ${sku.unitCogs > 0 ? 'brand-loss' : 'brand-muted'}`}>
                               {sku.unitCogs > 0 ? formatCurrency(sku.unitCogs) : 'N/A'}
                             </span>
-                            <span className={`w-20 text-right font-medium ${sku.totalCogs > 0 ? 'text-red-400' : 'text-gray-600'}`}>
+                            <span className={`w-20 text-right font-medium ${sku.totalCogs > 0 ? 'brand-loss' : 'brand-muted'}`}>
                               {sku.totalCogs > 0 ? formatCurrency(sku.totalCogs) : '-'}
                             </span>
                           </div>
                         ))}
                         {/* Footer total */}
-                        <div className="flex items-center gap-3 pt-2 border-t border-gray-700 font-medium">
-                          <span className="flex-1 text-white">Total</span>
-                          <span className="w-12 text-center text-white">
+                        <div className="flex items-center gap-3 pt-2 border-t font-medium" style={{ borderColor: 'var(--brand-card-border)' }}>
+                          <span className="flex-1 brand-text">Total</span>
+                          <span className="w-12 text-center brand-text">
                             x{cogsStats.sampleOrders.skuBreakdown.reduce((sum, s) => sum + s.quantity, 0)}
                           </span>
                           <span className="w-20"></span>
-                          <span className="w-20 text-right text-red-400">
+                          <span className="w-20 text-right brand-loss">
                             {formatCurrency(cogsStats.sampleOrders.totalCogsValue)}
                           </span>
                         </div>
@@ -2469,12 +2779,11 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                 />
 
                 <ExpandableItem
-                  icon={<DollarSign className="w-5 h-5 text-white" />}
-                  iconBgColor="bg-gradient-to-r from-red-500 to-orange-500"
+                  icon={<DollarSign className="w-5 h-5 shrink-0" />}
                   title="Sample Order Value"
                   subtitle="Cost of goods given away (Quantity × COGS)"
                   value={`${cogsStats.sampleOrders.gmv < 0 ? '-' : ''}${formatCurrency(cogsStats.sampleOrders.gmv)}`}
-                  valueColor="text-red-400"
+                  valueColor="brand-loss"
                   tooltip={{
                     source: "Orders & Products",
                     calculation: "Value = Quantity × COGS (negative because it's a cost)",
@@ -2483,16 +2792,16 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                   expandedContent={
                     <div className="space-y-3 text-sm">
                       <div className="flex justify-between">
-                        <span className="text-gray-400">Total Sample Orders</span>
-                        <span className="text-white">{cogsStats.sampleOrders.count}</span>
+                        <span className="brand-muted">Total Sample Orders</span>
+                        <span className="brand-text">{cogsStats.sampleOrders.count}</span>
                       </div>
                       <div className="flex justify-between">
-                        <span className="text-gray-400">Orders with COGS set</span>
-                        <span className="text-green-400">{cogsStats.sampleOrders.ordersWithCogs}</span>
+                        <span className="brand-muted">Orders with COGS set</span>
+                        <span className="brand-profit">{cogsStats.sampleOrders.ordersWithCogs}</span>
                       </div>
-                      <div className="border-t border-gray-700 pt-2 flex justify-between font-medium">
-                        <span className="text-white">Sample Order Value (Cost)</span>
-                        <span className="text-red-400">
+                      <div className="border-t pt-2 flex justify-between font-medium" style={{ borderColor: 'var(--brand-card-border)' }}>
+                        <span className="brand-text">Sample Order Value (Cost)</span>
+                        <span className="brand-loss">
                           {cogsStats.sampleOrders.gmv < 0 ? '-' : ''}{formatCurrency(cogsStats.sampleOrders.gmv)}
                         </span>
                       </div>
@@ -2501,8 +2810,8 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                 />
 
                 {/* Note about exclusion */}
-                <div className="mt-4 bg-blue-500/10 rounded-lg p-4 border border-blue-500/30">
-                  <p className="text-blue-300 text-sm">
+                <div className="mt-4 rounded-lg p-4 brand-state-info">
+                  <p className="brand-text text-sm">
                     <strong>Note:</strong> Sample orders are excluded from all P&L calculations including Revenue, COGS, and Net Profit to provide accurate financial reporting.
                   </p>
                 </div>
@@ -2511,25 +2820,29 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
           </div>
 
           {/* ═══════════════════ PROFITABILITY SUMMARY ═══════════════════ */}
-          <div className="bg-gradient-to-r from-green-500/10 to-emerald-500/10 border border-green-500/30 rounded-xl p-6">
-            <h3 className="text-lg font-semibold text-white mb-6">Profitability Summary</h3>
+          <div className="brand-card rounded-xl p-6 border">
+            <h3 className="text-lg font-semibold brand-text mb-6">Profitability Summary</h3>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-7 gap-4">
-              {/* GMV */}
-              <div className="bg-gray-800/50 rounded-lg p-5 border border-gray-700">
+              {/* GMV — brand-card matches OpEx section surfaces; avoids agency secondary-card accent floods */}
+              <div className="brand-card rounded-lg p-5">
                 <div className="flex items-center gap-3 mb-3">
-                  <DollarSign className="w-5 h-5 text-blue-400" />
-                  <p className="text-gray-400 text-sm font-medium">GMV</p>
+                  <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${plSemanticToIconTileClass(plSignedMetricClass(financials.grossSalesGMV))}`}>
+                    <DollarSign className="w-5 h-5 shrink-0" />
+                  </div>
+                  <p className="brand-muted text-sm font-medium">GMV</p>
                 </div>
-                <p className="text-2xl font-bold text-blue-400">{formatCurrency(financials.grossSalesGMV)}</p>
-                <p className="text-xs text-gray-500 mt-1">Gross Merchandise Value</p>
+                <p className={`text-2xl font-bold ${plSignedMetricClass(financials.grossSalesGMV)}`}>{formatCurrency(financials.grossSalesGMV)}</p>
+                <p className="text-xs brand-muted mt-1">Gross Merchandise Value</p>
               </div>
 
-              {/* Net sales (statement) */}
-              <div className="bg-gray-800/50 rounded-lg p-5 border border-gray-700">
+              {/* Net sales (TikTok statements) */}
+              <div className="brand-card rounded-lg p-5">
                 <div className="flex items-center justify-between gap-2 mb-3">
                   <div className="flex items-center gap-3 min-w-0">
-                    <Receipt className="w-5 h-5 text-sky-400 shrink-0" />
-                    <p className="text-gray-400 text-sm font-medium truncate">Net Sales</p>
+                    <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${plSemanticToIconTileClass(plSignedMetricClass(financials.statementNetSales))}`}>
+                      <Receipt className="w-5 h-5 shrink-0" />
+                    </div>
+                    <p className="brand-muted text-sm font-medium truncate">Net Sales</p>
                   </div>
                   <CalculationTooltip
                     source="TikTok Shop settlements"
@@ -2537,16 +2850,18 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                     api="GET /finance/pl-data → statement_totals.total_net_sales"
                   />
                 </div>
-                <p className="text-2xl font-bold text-sky-400">{formatCurrency(financials.statementNetSales)}</p>
-                <p className="text-xs text-gray-500 mt-1">From statement data (TikTok)</p>
+                <p className={`text-2xl font-bold ${plSignedMetricClass(financials.statementNetSales)}`}>{formatCurrency(financials.statementNetSales)}</p>
+                <p className="text-xs brand-muted mt-1">From statement data (TikTok)</p>
               </div>
 
               {/* Total settlement amount */}
-              <div className="bg-gray-800/50 rounded-lg p-5 border border-gray-700">
+              <div className="brand-card rounded-lg p-5">
                 <div className="flex items-center justify-between gap-2 mb-3">
                   <div className="flex items-center gap-3 min-w-0">
-                    <CircleDollarSign className="w-5 h-5 text-violet-400 shrink-0" />
-                    <p className="text-gray-400 text-sm font-medium truncate">Total Settlement</p>
+                    <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${plSemanticToIconTileClass(plSignedMetricClass(financials.settlementAmount))}`}>
+                      <CircleDollarSign className="w-5 h-5 shrink-0" />
+                    </div>
+                    <p className="brand-muted text-sm font-medium truncate">Total Settlement</p>
                   </div>
                   <CalculationTooltip
                     source="TikTok Shop settlements"
@@ -2554,16 +2869,18 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                     api="GET /finance/pl-data → statement_totals.total_settlement"
                   />
                 </div>
-                <p className="text-2xl font-bold text-violet-400">{formatCurrency(financials.settlementAmount)}</p>
-                <p className="text-xs text-gray-500 mt-1">Settlement amount (TikTok)</p>
+                <p className={`text-2xl font-bold ${plSignedMetricClass(financials.settlementAmount)}`}>{formatCurrency(financials.settlementAmount)}</p>
+                <p className="text-xs brand-muted mt-1">Settlement amount (TikTok)</p>
               </div>
 
               {/* Gross Profit */}
-              <div className="bg-gray-800/50 rounded-lg p-5 border border-gray-700">
+              <div className="brand-card rounded-lg p-5">
                 <div className="flex items-center justify-between gap-2 mb-3">
                   <div className="flex items-center gap-3 min-w-0">
-                    <Wallet className="w-5 h-5 text-amber-400 shrink-0" />
-                    <p className="text-gray-400 text-sm font-medium truncate">Gross Profit</p>
+                    <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${plSemanticToIconTileClass(isRestricted('gross_profit') ? 'brand-muted' : plSignedMetricClass(financials.grossProfit))}`}>
+                      <Wallet className="w-5 h-5 shrink-0" />
+                    </div>
+                    <p className="brand-muted text-sm font-medium truncate">Gross Profit</p>
                   </div>
                   <CalculationTooltip
                     source="Calculated in app"
@@ -2571,18 +2888,29 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                     api="TikTok API: none (computed from orders + statement fee rollups)"
                   />
                 </div>
-                <p className={`text-2xl font-bold ${financials.grossProfit >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                  {financials.grossProfit < 0 ? '-' : ''}{formatCurrency(financials.grossProfit)}
-                </p>
-                <p className="text-xs text-gray-500 mt-1">Profit after COGS & affiliate commissions</p>
+                {isRestricted('gross_profit') ? (
+                  <>
+                    <p className="text-2xl font-bold text-gray-400">Restricted</p>
+                    <p className="text-xs text-gray-500 mt-1">Hidden by seller visibility policy</p>
+                  </>
+                ) : (
+                  <>
+                    <p className={`text-2xl font-bold ${plSignedMetricClass(financials.grossProfit)}`}>
+                      {financials.grossProfit < 0 ? '-' : ''}{formatCurrency(financials.grossProfit)}
+                    </p>
+                    <p className="text-xs brand-muted mt-1">Profit after COGS & affiliate commissions</p>
+                  </>
+                )}
               </div>
 
               {/* Gross Margin */}
-              <div className="bg-gray-800/50 rounded-lg p-5 border border-gray-700">
+              <div className="brand-card rounded-lg p-5">
                 <div className="flex items-center justify-between gap-2 mb-3">
                   <div className="flex items-center gap-3 min-w-0">
-                    <Percent className="w-5 h-5 text-cyan-400 shrink-0" />
-                    <p className="text-gray-400 text-sm font-medium truncate">Gross Margin</p>
+                    <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${plSemanticToIconTileClass(canViewMargin ? plSignedPctClass(financials.grossMargin) : 'brand-muted')}`}>
+                      <Percent className="w-5 h-5 shrink-0" />
+                    </div>
+                    <p className="brand-muted text-sm font-medium truncate">Gross Margin</p>
                   </div>
                   <CalculationTooltip
                     source="Calculated in app"
@@ -2590,70 +2918,105 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                     api="TikTok API: none (computed)"
                   />
                 </div>
-                <p className={`text-2xl font-bold ${financials.grossMargin >= 20 ? 'text-emerald-400' : financials.grossMargin >= 0 ? 'text-yellow-400' : 'text-red-400'}`}>
-                  {financials.grossMargin.toFixed(1)}%
-                </p>
-                <p className="text-xs text-gray-500 mt-1">Gross Profit ÷ Net Revenue</p>
+                {canViewMargin ? (
+                  <>
+                    <p className={`text-2xl font-bold ${plSignedPctClass(financials.grossMargin)}`}>
+                      {financials.grossMargin.toFixed(1)}%
+                    </p>
+                    <p className="text-xs brand-muted mt-1">Gross Profit ÷ Net Revenue</p>
+                  </>
+                ) : (
+                  <>
+                    <p className="text-2xl font-bold text-gray-400">Restricted</p>
+                    <p className="text-xs text-gray-500 mt-1">Margin visibility restricted by seller policy</p>
+                  </>
+                )}
               </div>
 
               {/* Net Profit $ */}
-              <div className="bg-gray-800/50 rounded-lg p-5 border border-gray-700">
+              <div className="brand-card rounded-lg p-5">
                 <div className="flex items-center gap-3 mb-3">
-                  {netProfit >= 0 ? (
-                    <TrendingUp className="w-5 h-5 text-emerald-400" />
-                  ) : (
-                    <TrendingDown className="w-5 h-5 text-red-400" />
-                  )}
-                  <p className="text-gray-400 text-sm font-medium">Net Profit</p>
+                  <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${plSemanticToIconTileClass(isRestricted('net_profit') ? 'brand-muted' : plSignedMetricClass(netProfit))}`}>
+                    {netProfit > PL_AMOUNT_EPS ? (
+                      <TrendingUp className="w-5 h-5 shrink-0" />
+                    ) : netProfit < -PL_AMOUNT_EPS ? (
+                      <TrendingDown className="w-5 h-5 shrink-0" />
+                    ) : (
+                      <Minus className="w-5 h-5 shrink-0" />
+                    )}
+                  </div>
+                  <p className="brand-muted text-sm font-medium">Net Profit</p>
                 </div>
-                <p className={`text-2xl font-bold ${netProfit >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                  {netProfit < 0 ? '-' : ''}{formatCurrency(netProfit)}
-                </p>
-                <p className="text-xs text-gray-500 mt-1">Net revenue after all expenses</p>
+                {isRestricted('net_profit') ? (
+                  <>
+                    <p className="text-2xl font-bold text-gray-400">Restricted</p>
+                    <p className="text-xs text-gray-500 mt-1">Hidden by seller visibility policy</p>
+                  </>
+                ) : (
+                  <>
+                    <p className={`text-2xl font-bold ${plSignedMetricClass(netProfit)}`}>
+                      {netProfit < 0 ? '-' : ''}{formatCurrency(netProfit)}
+                    </p>
+                    <p className="text-xs brand-muted mt-1">Net revenue after all expenses</p>
+                  </>
+                )}
               </div>
 
               {/* Net Profit % */}
-              <div className="bg-gray-800/50 rounded-lg p-5 border border-gray-700">
+              <div className="brand-card rounded-lg p-5">
                 <div className="flex items-center gap-3 mb-3">
-                  <PieChart className="w-5 h-5 text-emerald-400" />
-                  <p className="text-gray-400 text-sm font-medium">Net Profit %</p>
+                  <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${plSemanticToIconTileClass(isRestricted('net_profit') ? 'brand-muted' : plSignedPctClass(operatingIncomePct))}`}>
+                    <PieChart className="w-5 h-5 shrink-0" />
+                  </div>
+                  <p className="brand-muted text-sm font-medium">Net Profit %</p>
                 </div>
-                <p className={`text-2xl font-bold ${operatingIncomePct >= 10 ? 'text-green-400' : operatingIncomePct >= 0 ? 'text-yellow-400' : 'text-red-400'}`}>
-                  {operatingIncomePct.toFixed(1)}%
-                </p>
-                <p className="text-xs text-gray-500 mt-1">Net Profit ÷ Net Revenue</p>
+                {isRestricted('net_profit') ? (
+                  <>
+                    <p className="text-2xl font-bold text-gray-400">Restricted</p>
+                    <p className="text-xs text-gray-500 mt-1">Hidden by seller visibility policy</p>
+                  </>
+                ) : (
+                  <>
+                    <p className={`text-2xl font-bold ${plSignedPctClass(operatingIncomePct)}`}>
+                      {operatingIncomePct.toFixed(1)}%
+                    </p>
+                    <p className="text-xs brand-muted mt-1">Net Profit ÷ Net Revenue</p>
+                  </>
+                )}
               </div>
 
             </div>
           </div>
 
           {/* ═══════════════════ PROFITABILITY CALCULATOR ═══════════════════ */}
-          <div className="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
+          <div className="brand-card rounded-xl overflow-hidden">
             {/* Header — always visible */}
             <button
+              type="button"
               onClick={() => setCalcOpen(!calcOpen)}
-              className="w-full flex items-center justify-between p-6 hover:bg-gray-750 transition-colors"
+              className="w-full flex items-center justify-between p-6 transition-colors brand-row-hover rounded-none"
             >
               <div className="flex items-center gap-3">
-                <div className="p-2 bg-gradient-to-r from-indigo-500 to-purple-500 rounded-lg">
-                  <SlidersHorizontal className="w-5 h-5 text-white" />
+                <div className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0 brand-icon-tile-neutral">
+                  <SlidersHorizontal className="w-5 h-5 shrink-0" />
                 </div>
                 <div className="text-left">
-                  <h3 className="text-lg font-semibold text-white">Profitability Calculator</h3>
-                  <p className="text-sm text-gray-400">Adjust variables to find your break-even & profit targets</p>
+                  <h3 className="text-lg font-semibold brand-text">Profitability Calculator</h3>
+                  <p className="text-sm brand-muted">Adjust variables to find your break-even & profit targets</p>
                 </div>
               </div>
-              {calcOpen ? <ChevronUp className="w-5 h-5 text-gray-400" /> : <ChevronDown className="w-5 h-5 text-gray-400" />}
+              {calcOpen ? <ChevronUp className="w-5 h-5 brand-muted" /> : <ChevronDown className="w-5 h-5 brand-muted" />}
             </button>
 
             {/* Collapsible body */}
             {calcOpen && (
-              <div className="border-t border-gray-700 p-6 space-y-6">
+              <div className="border-t p-6 space-y-6" style={{ borderColor: 'var(--brand-card-border)' }}>
                 {/* Reset button */}
                 <div className="flex justify-end">
                   <button
+                    type="button"
                     onClick={resetCalculator}
-                    className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-gray-400 hover:text-white bg-gray-700/50 hover:bg-gray-700 rounded-lg transition-colors"
+                    className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium brand-muted hover:brand-text rounded-lg transition-colors brand-card border"
                   >
                     <RotateCcw className="w-3.5 h-3.5" />
                     Reset to Actual
@@ -2663,9 +3026,9 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                 {/* Slider Groups */}
                 <div className="space-y-5">
                   {/* Per-Unit Economics */}
-                  <div className="bg-gray-900/50 rounded-lg p-4 border border-gray-700/50">
-                    <h4 className="text-sm font-semibold text-gray-300 mb-4 flex items-center gap-2">
-                      <DollarSign className="w-4 h-4 text-indigo-400" />
+                  <div className="brand-card rounded-lg p-4">
+                    <h4 className="text-sm font-semibold brand-text mb-4 flex items-center gap-2">
+                      <DollarSign className="w-4 h-4 brand-muted" />
                       Per-Unit Economics
                     </h4>
                     <div className="space-y-4">
@@ -2695,9 +3058,9 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                   </div>
 
                   {/* Volume */}
-                  <div className="bg-gray-900/50 rounded-lg p-4 border border-gray-700/50">
-                    <h4 className="text-sm font-semibold text-gray-300 mb-4 flex items-center gap-2">
-                      <Package className="w-4 h-4 text-indigo-400" />
+                  <div className="brand-card rounded-lg p-4">
+                    <h4 className="text-sm font-semibold brand-text mb-4 flex items-center gap-2">
+                      <Package className="w-4 h-4 brand-muted" />
                       Volume
                     </h4>
                     <div className="space-y-4">
@@ -2725,9 +3088,9 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                   </div>
 
                   {/* Costs & Revenue */}
-                  <div className="bg-gray-900/50 rounded-lg p-4 border border-gray-700/50">
-                    <h4 className="text-sm font-semibold text-gray-300 mb-4 flex items-center gap-2">
-                      <Wallet className="w-4 h-4 text-indigo-400" />
+                  <div className="brand-card rounded-lg p-4">
+                    <h4 className="text-sm font-semibold brand-text mb-4 flex items-center gap-2">
+                      <Wallet className="w-4 h-4 brand-muted" />
                       Revenue & Costs
                     </h4>
                     <div className="space-y-4">
@@ -2768,17 +3131,13 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                   </div>
                 </div>
 
-                {/* Simulated Results */}
-                <div className={`rounded-xl p-5 border ${simulatedPL.isProfitable
-                  ? 'bg-gradient-to-r from-green-500/10 to-emerald-500/10 border-green-500/30'
-                  : 'bg-gradient-to-r from-red-500/10 to-pink-500/10 border-red-500/30'
-                  }`}>
-                  <div className="flex items-center justify-between mb-4">
-                    <h4 className="text-sm font-semibold text-white">Simulated P&L</h4>
-                    <span className={`px-3 py-1 rounded-full text-xs font-bold ${simulatedPL.isProfitable
-                      ? 'bg-green-500/20 text-green-400'
-                      : 'bg-red-500/20 text-red-400'
-                      }`}>
+                {/* Simulated Results — brand-card avoids agency secondary-card accent floods */}
+                <div className="brand-card rounded-xl p-5 border">
+                  <div className="flex items-center justify-between mb-4 gap-3 flex-wrap">
+                    <h4 className="text-sm font-semibold brand-text">Simulated P&L</h4>
+                    <span
+                      className={`px-3 py-1 rounded-full text-xs font-bold shrink-0 ${simulatedPL.isProfitable ? 'brand-state-success' : 'brand-state-danger'}`}
+                    >
                       {simulatedPL.isProfitable ? 'PROFITABLE' : 'AT LOSS'}
                     </span>
                   </div>
@@ -2788,44 +3147,42 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                       value={simulatedPL.revenue}
                       delta={simulatedPL.revenueDelta}
                       formatValue={formatCurrency}
-                      color="text-green-400"
+                      variant="signed"
                     />
                     <SimResultCard
                       label="COGS"
                       value={simulatedPL.cogs}
                       delta={simulatedPL.cogsDelta}
                       formatValue={formatCurrency}
-                      color="text-orange-400"
-                      isExpense
+                      variant="expense"
                     />
                     <SimResultCard
                       label="Gross Profit"
                       value={simulatedPL.grossProfit}
                       delta={simulatedPL.grossProfitDelta}
                       formatValue={formatCurrency}
-                      color={simulatedPL.grossProfit >= 0 ? 'text-blue-400' : 'text-red-400'}
+                      variant="signed"
                     />
                     <SimResultCard
                       label="Expenses"
                       value={simulatedPL.totalExpenses}
                       delta={simulatedPL.totalExpenses - totalExpenses}
                       formatValue={formatCurrency}
-                      color="text-red-400"
-                      isExpense
+                      variant="expense"
                     />
                     <SimResultCard
                       label="Net Profit"
                       value={simulatedPL.netProfit}
                       delta={simulatedPL.netProfitDelta}
                       formatValue={formatCurrency}
-                      color={simulatedPL.netProfit >= 0 ? 'text-green-400' : 'text-red-400'}
+                      variant="signed"
                     />
                     <SimResultCard
                       label="Net Margin"
                       value={simulatedPL.margin}
                       delta={simulatedPL.marginDelta}
                       formatValue={(n) => `${n.toFixed(1)}%`}
-                      color={simulatedPL.margin >= 0 ? 'text-green-400' : 'text-red-400'}
+                      variant="percent"
                     />
                   </div>
                 </div>
@@ -2902,7 +3259,7 @@ function CalcSlider({ label, value, actual, onChange, min, max, step, prefix, fo
           </div>
           {/* Delta badge */}
           {hasDelta && (
-            <span className={`text-xs font-medium px-1.5 py-0.5 rounded ${delta > 0 ? 'text-green-400 bg-green-500/10' : 'text-red-400 bg-red-500/10'}`}>
+            <span className={`text-xs font-medium px-1.5 py-0.5 rounded ${delta > 0 ? 'brand-profit bg-black/15' : 'brand-loss bg-black/15'}`}>
               {delta > 0 ? '+' : ''}{prefix === '$' ? formatValue(Math.abs(delta)) : delta.toFixed(step < 1 ? 2 : 0)}
               {delta > 0 && prefix === '$' ? '' : ''}
             </span>
@@ -2917,12 +3274,12 @@ function CalcSlider({ label, value, actual, onChange, min, max, step, prefix, fo
         min={min}
         max={max}
         step={step}
-        className="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-pink-500
+        className="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-gray-400
           [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:h-4
-          [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-pink-500 [&::-webkit-slider-thumb]:cursor-pointer
-          [&::-webkit-slider-thumb]:shadow-[0_0_6px_rgba(236,72,153,0.5)]
+          [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-gray-400 [&::-webkit-slider-thumb]:cursor-pointer
+          [&::-webkit-slider-thumb]:shadow-[0_0_6px_rgb(156_163_175_/_0.35)]
           [&::-moz-range-thumb]:w-4 [&::-moz-range-thumb]:h-4 [&::-moz-range-thumb]:rounded-full
-          [&::-moz-range-thumb]:bg-pink-500 [&::-moz-range-thumb]:border-0 [&::-moz-range-thumb]:cursor-pointer"
+          [&::-moz-range-thumb]:bg-gray-400 [&::-moz-range-thumb]:border-0 [&::-moz-range-thumb]:cursor-pointer"
       />
       {/* Min/Max labels */}
       <div className="flex justify-between text-xs text-gray-600">
@@ -2939,25 +3296,32 @@ interface SimResultCardProps {
   value: number;
   delta: number;
   formatValue: (n: number) => string;
-  color: string;
-  isExpense?: boolean;
+  variant: 'signed' | 'expense' | 'percent';
 }
 
-function SimResultCard({ label, value, delta, formatValue, color, isExpense }: SimResultCardProps) {
+function SimResultCard({ label, value, delta, formatValue, variant }: SimResultCardProps) {
   const hasDelta = Math.abs(delta) > 0.01;
-  // For expenses, a decrease (negative delta) is good
-  const deltaIsGood = isExpense ? delta < 0 : delta > 0;
+  const deltaIsGood = variant === 'expense' ? delta < 0 : delta > 0;
+  const valueClass =
+    variant === 'expense'
+      ? plExpenseMetricClass(value)
+      : variant === 'percent'
+        ? plSignedPctClass(value)
+        : plSignedMetricClass(value);
+  const deltaSemantic = deltaIsGood ? plSignedMetricClass(1) : plSignedMetricClass(-1);
+  const deltaText =
+    variant === 'percent'
+      ? formatValue(delta)
+      : `${delta > 0 ? '+' : delta < 0 ? '−' : ''}${formatValue(Math.abs(delta))}`;
 
   return (
-    <div className="bg-gray-800/50 rounded-lg p-3 border border-gray-700/50">
-      <p className="text-xs text-gray-400 mb-1">{label}</p>
-      <p className={`text-lg font-bold ${color}`}>
+    <div className="brand-card rounded-lg p-3">
+      <p className="text-xs brand-muted mb-1">{label}</p>
+      <p className={`text-lg font-bold ${valueClass}`}>
         {value < 0 ? '-' : ''}{formatValue(Math.abs(value))}
       </p>
       {hasDelta && (
-        <p className={`text-xs font-medium mt-0.5 ${deltaIsGood ? 'text-green-400' : 'text-red-400'}`}>
-          {delta > 0 ? '+' : ''}{formatValue(delta)}
-        </p>
+        <p className={`text-xs font-medium mt-0.5 ${deltaSemantic}`}>{deltaText}</p>
       )}
     </div>
   );

@@ -79,56 +79,56 @@ export function NotificationsView() {
     const getIcon = (category: string) => {
         switch (category) {
             case 'Order':
-                return <ShoppingBag className="w-5 h-5 text-emerald-400" />;
+                return <ShoppingBag className="w-5 h-5" style={{ color: 'var(--brand-success-text)' }} />;
             case 'Customer Service':
-                return <MessageSquare className="w-5 h-5 text-blue-400" />;
+                return <MessageSquare className="w-5 h-5" style={{ color: 'var(--brand-info-text)' }} />;
             case 'Fulfillment':
-                return <Package className="w-5 h-5 text-amber-400" />;
+                return <Package className="w-5 h-5" style={{ color: 'var(--brand-warning-text)' }} />;
             case 'Reverse':
-                return <RefreshCcw className="w-5 h-5 text-rose-400" />;
+                return <RefreshCcw className="w-5 h-5" style={{ color: 'var(--brand-danger-text)' }} />;
             default:
-                return <Bell className="w-5 h-5 text-indigo-400" />;
+                return <Bell className="w-5 h-5" style={{ color: 'var(--brand-secondary)' }} />;
         }
     };
 
     const getBgColor = (category: string) => {
         switch (category) {
-            case 'Order': return 'bg-emerald-500/20';
-            case 'Customer Service': return 'bg-blue-500/20';
-            case 'Fulfillment': return 'bg-amber-500/20';
-            case 'Reverse': return 'bg-rose-500/20';
-            default: return 'bg-indigo-500/20';
+            case 'Order': return 'var(--brand-success-bg)';
+            case 'Customer Service': return 'var(--brand-info-bg)';
+            case 'Fulfillment': return 'var(--brand-warning-bg)';
+            case 'Reverse': return 'var(--brand-danger-bg)';
+            default: return 'var(--brand-secondary-card-bg)';
         }
     };
 
     return (
         <>
         <div className="space-y-6 max-w-5xl mx-auto">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-gray-900 border border-gray-800 rounded-2xl p-6">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 brand-card rounded-2xl p-6">
                 <div>
-                    <h1 className="text-2xl font-bold text-white flex items-center gap-3">
-                        <Bell className="w-6 h-6 text-pink-500" />
+                    <h1 className="text-2xl font-bold brand-text flex items-center gap-3">
+                        <Bell className="w-6 h-6" style={{ color: 'var(--brand-primary)' }} />
                         Today's Notifications
                         {unreadCount > 0 && (
-                            <span className="bg-pink-500 text-white text-sm font-bold px-2.5 py-0.5 rounded-full">
+                            <span className="text-sm font-bold px-2.5 py-0.5 rounded-full brand-on-primary" style={{ backgroundColor: 'var(--brand-primary)' }}>
                                 {unreadCount} new
                             </span>
                         )}
                     </h1>
-                    <p className="text-sm text-gray-400 mt-1">Real-time updates and alerts from TikTok Shop</p>
+                    <p className="text-sm brand-muted mt-1">Real-time updates and alerts from TikTok Shop</p>
                 </div>
                 
                 <div className="flex flex-wrap items-center gap-3">
-                    <div className="bg-gray-800 rounded-lg p-1 border border-gray-700 flex">
+                    <div className="brand-toolbar rounded-lg p-1 flex">
                         <button
                             onClick={() => setFilter('all')}
-                            className={`px-4 py-1.5 text-sm font-medium rounded-md transition-colors ${filter === 'all' ? 'bg-gray-700 text-white shadow' : 'text-gray-400 hover:text-gray-200'}`}
+                            className={`px-4 py-1.5 text-sm font-medium rounded-md transition-colors ${filter === 'all' ? 'brand-card brand-text shadow' : 'brand-muted brand-nav-idle'}`}
                         >
                             All
                         </button>
                         <button
                             onClick={() => setFilter('unread')}
-                            className={`px-4 py-1.5 text-sm font-medium rounded-md transition-colors ${filter === 'unread' ? 'bg-gray-700 text-white shadow' : 'text-gray-400 hover:text-gray-200'}`}
+                            className={`px-4 py-1.5 text-sm font-medium rounded-md transition-colors ${filter === 'unread' ? 'brand-card brand-text shadow' : 'brand-muted brand-nav-idle'}`}
                         >
                             Unread
                         </button>
@@ -144,8 +144,8 @@ export function NotificationsView() {
                             disabled={isTogglingPause}
                             className={`flex items-center gap-2 px-4 py-2 border rounded-lg transition-all text-sm font-medium ${
                                 isPaused 
-                                ? 'bg-amber-500/10 border-amber-500/50 text-amber-400 hover:bg-amber-500/20' 
-                                : 'bg-gray-800 border-gray-700 text-gray-300 hover:text-white hover:bg-gray-700'
+                                ? 'brand-state-warning' 
+                                : 'brand-card brand-text brand-card-hover'
                             } ${isTogglingPause ? 'opacity-50 cursor-wait' : ''}`}
                             title={isPaused ? "Resume system webhooks" : "Stop receiving system webhooks"}
                         >
@@ -160,7 +160,7 @@ export function NotificationsView() {
                         {unreadCount > 0 && (
                             <button
                                 onClick={() => markAllAsRead()}
-                                className="flex items-center gap-2 px-4 py-2 bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-300 hover:text-white rounded-lg transition-colors text-sm font-medium"
+                                className="flex items-center gap-2 px-4 py-2 brand-card brand-text brand-card-hover rounded-lg transition-colors text-sm font-medium"
                             >
                                 <CheckCheck className="w-4 h-4" />
                                 Mark all read
@@ -179,8 +179,8 @@ export function NotificationsView() {
                                 disabled={isDeleting}
                                 className={`flex items-center gap-2 px-4 py-2 border rounded-lg transition-all text-sm font-medium ${
                                     isDeleting
-                                    ? 'bg-gray-800 border-gray-700 text-gray-500 cursor-not-allowed'
-                                    : 'bg-rose-500/10 hover:bg-rose-500/20 border-rose-500/50 text-rose-400 hover:text-rose-300'
+                                    ? 'brand-card brand-muted cursor-not-allowed'
+                                    : 'brand-state-danger'
                                 }`}
                             >
                                 {isDeleting ? (
@@ -197,21 +197,21 @@ export function NotificationsView() {
 
             <div className="space-y-3">
                 {isPaused && (
-                    <div className="bg-amber-500/10 border border-amber-500/20 rounded-2xl p-4 flex items-center gap-3">
-                        <Pause className="w-5 h-5 text-amber-500" />
-                        <div className="text-sm text-amber-200">
+                    <div className="brand-state-warning rounded-2xl p-4 flex items-center gap-3">
+                        <Pause className="w-5 h-5" style={{ color: 'var(--brand-warning-text)' }} />
+                        <div className="text-sm">
                             <strong>System is Paused</strong>: Incoming TikTok webhooks are currently being discarded by the server. Resume to start receiving real-time updates again.
                         </div>
                     </div>
                 )}
 
                 {filteredNotifications.length === 0 ? (
-                    <div className="bg-gray-900 border border-gray-800 rounded-2xl py-12 flex flex-col items-center justify-center text-center">
-                        <div className="w-16 h-16 bg-gray-800 rounded-full flex items-center justify-center mb-4 border border-gray-700">
-                            <Bell className="w-7 h-7 text-gray-500" />
+                    <div className="brand-card rounded-2xl py-12 flex flex-col items-center justify-center text-center">
+                        <div className="w-16 h-16 brand-toolbar rounded-full flex items-center justify-center mb-4">
+                            <Bell className="w-7 h-7 brand-muted" />
                         </div>
-                        <h3 className="text-lg font-medium text-white mb-1">No notifications found</h3>
-                        <p className="text-sm text-gray-400">You're all caught up! Real-time events will appear here.</p>
+                        <h3 className="text-lg font-medium brand-text mb-1">No notifications found</h3>
+                        <p className="text-sm brand-muted">You're all caught up! Real-time events will appear here.</p>
                     </div>
                 ) : (
                     paginatedNotifications.map((notif) => {
@@ -250,40 +250,40 @@ export function NotificationsView() {
                                 }}
                                 className={`relative flex items-start gap-4 p-5 rounded-2xl border transition-all cursor-pointer group ${
                                     notif.is_read 
-                                    ? 'bg-gray-900/40 border-gray-800/40 hover:bg-gray-800/40 hover:border-gray-700/40' 
-                                    : 'bg-gray-900 border-gray-700 shadow-lg hover:bg-gray-800 hover:border-pink-500/30'
+                                    ? 'brand-card opacity-70 brand-card-hover' 
+                                    : 'brand-card shadow-lg brand-card-hover'
                                 }`}
                             >
                                 {isLoadingOrderId === notif.raw_payload?.data?.order_id && (
-                                    <div className="absolute inset-0 bg-gray-900/50 backdrop-blur-sm rounded-2xl flex items-center justify-center z-10">
-                                        <div className="w-8 h-8 border-2 border-pink-500 border-t-transparent rounded-full animate-spin" />
+                                    <div className="absolute inset-0 rounded-2xl flex items-center justify-center z-10" style={{ backgroundColor: 'color-mix(in srgb, var(--brand-bg) 72%, transparent)' }}>
+                                        <div className="w-8 h-8 border-2 border-t-transparent rounded-full animate-spin" style={{ borderColor: 'var(--brand-primary)', borderTopColor: 'transparent' }} />
                                     </div>
                                 )}
-                                <div className={`w-12 h-12 shrink-0 rounded-full flex items-center justify-center ${getBgColor(notif.category)}`}>
+                                <div className="w-12 h-12 shrink-0 rounded-full flex items-center justify-center" style={{ backgroundColor: getBgColor(notif.category) }}>
                                     {getIcon(notif.category)}
                                 </div>
                                 
                                 <div className="flex-1 min-w-0">
                                     <div className="flex items-start justify-between gap-4 mb-1">
-                                        <h4 className={`text-base font-semibold truncate group-hover:text-pink-400 transition-colors ${notif.is_read ? 'text-gray-400' : 'text-gray-100'}`}>
+                                        <h4 className={`text-base font-semibold truncate transition-colors ${notif.is_read ? 'brand-muted' : 'brand-text'}`}>
                                             {notif.title}
                                         </h4>
-                                        <span className="text-xs text-gray-500 shrink-0 whitespace-nowrap">
+                                        <span className="text-xs brand-muted shrink-0 whitespace-nowrap">
                                             {formatDistanceToNow(new Date(notif.created_at), { addSuffix: true })}
                                         </span>
                                     </div>
-                                    <p className={`text-sm mb-3 ${notif.is_read ? 'text-gray-500' : 'text-gray-300'}`}>
+                                    <p className={`text-sm mb-3 ${notif.is_read ? 'brand-muted' : 'brand-text'}`}>
                                         {notif.message}
                                     </p>
 
                                     {/* Timestamp Section */}
                                     <div className="flex flex-wrap items-center gap-2 mb-4">
-                                        <div className="flex items-center gap-1 text-[10px] text-gray-500 bg-gray-800/50 px-2 py-0.5 rounded border border-gray-700/30">
+                                        <div className="flex items-center gap-1 text-[10px] brand-muted brand-card px-2 py-0.5 rounded">
                                             <span>Received:</span>
-                                            <span className="font-medium text-gray-400">{formatShopDateTime(notif.created_at, tz)}</span>
+                                            <span className="font-medium brand-text">{formatShopDateTime(notif.created_at, tz)}</span>
                                         </div>
                                         {notif.raw_payload?.data?.update_time && (
-                                            <div className="flex items-center gap-1 text-[10px] text-pink-400/90 bg-pink-500/10 px-2 py-0.5 rounded border border-pink-500/20">
+                                            <div className="flex items-center gap-1 text-[10px] px-2 py-0.5 rounded brand-primary-card">
                                                 <span>Event Time:</span>
                                                 <span className="font-semibold">{formatShopDateTime(notif.raw_payload.data.update_time * 1000, tz)}</span>
                                             </div>
@@ -291,7 +291,7 @@ export function NotificationsView() {
                                     </div>
                                 
                                     <div className="mt-auto flex items-center gap-3">
-                                        <span className="text-xs font-semibold tracking-wide px-2.5 py-1 bg-gray-800 border border-gray-700 rounded-md text-gray-400 group-hover:border-gray-600 transition-colors">
+                                        <span className="text-xs font-semibold tracking-wide px-2.5 py-1 rounded-md brand-card brand-muted transition-colors">
                                             {notif.category.toUpperCase()}
                                         </span>
                                         
@@ -301,7 +301,8 @@ export function NotificationsView() {
                                                     e.stopPropagation();
                                                     markAsRead(notif.id);
                                                 }}
-                                                className="flex items-center gap-1.5 text-xs font-medium text-pink-400 hover:text-pink-300 transition-colors"
+                                                className="flex items-center gap-1.5 text-xs font-medium transition-colors"
+                                                style={{ color: 'var(--brand-primary)' }}
                                             >
                                                 <Check className="w-3.5 h-3.5" />
                                                 Mark as read
@@ -311,7 +312,7 @@ export function NotificationsView() {
                                 </div>
                                 
                                 {!notif.is_read && (
-                                    <div className="w-2.5 h-2.5 rounded-full bg-pink-500 shrink-0 mt-2 shadow-[0_0_8px_rgba(236,72,153,0.8)]" />
+                                    <div className="w-2.5 h-2.5 rounded-full shrink-0 mt-2" style={{ backgroundColor: 'var(--brand-primary)' }} />
                                 )}
                             </div>
                         );
@@ -320,21 +321,21 @@ export function NotificationsView() {
             </div>
 
             {totalPages > 1 && (
-                <div className="flex items-center justify-between bg-gray-900 border border-gray-800 rounded-2xl p-4 mt-6">
+                <div className="flex items-center justify-between brand-card rounded-2xl p-4 mt-6">
                     <button
                         onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
                         disabled={currentPage === 1}
-                        className="px-4 py-2 text-sm font-medium border border-gray-700 rounded-lg disabled:opacity-50 text-white hover:bg-gray-800 transition-colors"
+                        className="px-4 py-2 text-sm font-medium rounded-lg disabled:opacity-50 brand-card brand-text brand-card-hover transition-colors"
                     >
                         Previous
                     </button>
-                    <span className="text-sm text-gray-400">
-                        Page <strong className="text-white">{currentPage}</strong> of <strong className="text-white">{totalPages}</strong>
+                    <span className="text-sm brand-muted">
+                        Page <strong className="brand-text">{currentPage}</strong> of <strong className="brand-text">{totalPages}</strong>
                     </span>
                     <button
                         onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
                         disabled={currentPage === totalPages}
-                        className="px-4 py-2 text-sm font-medium border border-gray-700 rounded-lg disabled:opacity-50 text-white hover:bg-gray-800 transition-colors"
+                        className="px-4 py-2 text-sm font-medium rounded-lg disabled:opacity-50 brand-card brand-text brand-card-hover transition-colors"
                     >
                         Next
                     </button>

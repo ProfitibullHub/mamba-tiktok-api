@@ -2,6 +2,7 @@ import type { Request } from 'express';
 import { supabase } from '../config/supabase.js';
 import { auditLog } from './audit-logger.js';
 import { resolveRequestTenantContext, type RequestTenantContext, userCanAccessAccount, userIsPlatformSuperAdmin } from '../middleware/account-access.middleware.js';
+import { statusDisablesTenantAccess } from './tenant-lifecycle.service.js';
 
 export type AuthorizationContext = RequestTenantContext & {
     effectivePermissions: Set<string>;
@@ -50,6 +51,20 @@ async function featureAllowed(tenantId: string, featureKey: string): Promise<boo
     return data === true;
 }
 
+async function resolveFeatureTenantId(
+    contextTenantId: string,
+    accountId?: string
+): Promise<string> {
+    if (!accountId) return contextTenantId;
+    const { data, error } = await supabase.from('accounts').select('tenant_id').eq('id', accountId).maybeSingle();
+    if (error) {
+        console.error('[authz] resolve feature tenant from account', error.message);
+        return contextTenantId;
+    }
+    const tenantId = typeof data?.tenant_id === 'string' ? data.tenant_id : null;
+    return tenantId || contextTenantId;
+}
+
 async function logDenied(req: Request, options: AuthorizeOptions, reason: string, context?: AuthorizationContext): Promise<void> {
     await auditLog(req, {
         action: options.denyAction || 'permission.denied',
@@ -81,6 +96,11 @@ export async function authorize(req: Request, options: AuthorizeOptions): Promis
         return { allowed: false, status: 401, reason: 'Authorization required' };
     }
 
+    if (statusDisablesTenantAccess(context.tenantStatus)) {
+        await logDenied(req, options, 'tenant_inactive_or_suspended', context);
+        return { allowed: false, status: 403, reason: 'Access blocked while tenant is inactive or suspended', context };
+    }
+
     // Platform super admins bypass tenant-scoped RBAC + plan entitlements.
     // Their role is global and should never be blocked by account tenant feature flags.
     if (await userIsPlatformSuperAdmin(context.userId)) {
@@ -106,7 +126,10 @@ export async function authorize(req: Request, options: AuthorizeOptions): Promis
     }
 
     if (options.featureKey) {
-        const allowed = await featureAllowed(context.tenantId, options.featureKey);
+        // For account-scoped routes, entitlement must be evaluated on the owning seller tenant
+        // (accounts.tenant_id), not the caller's current profile tenant.
+        const featureTenantId = await resolveFeatureTenantId(context.tenantId, options.accountId);
+        const allowed = await featureAllowed(featureTenantId, options.featureKey);
         if (!allowed) {
             await logDenied(req, options, 'plan_entitlement_denied', context);
             return { allowed: false, status: 403, reason: `Plan does not allow: ${options.featureKey}`, context };

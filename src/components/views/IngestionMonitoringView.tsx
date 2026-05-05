@@ -17,7 +17,7 @@ import {
     ListFilter,
     PanelRightOpen,
 } from 'lucide-react';
-import { apiFetch, getAccessTokenForApi } from '../../lib/apiClient';
+import { apiFetch, getAccessTokenForApi, getApiOrigin } from '../../lib/apiClient';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -234,8 +234,7 @@ function useLiveLogStream(enabled: boolean) {
         setConnected(false);
 
         const token = await getAccessTokenForApi();
-        const base = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001';
-        const url = `${base}/api/tiktok-shop/sync/monitoring/log-stream?since=${encodeURIComponent(cursorRef.current)}`;
+        const url = `${getApiOrigin()}/api/tiktok-shop/sync/monitoring/log-stream?since=${encodeURIComponent(cursorRef.current)}`;
 
         let response: Response;
         try {

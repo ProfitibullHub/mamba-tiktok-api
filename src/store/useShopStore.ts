@@ -2,12 +2,12 @@ import { create } from 'zustand';
 import { calculateOrderGMV } from '../utils/gmvCalculations';
 import { DEFAULT_SYNC_DAYS, getInitialLoadDaysWithBuffer, DEFAULT_LOAD_DAYS } from '../config/dataRetention';
 import { supabase, AffiliateSettlement, AgencyFee } from '../lib/supabase';
-import { getAccessTokenForApi } from '../lib/apiClient';
+import { getAccessTokenForApi, getApiOrigin } from '../lib/apiClient';
 import { reportClientError } from '../lib/observability';
 import { getUtcCalendarRangeExclusiveUnix, nextCalendarDayISO, previousCalendarDayISO } from '../utils/dateUtils';
 import { mapDbOrderToStore } from '../utils/mapDbOrderToStore';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001';
+const API_BASE_URL = getApiOrigin();
 
 async function sleep(ms: number): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, ms));
@@ -102,6 +102,20 @@ let pendingShopDataRequest: {
     startDate?: string;
     endDate?: string;
 } | null = null;
+
+/** Bumped on shop switches so in-flight HTTP merges can detect staleness (fixes wrong-shop flash when navigating mid-fetch). */
+let shopDataFetchEpoch = 0;
+function bumpShopDataFetchEpoch(reason: string) {
+    shopDataFetchEpoch++;
+    console.log(`[Store] shopDataFetchEpoch bump (${reason}) → ${shopDataFetchEpoch}`);
+}
+
+/** Last successful P&L HTTP per `${accountId}:${shopId}:${start}:${end}` — skips repeat requests after console ↔ shop hops while cache still warm. */
+const PL_FETCH_NETWORK_COOLDOWN_MS = 30 * 60 * 1000;
+const lastPlNetworkSuccessAtMs = new Map<string, number>();
+
+/** Concurrent P&L HTTP requests — replaces a single boolean so one shop finishing does not clear `plFetchInFlight` for another. */
+let plDataHttpInflightDepth = 0;
 
 /** Civil calendar add for YYYY-MM-DD (avoids UTC/local drift from `new Date('YYYY-MM-DD')` in gap-fetch math). */
 function addDaysToISODate(iso: string, deltaDays: number): string {
@@ -337,6 +351,23 @@ interface SyncProgress {
     settlementsTotal?: number;
 }
 
+/** Reset baseline — avoids stale TikTok/order-batch UI bleeding across shops (single global syncProgress). */
+const IDLE_SYNC_PROGRESS: SyncProgress = {
+    isActive: false,
+    isFirstSync: false,
+    currentStep: 'idle',
+    message: '',
+    ordersComplete: false,
+    productsComplete: false,
+    settlementsComplete: false,
+    ordersFetched: 0,
+    ordersTotal: undefined,
+    productsFetched: 0,
+    productsTotal: undefined,
+    settlementsFetched: 0,
+    settlementsTotal: undefined,
+};
+
 export interface Warehouse {
     id: string;
     name: string;
@@ -395,6 +426,15 @@ interface ShopState {
         endDate: string | null;
     };
     syncProgress: SyncProgress;
+    /** Shop whose sync/order-batch progress `syncProgress` describes (null when idle). */
+    syncProgressShopId: string | null;
+    /** Shop currently loading shop-data for `fetchDateRange` / `isFetchingDateRange`. */
+    dateRangeFetchShopId: string | null;
+    /** True when a newer `fetchShopData` call was queued behind `fetchInProgress` (same shop). */
+    shopDataFetchQueued: boolean;
+    /** Range from the queued request (for UI copy); cleared when that fetch starts or queue is dropped. */
+    queuedShopDataRequestRange: { startDate: string | null; endDate: string | null };
+    queuedShopDataRequestShopId: string | null;
     syncAbortController: AbortController | null;
     dataVersion: number; // Increments on every data update to force UI re-renders
 
@@ -451,7 +491,10 @@ interface ShopState {
     // P&L data (persists across navigations, like products/orders)
     plData: any | null;
     plDataKey: string;
+    plDataCache: Record<string, any>;
     plLoading: boolean;
+    /** True while `fetchPLData` network round-trip is in flight (including silent revalidation when cache exists). */
+    plFetchInFlight: boolean;
     plError: string | null;
     fetchPLData: (accountId: string, shopId: string, startDate: string, endDate: string, forceRefresh?: boolean, timezone?: string) => Promise<void>;
     memoryCache: Record<string, {
@@ -470,7 +513,11 @@ interface ShopState {
         cacheMetadata: CacheMetadata;
         plData?: any | null;
         plDataKey?: string;
+        plDataCache?: Record<string, any>;
         loadedDateRange?: { startDate: string | null; endDate: string | null };
+        currentDateRange?: { startDate: string | null; endDate: string | null };
+        fetchDateRange?: { startDate: string | null; endDate: string | null };
+        dataLoadIncomplete?: boolean;
     }>;
     fetchInProgress: boolean; // Track if a fetch is currently running
     dataLoadIncomplete: boolean; // True when batch loading stopped early due to errors
@@ -622,24 +669,17 @@ export const useShopStore = create<ShopState>((set, get) => ({
         startDate: null,
         endDate: null
     },
-    syncProgress: {
-        isActive: false,
-        isFirstSync: false,
-        currentStep: 'idle',
-        message: '',
-        ordersComplete: false,
-        productsComplete: false,
-        settlementsComplete: false,
-        ordersFetched: 0,
-        ordersTotal: undefined,
-        productsFetched: 0,
-        productsTotal: undefined,
-        settlementsFetched: 0,
-        settlementsTotal: undefined,
-    },
+    syncProgress: { ...IDLE_SYNC_PROGRESS },
+    syncProgressShopId: null,
+    dateRangeFetchShopId: null,
+    shopDataFetchQueued: false,
+    queuedShopDataRequestRange: { startDate: null, endDate: null },
+    queuedShopDataRequestShopId: null,
     plData: null,
     plDataKey: '',
+    plDataCache: {},
     plLoading: false,
+    plFetchInFlight: false,
     plError: null,
     memoryCache: {},
     autoSyncInProgress: [],
@@ -669,15 +709,175 @@ export const useShopStore = create<ShopState>((set, get) => ({
             _skipPreviousChunk?: boolean;
             _trendsNestedFetch?: boolean;
         };
-        const state = get();
+        /** Nested trends phase-2 merges orders quietly — must not replace parent's syncProgress / dismiss timers */
+        const suppressShopFetchProgressUi = Boolean(silentRefresh || _trendsNestedFetch);
+        let state = get();
 
-        // CRITICAL: Prevent duplicate concurrent fetches — queue the latest request so it runs when the current fetch finishes
-        // Exception: nested "previous period" load for the same user action must run now; otherwise await queues no-op and trends stay empty.
-        if (state.fetchInProgress && !forceRefresh && !_trendsNestedFetch) {
+        const hydrateShopSwitchForFetch = (): 'memory-done' | 'need-fetch' | null => {
+            const st = get();
+            if (!shopId || st.lastFetchShopId === shopId) return null;
+
+            bumpShopDataFetchEpoch('shop-switch');
+            pendingShopDataRequest = null;
+            set({
+                shopDataFetchQueued: false,
+                queuedShopDataRequestRange: { startDate: null, endDate: null },
+                queuedShopDataRequestShopId: null,
+            });
+
+            if (st.lastFetchShopId) {
+                console.log(`[Store] Saving data for ${st.lastFetchShopId} to memory cache`);
+                const prevId = st.lastFetchShopId;
+                const snapshot = {
+                    products: st.products,
+                    orders: st.orders,
+                    metrics: st.metrics,
+                    finance: st.finance,
+                    lastFetchTime: st.lastFetchTime,
+                    cacheMetadata: st.cacheMetadata,
+                    plData: st.plData,
+                    plDataKey: st.plDataKey,
+                    plDataCache: st.plDataCache,
+                    loadedDateRange: st.loadedDateRange,
+                    currentDateRange: st.currentDateRange,
+                    fetchDateRange: st.fetchDateRange,
+                    dataLoadIncomplete: st.dataLoadIncomplete,
+                };
+                set((s) => ({ memoryCache: { ...s.memoryCache, [prevId]: snapshot } }));
+            }
+
+            const cached = get().memoryCache[shopId];
+            if (cached && !forceRefresh) {
+                console.log(`[Store] Cache hit for ${shopId}, loading from memory...`);
+                const cacheAge = cached.lastFetchTime ? Date.now() - cached.lastFetchTime : Infinity;
+                const isFresh = cacheAge < 5 * 60 * 1000;
+                const isModeratelyStale = cacheAge >= 5 * 60 * 1000 && cacheAge < 30 * 60 * 1000;
+                const isStale = cacheAge >= 30 * 60 * 1000;
+
+                set({
+                    products: cached.products,
+                    orders: cached.orders,
+                    metrics: cached.metrics,
+                    finance: cached.finance,
+                    lastFetchTime: cached.lastFetchTime,
+                    cacheMetadata: cached.cacheMetadata,
+                    plData: cached.plData || null,
+                    plDataKey: cached.plDataKey || '',
+                    plDataCache: cached.plDataCache || {},
+                    loadedDateRange: cached.loadedDateRange || { startDate: null, endDate: null },
+                    currentDateRange: cached.currentDateRange ?? { startDate: null, endDate: null },
+                    fetchDateRange: cached.fetchDateRange ?? { startDate: null, endDate: null },
+                    dataLoadIncomplete: cached.dataLoadIncomplete ?? false,
+                    lastFetchShopId: shopId,
+                    isLoading: false,
+                    error: null,
+                    fetchInProgress: false,
+                    plLoading: false,
+                    plFetchInFlight: false,
+                    plError: null,
+                    syncProgress: { ...IDLE_SYNC_PROGRESS },
+                    syncProgressShopId: null,
+                    isFetchingDateRange: false,
+                    dateRangeFetchShopId: null,
+                    shopDataFetchQueued: false,
+                    queuedShopDataRequestRange: { startDate: null, endDate: null },
+                    queuedShopDataRequestShopId: null,
+                });
+
+                if (isFresh) {
+                    console.log(`[Store] Memory cache is very fresh (<5 min), skipping all network requests.`);
+                    return 'memory-done';
+                }
+
+                if (isModeratelyStale) {
+                    console.log(`[Store] Memory cache is moderately stale (5-30 min), skipping DB fetch.`);
+                    return 'memory-done';
+                }
+
+                if (isStale && !skipSyncCheck) {
+                    console.log(`[Store] Memory cache is stale (>30 min), triggering background auto-sync.`);
+                    setTimeout(() => {
+                        get().smartAutoSync(accountId, shopId!);
+                    }, 100);
+                    return 'memory-done';
+                }
+
+                return 'memory-done';
+            }
+
+            console.log('[Store] No memory cache, loading from DB with progress indicator...');
+            const cm = get().cacheMetadata;
+            set({
+                products: [],
+                orders: [],
+                metrics: {
+                    totalOrders: 0,
+                    totalRevenue: 0,
+                    totalProducts: 0,
+                    totalNet: 0,
+                    avgOrderValue: 0,
+                    conversionRate: 0,
+                    shopRating: 0,
+                },
+                finance: { statements: [], payments: [], withdrawals: [], unsettledOrders: [], affiliateSettlements: [], agencyFees: [] },
+                plData: null,
+                plDataKey: '',
+                plDataCache: {},
+                plLoading: false,
+                plFetchInFlight: false,
+                plError: null,
+                error: null,
+                lastFetchShopId: shopId,
+                isLoading: false,
+                fetchInProgress: true,
+                syncProgress: {
+                    ...IDLE_SYNC_PROGRESS,
+                    isActive: true,
+                    isFirstSync: false,
+                    currentStep: 'orders',
+                    message: 'Loading data...',
+                    ordersComplete: false,
+                    productsComplete: false,
+                    settlementsComplete: false,
+                },
+                syncProgressShopId: shopId,
+                cacheMetadata: {
+                    ...cm,
+                    shopId,
+                    accountId,
+                },
+                loadedDateRange: { startDate: null, endDate: null },
+                shopDataFetchQueued: false,
+                queuedShopDataRequestRange: { startDate: null, endDate: null },
+                queuedShopDataRequestShopId: null,
+            });
+            return 'need-fetch';
+        };
+
+        const switchingShop = Boolean(shopId && shopId !== state.lastFetchShopId);
+
+        // Same-shop concurrency: queue. Shop switches bypass so memory/cache swaps immediately and stale epochs drop old merges.
+        if (!switchingShop && state.fetchInProgress && !forceRefresh && !_trendsNestedFetch) {
             pendingShopDataRequest = { accountId, shopId, options: options as Record<string, unknown>, startDate, endDate };
             console.log('[Store] Fetch already in progress — queued latest request (will run when current completes).');
+            set({
+                shopDataFetchQueued: true,
+                queuedShopDataRequestShopId: shopId ?? null,
+                queuedShopDataRequestRange:
+                    startDate && endDate
+                        ? { startDate, endDate }
+                        : { startDate: null, endDate: null },
+            });
             return;
         }
+
+        if (switchingShop) {
+            const switchOutcome = hydrateShopSwitchForFetch();
+            state = get();
+            if (switchOutcome === 'memory-done') return;
+        }
+
+        state = get();
 
         // Fast path: same calendar selection as last fetch — skip network if loadedDateRange already covers
         // the selected days plus the trends comparison window (when includePreviousPeriod is on).
@@ -715,119 +915,10 @@ export const useShopStore = create<ShopState>((set, get) => ({
             }
         }
 
-        // If switching shops, save current data to cache and clear (or load from cache)
-        if (shopId && state.lastFetchShopId !== shopId) {
-            // Save current shop data to memory cache if we have a valid shop loaded
-            if (state.lastFetchShopId) {
-                console.log(`[Store] Saving data for ${state.lastFetchShopId} to memory cache`);
-                const currentData = {
-                    products: state.products,
-                    orders: state.orders,
-                    metrics: state.metrics,
-                    finance: state.finance,
-                    lastFetchTime: state.lastFetchTime,
-                    cacheMetadata: state.cacheMetadata,
-                    plData: state.plData,
-                    plDataKey: state.plDataKey,
-                    loadedDateRange: state.loadedDateRange
-                };
-                set(s => ({ memoryCache: { ...s.memoryCache, [state.lastFetchShopId!]: currentData } }));
-            }
+        state = get();
+        const epochAtStart = shopDataFetchEpoch;
 
-            // Check if we have data for the new shop in memory cache
-            if (state.memoryCache[shopId] && !forceRefresh) {
-                console.log(`[Store] Cache hit for ${shopId}, loading from memory...`);
-                const cached = state.memoryCache[shopId];
-
-                // Tiered staleness check
-                const cacheAge = cached.lastFetchTime ? Date.now() - cached.lastFetchTime : Infinity;
-                const isFresh = cacheAge < 5 * 60 * 1000; // <5 min = very fresh
-                const isModeratelyStale = cacheAge >= 5 * 60 * 1000 && cacheAge < 30 * 60 * 1000; // 5-30 min
-                const isStale = cacheAge >= 30 * 60 * 1000; // >30 min
-
-                set({
-                    products: cached.products,
-                    orders: cached.orders,
-                    metrics: cached.metrics,
-                    finance: cached.finance,
-                    lastFetchTime: cached.lastFetchTime,
-                    cacheMetadata: cached.cacheMetadata,
-                    plData: cached.plData || null,
-                    plDataKey: cached.plDataKey || '',
-                    loadedDateRange: cached.loadedDateRange || { startDate: null, endDate: null },
-                    lastFetchShopId: shopId,
-                    isLoading: false,
-                    error: null,
-                    fetchInProgress: false,
-                });
-
-                if (isFresh) {
-                    // Very fresh cache - skip all network requests
-                    console.log(`[Store] Memory cache is very fresh (<5 min), skipping all network requests.`);
-                    return;
-                }
-
-                if (isModeratelyStale) {
-                    // Moderately stale - skip DB fetch, but check sync status in background
-                    console.log(`[Store] Memory cache is moderately stale (5-30 min), skipping DB fetch.`);
-                    return;
-                }
-
-                if (isStale && !skipSyncCheck) {
-                    // Stale cache - trigger background auto-sync
-                    console.log(`[Store] Memory cache is stale (>30 min), triggering background auto-sync.`);
-                    setTimeout(() => {
-                        get().smartAutoSync(accountId, shopId!);
-                    }, 100);
-                    return; // Don't fetch from DB, we already have memory cache data
-                }
-
-                return; // Default: use cached data
-            } else {
-                // No memory cache — show sync-style progress instead of blocking overlay
-                console.log('[Store] No memory cache, loading from DB with progress indicator...');
-                set({
-                    products: [],
-                    orders: [],
-                    metrics: {
-                        totalOrders: 0,
-                        totalRevenue: 0,
-                        totalProducts: 0,
-                        totalNet: 0,
-                        avgOrderValue: 0,
-                        conversionRate: 0,
-                        shopRating: 0
-                    },
-                    finance: { statements: [], payments: [], withdrawals: [], unsettledOrders: [], affiliateSettlements: [], agencyFees: [] },
-                    plData: null,
-                    plDataKey: '',
-                    plLoading: false,
-                    plError: null,
-                    error: null,
-                    lastFetchShopId: shopId,
-                    isLoading: false, // NO blocking overlay
-                    fetchInProgress: true, // Mark fetch as in progress
-                    syncProgress: {
-                        isActive: true,
-                        isFirstSync: false,
-                        currentStep: 'orders',
-                        message: 'Loading data...',
-                        ordersComplete: false,
-                        productsComplete: false,
-                        settlementsComplete: false,
-                        ordersFetched: 0,
-                        productsFetched: 0,
-                        settlementsFetched: 0
-                    },
-                    cacheMetadata: {
-                        ...state.cacheMetadata,
-                        shopId,
-                        accountId
-                    },
-                    loadedDateRange: { startDate: null, endDate: null }
-                });
-            }
-        } else if (forceRefresh) {
+        if (forceRefresh && shopId && shopId === state.lastFetchShopId) {
             // Show progress bar for manual refresh too
             // Only reset loadedDateRange on genuine manual refresh (not post-sync refetch)
             // When skipSyncCheck is true, this is a post-sync refetch — preserve the cache
@@ -838,6 +929,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
                 ...(skipSyncCheck ? {} : { loadedDateRange: { startDate: null, endDate: null } }),
                 ...(silentRefresh ? {} : {
                     syncProgress: {
+                        ...IDLE_SYNC_PROGRESS,
                         isActive: true,
                         isFirstSync: false,
                         currentStep: 'orders',
@@ -845,10 +937,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
                         ordersComplete: false,
                         productsComplete: false,
                         settlementsComplete: false,
-                        ordersFetched: 0,
-                        productsFetched: 0,
-                        settlementsFetched: 0
-                    }
+                    },
+                    syncProgressShopId: shopId,
                 })
             });
         }
@@ -1065,6 +1155,13 @@ export const useShopStore = create<ShopState>((set, get) => ({
             }
 
             if (showCached && shopId) {
+                /** Picker / banners match the user's selection; API may use gap slice or trends phase-2 separately */
+                const uiFetchRange = {
+                    startDate: startDate ?? effectiveStartDate!,
+                    endDate: endDate ?? effectiveEndDate!,
+                };
+
+                try {
                 console.log('[Store] Loading shop data (optimized single request)...');
 
                 // Set loading state for date range fetch.
@@ -1073,28 +1170,30 @@ export const useShopStore = create<ShopState>((set, get) => ({
                 // it re-checks on its own synchronous path. Because JS is single-threaded,
                 // setting this synchronously before the first await guarantees the second
                 // caller sees it set when it reaches the guard check.
-                set(s => {
-                    // Show user-facing days count (their actual selection, not the internal buffered range).
-                    // If startDate/endDate were provided (user picked a range), compute from those.
-                    // Otherwise use the user's default load days preference.
-                    const userDays = startDate && endDate
-                        ? Math.ceil((new Date(endDate).getTime() - new Date(startDate).getTime()) / 86400000) + 1
-                        : (initialLoadDays || DEFAULT_LOAD_DAYS);
-                    const dayPhrase = userDays === 1 ? '1 day' : `${userDays} days`;
-                    return {
-                        isFetchingDateRange: true,
-                        fetchInProgress: silentRefresh ? false : true,
-                        dataLoadIncomplete: false,
-                        fetchDateRange: { startDate: effectiveStartDate, endDate: effectiveEndDate },
-                        ...(silentRefresh ? {} : {
-                            syncProgress: {
-                                ...s.syncProgress,
-                                isActive: true,
-                                message: `Loading ${dayPhrase} of data...`
-                            }
-                        })
-                    };
-                });
+                if (!_trendsNestedFetch) {
+                    set(s => {
+                        // Show user-facing days count from their actual calendar selection when provided.
+                        const userDays = startDate && endDate
+                            ? Math.ceil((new Date(endDate).getTime() - new Date(startDate).getTime()) / 86400000) + 1
+                            : (initialLoadDays || DEFAULT_LOAD_DAYS);
+                        const dayPhrase = userDays === 1 ? '1 day' : `${userDays} days`;
+                        return {
+                            isFetchingDateRange: true,
+                            dateRangeFetchShopId: shopId,
+                            fetchInProgress: silentRefresh ? false : true,
+                            dataLoadIncomplete: false,
+                            fetchDateRange: uiFetchRange,
+                            ...(suppressShopFetchProgressUi ? {} : {
+                                syncProgress: {
+                                    ...s.syncProgress,
+                                    isActive: true,
+                                    message: `Loading ${dayPhrase} of data...`
+                                },
+                                syncProgressShopId: shopId,
+                            })
+                        };
+                    });
+                }
 
                 // Determine the actual fetch range (gap or full)
                 const fetchStartDate = isGapFetch ? gapStartDate! : effectiveStartDate;
@@ -1106,7 +1205,16 @@ export const useShopStore = create<ShopState>((set, get) => ({
                 shopDataUrl += `&startDate=${fetchStartDate}&endDate=${fetchEndDate}`;
                 console.log(`[Store] Fetching shop data: ${fetchStartDate} to ${fetchEndDate}${isGapFetch ? ' (GAP FETCH)' : ''}`);
                 const shopDataResponse = await shopApi(shopDataUrl);
+                if (epochAtStart !== shopDataFetchEpoch) {
+                    console.log('[Store] Discarding shop-data response — shop switched mid-fetch');
+                    return;
+                }
                 const result = await shopDataResponse.json().catch(() => ({} as { success?: boolean; error?: string }));
+
+                if (epochAtStart !== shopDataFetchEpoch) {
+                    console.log('[Store] Discarding parsed shop-data — shop switched mid-fetch');
+                    return;
+                }
 
                 if (!shopDataResponse.ok) {
                     throw new Error(result.error || `Could not load shop data (HTTP ${shopDataResponse.status})`);
@@ -1165,15 +1273,15 @@ export const useShopStore = create<ShopState>((set, get) => ({
                         console.log(`[Store] Gap fetch returned 0 orders for ${fetchStartDate}..${fetchEndDate} (beyond ${DEFAULT_SYNC_DAYS}-day window). Triggering on-demand TikTok sync...`);
 
                         // Show syncing indicator
-                        if (!silentRefresh) {
+                        if (!suppressShopFetchProgressUi) {
                             set(s => ({
                                 syncProgress: {
                                     ...s.syncProgress,
                                     isActive: true,
                                     currentStep: 'orders',
                                     message: `Fetching historical data (${fetchStartDate} to ${fetchEndDate})...`,
-                                    ordersComplete: false
-                                }
+                                    ordersComplete: false,
+                                },
                             }));
                         }
 
@@ -1185,12 +1293,20 @@ export const useShopStore = create<ShopState>((set, get) => ({
                                 startDate: fetchStartDate,
                                 endDate: fetchEndDate
                             }, undefined);
+                            if (epochAtStart !== shopDataFetchEpoch) {
+                                console.log('[Store] Discarding historical sync follow-up — shop switched mid-fetch');
+                                return;
+                            }
                             const fetched = syncResult.stats?.orders?.fetched || 0;
                             console.log(`[Store] Historical sync complete: ${fetched} orders fetched from TikTok`);
 
                             // Re-read from Supabase now that data is there
                             if (fetched > 0) {
                                 const retryResult = await shopApi(shopDataUrl).then(r => r.json());
+                                if (epochAtStart !== shopDataFetchEpoch) {
+                                    console.log('[Store] Discarding post-sync refetch — shop switched mid-fetch');
+                                    return;
+                                }
                                 if (retryResult.success) {
                                     orders = (retryResult.data.orders || []).map(mapRawOrder);
                                     statements = (retryResult.data.settlements || []).map((s: any) => ({
@@ -1207,12 +1323,18 @@ export const useShopStore = create<ShopState>((set, get) => ({
                         } catch (syncError: any) {
                             console.error('[Store] Historical sync failed:', syncError.message);
                         } finally {
-                            // Dismiss sync progress
-                            set(s => ({
-                                syncProgress: { ...s.syncProgress, isActive: false, message: '' }
-                            }));
+                            if (!suppressShopFetchProgressUi) {
+                                set((s) => ({
+                                    syncProgress: { ...s.syncProgress, isActive: false, message: '' },
+                                }));
+                            }
                         }
                     }
+                }
+
+                if (epochAtStart !== shopDataFetchEpoch) {
+                    console.log('[Store] Discarding merge — shop switched mid-fetch');
+                    return;
                 }
 
                 // For gap fetches, merge new data with existing; for full fetches, replace
@@ -1270,6 +1392,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
 
                 const hasPreservedRealtimeOrders = !isGapFetch && mergedOrders.length !== orders.length;
 
+                const metricsBlend = get().metrics;
                 const metrics: ShopMetrics = {
                     totalOrders: (isGapFetch || hasPreservedRealtimeOrders) ? mergedOrders.length : (serverMetrics?.totalOrders || orders.length),
                     totalRevenue: (isGapFetch || hasPreservedRealtimeOrders)
@@ -1280,8 +1403,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
                         ? mergedStatements.reduce((sum: number, s: Statement) => sum + parseFloat(s.settlement_amount || '0'), 0)
                         : (serverMetrics?.totalNet || statements.reduce((sum: number, s: Statement) => sum + parseFloat(s.settlement_amount || '0'), 0)),
                     avgOrderValue: serverMetrics?.avgOrderValue || 0,
-                    conversionRate: state.metrics.conversionRate || 0,
-                    shopRating: state.metrics.shopRating || 0
+                    conversionRate: metricsBlend.conversionRate || 0,
+                    shopRating: metricsBlend.shopRating || 0
                 };
 
                 // Full fetch: loaded range is exactly this request's effective range (replaces orders for that slice).
@@ -1321,24 +1444,29 @@ export const useShopStore = create<ShopState>((set, get) => ({
                         agencyFees: get().finance.agencyFees || []
                     },
                     isLoading: false,
-                    isFetchingDateRange: false,
                     error: null,
                     lastFetchTime: Date.now(),
                     lastFetchShopId: shopId,
-                    syncProgress: {
-                        ...get().syncProgress,
-                        productsComplete: true,
-                        productsFetched: mergedProducts.length,
-                        settlementsComplete: true,
-                        settlementsFetched: mergedStatements.length,
-                        ordersComplete: !hasMoreOrders,
-                        ordersFetched: mergedOrders.length,
-                        currentStep: hasMoreOrders ? 'orders' : 'complete',
-                        message: hasMoreOrders
-                            ? (totalOrderCount ? `Loading data: ${mergedOrders.length}/${totalOrderCount}...` : `Loading data: ${mergedOrders.length}...`)
-                            : `Loaded ${mergedOrders.length} orders`,
-                        isActive: hasMoreOrders
-                    },
+                    ...(suppressShopFetchProgressUi
+                        ? {}
+                        : {
+                              syncProgress: {
+                                  ...get().syncProgress,
+                                  productsComplete: true,
+                                  productsFetched: mergedProducts.length,
+                                  settlementsComplete: true,
+                                  settlementsFetched: mergedStatements.length,
+                                  ordersComplete: !hasMoreOrders,
+                                  ordersFetched: mergedOrders.length,
+                                  ordersTotal: totalOrderCount || mergedOrders.length,
+                                  currentStep: hasMoreOrders ? 'orders' : 'complete',
+                                  message: hasMoreOrders
+                                      ? (totalOrderCount ? `Loading data: ${mergedOrders.length}/${totalOrderCount}...` : `Loading data: ${mergedOrders.length}...`)
+                                      : `Loaded ${mergedOrders.length} orders`,
+                                  isActive: hasMoreOrders,
+                              },
+                              syncProgressShopId: shopId,
+                          }),
                     cacheMetadata: {
                         shopId,
                         accountId,
@@ -1352,12 +1480,14 @@ export const useShopStore = create<ShopState>((set, get) => ({
                         lastSyncStats: get().cacheMetadata.lastSyncStats,
                         lastPromptDismissedAt: get().cacheMetadata.lastPromptDismissedAt
                     },
-                    // Store the USER's selected range (not the expanded effective range)
-                    // This ensures the duplicate-call check at line 432 works correctly
-                    currentDateRange: {
-                        startDate: startDate || effectiveStartDate || null,
-                        endDate: endDate || effectiveEndDate || null
-                    },
+                    ...(!_trendsNestedFetch
+                        ? {
+                              currentDateRange: {
+                                  startDate: startDate || effectiveStartDate || null,
+                                  endDate: endDate || effectiveEndDate || null,
+                              },
+                          }
+                        : {}),
                     ...(deferLoadedRangeUntilPagination
                         ? { dataLoadIncomplete: true }
                         : {
@@ -1429,12 +1559,26 @@ export const useShopStore = create<ShopState>((set, get) => ({
                                     `[Store] Re-fetching same batch cursor (round ${round + 1}/${MAX_CURSOR_ROUNDS}) after ${pause}ms pause...`
                                 );
                                 await new Promise((r) => setTimeout(r, pause));
+                                if (epochAtStart !== shopDataFetchEpoch) {
+                                    batchLoopExitedEarly = true;
+                                    break;
+                                }
                             }
                             const outcome = await fetchOrdersBatchPage(batchUrl);
+                            if (epochAtStart !== shopDataFetchEpoch) {
+                                batchLoopExitedEarly = true;
+                                page = null;
+                                break;
+                            }
                             if (outcome.ok) {
                                 page = outcome.data;
                                 break;
                             }
+                        }
+
+                        if (epochAtStart !== shopDataFetchEpoch) {
+                            batchLoopExitedEarly = true;
+                            break;
                         }
 
                         if (!page) {
@@ -1489,6 +1633,11 @@ export const useShopStore = create<ShopState>((set, get) => ({
                         const updatedRevenue = accumulatedOrders.reduce((sum, o) => sum + calculateOrderGMV(o), 0);
                         const updatedAvg = accumulatedOrders.length > 0 ? updatedRevenue / accumulatedOrders.length : 0;
 
+                        if (epochAtStart !== shopDataFetchEpoch) {
+                            batchLoopExitedEarly = true;
+                            break;
+                        }
+
                         // Functional set to ensure we don't accidentally wipe out other changes
                         set(s => ({
                             orders: accumulatedOrders,
@@ -1498,21 +1647,28 @@ export const useShopStore = create<ShopState>((set, get) => ({
                                 totalRevenue: updatedRevenue,
                                 avgOrderValue: updatedAvg
                             },
-                            ...(silentRefresh ? {} : {
+                            ...(suppressShopFetchProgressUi ? {} : {
                                 syncProgress: {
                                     ...s.syncProgress,
                                     ordersFetched: accumulatedOrders.length,
+                                    ordersTotal: totalOrderCount || accumulatedOrders.length,
                                     message: hasMore
                                         ? (totalOrderCount ? `Loading data: ${accumulatedOrders.length}/${totalOrderCount}...` : `Loading data: ${accumulatedOrders.length}...`)
                                         : `Loaded all ${accumulatedOrders.length} orders`,
                                     currentStep: hasMore ? 'orders' : 'complete',
                                     ordersComplete: !hasMore,
                                     isActive: hasMore
-                                }
+                                },
+                                syncProgressShopId: shopId,
                             })
                         }));
 
                         console.log(`[Store] Progressive load: ${accumulatedOrders.length}/${totalOrderCount} orders`);
+                    }
+
+                    if (epochAtStart !== shopDataFetchEpoch) {
+                        console.log('[Store] Discarding pagination footer — shop switched during batch load');
+                        return;
                     }
 
                     // After the loop, check if we loaded fewer orders than the server reported.
@@ -1524,13 +1680,19 @@ export const useShopStore = create<ShopState>((set, get) => ({
                         );
                         set(s => ({
                             dataLoadIncomplete: true,
-                            syncProgress: {
-                                ...s.syncProgress,
-                                isActive: false,  // stop the spinner regardless of auto-sync
-                                ordersComplete: false,
-                                currentStep: 'complete',
-                                message: `Loaded ${finalLoaded} of ${totalOrderCount} orders`
-                            }
+                            ...(suppressShopFetchProgressUi
+                                ? {}
+                                : {
+                                      syncProgress: {
+                                          ...s.syncProgress,
+                                          isActive: false,
+                                          ordersComplete: false,
+                                          ordersTotal: totalOrderCount,
+                                          currentStep: 'complete',
+                                          message: `Loaded ${finalLoaded} of ${totalOrderCount} orders`,
+                                      },
+                                      syncProgressShopId: shopId,
+                                  }),
                         }));
                     } else {
                         // Pagination finished — now safe to extend loadedDateRange (cache HIT was deferred until this point)
@@ -1559,19 +1721,27 @@ export const useShopStore = create<ShopState>((set, get) => ({
                             }));
                         }
                         // All orders loaded — dismiss progress bar
-                        setTimeout(() => {
-                            set(s => ({
-                                syncProgress: { ...s.syncProgress, isActive: false, message: '' }
-                            }));
-                        }, 2000);
+                        if (!suppressShopFetchProgressUi) {
+                            setTimeout(() => {
+                                if (epochAtStart !== shopDataFetchEpoch) return;
+                                set(s => ({
+                                    syncProgress: { ...s.syncProgress, isActive: false, message: '' },
+                                    syncProgressShopId: null,
+                                }));
+                            }, 2000);
+                        }
                     }
                 } else {
                     // All data loaded in first batch — dismiss progress bar
-                    setTimeout(() => {
-                        set(s => ({
-                            syncProgress: { ...s.syncProgress, isActive: false, message: '' }
-                        }));
-                    }, 1500);
+                    if (!suppressShopFetchProgressUi) {
+                        setTimeout(() => {
+                            if (epochAtStart !== shopDataFetchEpoch) return;
+                            set(s => ({
+                                syncProgress: { ...s.syncProgress, isActive: false, message: '' },
+                                syncProgressShopId: null,
+                            }));
+                        }, 1500);
+                    }
                 }
 
                 // Phase 2: previous calendar period for Performance Comparison — after phase-1 pagination so the
@@ -1591,6 +1761,11 @@ export const useShopStore = create<ShopState>((set, get) => ({
                         previousChunk.start,
                         previousChunk.end
                     );
+                }
+                } finally {
+                    if (!_trendsNestedFetch) {
+                        set({ isFetchingDateRange: false, dateRangeFetchShopId: null });
+                    }
                 }
             }
 
@@ -1615,7 +1790,9 @@ export const useShopStore = create<ShopState>((set, get) => ({
                 error: error.message,
                 isLoading: false,
                 isFetchingDateRange: false,
+                dateRangeFetchShopId: null,
                 fetchInProgress: false,
+                syncProgressShopId: null,
                 syncProgress: { ...get().syncProgress, isActive: false, message: '' }
             });
         } finally {
@@ -1624,20 +1801,35 @@ export const useShopStore = create<ShopState>((set, get) => ({
                 set({ fetchInProgress: false });
                 const pending = pendingShopDataRequest;
                 pendingShopDataRequest = null;
+                set({
+                    shopDataFetchQueued: false,
+                    queuedShopDataRequestRange: { startDate: null, endDate: null },
+                    queuedShopDataRequestShopId: null,
+                });
                 if (pending) {
-                    void get().fetchShopData(
-                        pending.accountId,
-                        pending.shopId,
-                        pending.options as Parameters<ShopState['fetchShopData']>[2],
-                        pending.startDate,
-                        pending.endDate
-                    );
+                    const displayedShopId = get().lastFetchShopId;
+                    if (pending.shopId != null && pending.shopId !== displayedShopId) {
+                        console.warn(
+                            `[Store] Discarding queued shop-data fetch — queued shop ${pending.shopId} ≠ displayed ${displayedShopId}`
+                        );
+                    } else {
+                        void get().fetchShopData(
+                            pending.accountId,
+                            pending.shopId,
+                            pending.options as Parameters<ShopState['fetchShopData']>[2],
+                            pending.startDate,
+                            pending.endDate
+                        );
+                    }
                 }
             }
         }
     },
 
-    clearData: () => set({
+    clearData: () => {
+        lastPlNetworkSuccessAtMs.clear();
+        plDataHttpInflightDepth = 0;
+        set({
         products: [],
         orders: [],
         metrics: {
@@ -1650,11 +1842,25 @@ export const useShopStore = create<ShopState>((set, get) => ({
             shopRating: 0
         },
         finance: { statements: [], payments: [], withdrawals: [], unsettledOrders: [], affiliateSettlements: [], agencyFees: [] },
+        plData: null,
+        plDataKey: '',
+        plDataCache: {},
+        plLoading: false,
+        plFetchInFlight: false,
+        plError: null,
         error: null,
         lastFetchTime: null,
         lastFetchShopId: null,
-        loadedDateRange: { startDate: null, endDate: null }
-    }),
+        loadedDateRange: { startDate: null, endDate: null },
+        syncProgress: { ...IDLE_SYNC_PROGRESS },
+        syncProgressShopId: null,
+        isFetchingDateRange: false,
+        dateRangeFetchShopId: null,
+        shopDataFetchQueued: false,
+        queuedShopDataRequestRange: { startDate: null, endDate: null },
+        queuedShopDataRequestShopId: null,
+    });
+    },
 
     syncData: async (accountId: string, shopId: string, syncType: string = 'all', forceFullSync: boolean = false) => {
         // Preempt any running auto-sync — manual sync takes priority
@@ -1676,7 +1882,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
         set({
             isLoading: false,
             error: null,
-            cacheMetadata: { ...get().cacheMetadata, isSyncing: true },
+            cacheMetadata: { ...get().cacheMetadata, isSyncing: true, shopId, accountId },
+            syncProgressShopId: shopId,
             syncProgress: {
                 isActive: true,
                 isFirstSync,
@@ -1780,7 +1987,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
 
             // Clear P&L cache if finance was synced
             if (syncSettlements) {
-                set({ plDataKey: '' });
+                set({ plDataKey: '', plDataCache: {} });
             }
 
             // Show sync complete message and update cache metadata
@@ -1795,6 +2002,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
                     cacheMetadata: s.cacheMetadata,
                     plData: s.plData,
                     plDataKey: s.plDataKey,
+                    plDataCache: s.plDataCache,
                     loadedDateRange: s.loadedDateRange
                 };
 
@@ -1852,7 +2060,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
         } finally {
             set(s => ({
                 cacheMetadata: { ...s.cacheMetadata, isSyncing: false },
-                syncAbortController: null
+                syncAbortController: null,
+                syncProgressShopId: null,
             }));
         }
     },
@@ -1865,6 +2074,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
             controller.abort();
         }
 
+        const cancelledForShop = get().syncProgressShopId ?? get().lastFetchShopId;
         set({
             syncProgress: {
                 isActive: false,
@@ -1881,6 +2091,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
                 settlementsFetched: 0,
                 settlementsTotal: undefined,
             },
+            syncProgressShopId: cancelledForShop,
             cacheMetadata: {
                 ...get().cacheMetadata,
                 isSyncing: false
@@ -1890,7 +2101,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
         // Show cancelled message briefly
         setTimeout(() => {
             set(s => ({
-                syncProgress: { ...s.syncProgress, isActive: false, message: '' }
+                syncProgress: { ...s.syncProgress, isActive: false, message: '' },
+                syncProgressShopId: s.syncProgressShopId === cancelledForShop ? null : s.syncProgressShopId,
             }));
         }, 1500);
     },
@@ -2027,7 +2239,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
             // Step 4: Finalize silently
             if (get().autoSyncInProgress.length > 0) {
                 if (syncSettlements) {
-                    set({ plDataKey: '' });
+                    set({ plDataKey: '', plDataCache: {} });
                 }
 
                 console.log('[AutoSync] Background sync complete');
@@ -2158,6 +2370,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
                     cacheMetadata: s.cacheMetadata,
                     plData: s.plData,
                     plDataKey: s.plDataKey,
+                    plDataCache: s.plDataCache,
                     loadedDateRange: s.loadedDateRange
                 };
                 return { memoryCache: newMemoryCache };
@@ -2228,6 +2441,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
                     cacheMetadata: s.cacheMetadata,
                     plData: s.plData,
                     plDataKey: s.plDataKey,
+                    plDataCache: s.plDataCache,
                     loadedDateRange: s.loadedDateRange
                 };
                 return { memoryCache: newMemoryCache };
@@ -2300,13 +2514,14 @@ export const useShopStore = create<ShopState>((set, get) => ({
                     cacheMetadata: s.cacheMetadata,
                     plData: s.plData,
                     plDataKey: s.plDataKey,
+                    plDataCache: s.plDataCache,
                     loadedDateRange: s.loadedDateRange
                 };
                 return { memoryCache: newMemoryCache };
             });
 
             // Clear P&L cache since settlements changed
-            set({ plDataKey: '' });
+            set({ plDataKey: '', plDataCache: {} });
 
             console.log(`[MergeSettlements] ✅ Merged ${newStatements.length} synced settlements. Store total: ${mergedStatements.length}`);
         } catch (error: any) {
@@ -2496,6 +2711,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
                     cacheMetadata: s.cacheMetadata,
                     plData: s.plData,
                     plDataKey: s.plDataKey,
+                    plDataCache: s.plDataCache,
                     loadedDateRange: s.loadedDateRange
                 };
                 return { memoryCache: newMemoryCache };
@@ -3081,23 +3297,43 @@ export const useShopStore = create<ShopState>((set, get) => ({
 
     fetchPLData: async (accountId: string, shopId: string, startDate: string, endDate: string, forceRefresh: boolean = false, _timezone: string = 'America/Los_Angeles') => {
         const key = `${accountId}:${shopId}:${startDate}:${endDate}`;
+        const cachedForRange = get().plDataCache[key];
 
-        // If we already have data for this exact key and not forcing refresh, skip
-        if (!forceRefresh && get().plDataKey === key && get().plData) {
-            return;
+        // Keep the last correct payload for this exact range on screen while we
+        // revalidate. This prevents tab/range switches from briefly rendering
+        // estimate fallbacks or zero settlement totals.
+        if (cachedForRange && !forceRefresh) {
+            set((s) => {
+                if (s.lastFetchShopId !== shopId) return {};
+                return { plData: cachedForRange, plDataKey: key, plLoading: false, plError: null };
+            });
+            const lastOk = lastPlNetworkSuccessAtMs.get(key);
+            if (lastOk != null && Date.now() - lastOk < PL_FETCH_NETWORK_COOLDOWN_MS) {
+                console.log('[Store] P&L served from cache — skipping network (recent fetch)');
+                return;
+            }
         }
 
+        // Revalidate from server when cache is missing, stale past cooldown, or forceRefresh.
+
         // Only show loading spinner if we have no existing data (prevents flickering)
-        if (!get().plData) {
+        if (!cachedForRange && !get().plData && get().lastFetchShopId === shopId) {
             set({ plLoading: true });
         }
 
-        set({ plError: null });
+        plDataHttpInflightDepth++;
+        set({ plFetchInFlight: plDataHttpInflightDepth > 0 });
+
+        if (get().lastFetchShopId === shopId) {
+            set({ plError: null });
+        }
 
         try {
             const range = getUtcCalendarRangeExclusiveUnix(startDate, endDate);
             if (!range) {
-                set({ plError: 'Invalid date range for P&L', plLoading: false });
+                if (get().lastFetchShopId === shopId) {
+                    set({ plError: 'Invalid date range for P&L', plLoading: false });
+                }
                 return;
             }
 
@@ -3106,13 +3342,32 @@ export const useShopStore = create<ShopState>((set, get) => ({
             const result = await response.json();
 
             if (result.success) {
-                set({ plData: result.data, plDataKey: key, plLoading: false });
-            } else {
+                lastPlNetworkSuccessAtMs.set(key, Date.now());
+                set((s) => ({
+                    plDataCache: {
+                        ...s.plDataCache,
+                        [key]: result.data,
+                    },
+                    ...(s.lastFetchShopId === shopId
+                        ? {
+                              plData: result.data,
+                              plDataKey: key,
+                              plLoading: false,
+                              plError: null,
+                          }
+                        : {}),
+                }));
+            } else if (get().lastFetchShopId === shopId) {
                 set({ plError: result.error || 'Failed to fetch P&L data', plLoading: false });
             }
         } catch (err: any) {
             console.error('Error fetching P&L data:', err);
-            set({ plError: err.message || 'Network error', plLoading: false });
+            if (get().lastFetchShopId === shopId) {
+                set({ plError: err.message || 'Network error', plLoading: false });
+            }
+        } finally {
+            plDataHttpInflightDepth = Math.max(0, plDataHttpInflightDepth - 1);
+            set({ plFetchInFlight: plDataHttpInflightDepth > 0 });
         }
     }
 }));

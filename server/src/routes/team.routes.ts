@@ -1,53 +1,236 @@
 import express from 'express';
+import { randomUUID } from 'node:crypto';
 import { supabase } from '../config/supabase.js';
 import { resolveRequestUserId } from '../middleware/account-access.middleware.js';
-import { sendHtmlEmail } from '../services/email.js';
 import {
     deactivateAgencyLifecycle,
     tenantStatusTriggersLifecycle,
     unlinkSellerFromAgencyLifecycle,
 } from '../services/tenant-lifecycle.service.js';
 import { auditLog } from '../services/audit-logger.js';
+import { sendHtmlEmail } from '../services/email.js';
 
 const router = express.Router();
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const FRONTEND_URL = (process.env.FRONTEND_URL || 'https://mamba.app').replace(/\/$/, '');
+
+function escapeHtml(value: string): string {
+    return value
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function buildTeamInviteEmailHtml(acceptUrl: string, tenantLabel?: string): string {
+    const tenantText = tenantLabel?.trim() ? ` to join <strong>${escapeHtml(tenantLabel)}</strong>` : '';
+    const safeUrl = escapeHtml(acceptUrl);
+    return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>You have been invited</title>
+  </head>
+  <body style="margin:0;padding:24px;background:#0b1020;font-family:Arial,Helvetica,sans-serif;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:620px;margin:0 auto;">
+      <tr>
+        <td style="background:#121a31;border:1px solid #2a355b;border-radius:16px;padding:32px;">
+          <p style="margin:0 0 12px;color:#94a3b8;font-size:12px;letter-spacing:.4px;">MAMBA TEAM INVITE</p>
+          <h1 style="margin:0 0 12px;color:#f8fafc;font-size:28px;line-height:1.2;">You have been invited</h1>
+          <p style="margin:0 0 20px;color:#cbd5e1;font-size:16px;line-height:1.6;">
+            You have been invited${tenantText}. Use the button below to review and accept your invitation.
+          </p>
+          <p style="margin:0 0 20px;">
+            <a href="${safeUrl}" style="display:inline-block;padding:14px 24px;border-radius:10px;background:#ec4899;color:#ffffff;text-decoration:none;font-weight:700;">
+              Accept Invitation
+            </a>
+          </p>
+          <p style="margin:0;color:#94a3b8;font-size:13px;line-height:1.6;">
+            If the button doesn't work, copy this URL into your browser:<br />
+            <a href="${safeUrl}" style="color:#a78bfa;text-decoration:underline;word-break:break-all;">${safeUrl}</a>
+          </p>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>`;
+}
 
 /**
- * Send an invitation email with an accept link.
- * Uses Resend when RESEND_API_KEY is set; otherwise logs the accept URL for local dev.
+ * Send team invitation email through Supabase Auth mailer.
+ * - Prefer Invite template for new users.
+ * - Fallback to OTP flow for already-registered users.
  */
-async function sendInvitationEmail(toEmail: string, acceptUrl: string): Promise<void> {
-    const subject = 'You have been invited to join a team on Mamba';
-    const from = process.env.INVITE_FROM_EMAIL || 'noreply@mamba.app';
-    const html = `
-        <div style="font-family:Inter,sans-serif;max-width:480px;margin:0 auto;padding:24px;">
-            <h2 style="color:#fff;margin-bottom:8px;">You're invited! 🎉</h2>
-            <p style="color:#aaa;margin-bottom:24px;">
-                You have been invited to join a team on <strong style="color:#fff;">Mamba</strong>.
-                Click the button below to review and accept the invitation.
-            </p>
-            <a href="${acceptUrl}"
-               style="display:inline-block;background:#4f46e5;color:#fff;padding:12px 28px;
-                      border-radius:8px;text-decoration:none;font-weight:bold;font-size:15px;">
-                Accept Invitation
-            </a>
-            <p style="color:#555;font-size:12px;margin-top:20px;">
-                This link expires in 7 days. If you did not expect this invitation, you may safely ignore this email.
-            </p>
-        </div>`;
+async function sendInvitationEmail(tenantId: string, toEmail: string, acceptUrl: string): Promise<void> {
+    const invite = await supabase.auth.admin.inviteUserByEmail(toEmail, {
+        redirectTo: acceptUrl,
+        data: { invitation_tenant_id: tenantId },
+    });
 
-    const { delivered } = await sendHtmlEmail(toEmail, subject, html, { from });
-    if (!delivered) {
-        console.log(`[team] invitation email (no RESEND_API_KEY set):`);
-        console.log(`  To: ${toEmail}`);
-        console.log(`  Accept URL: ${acceptUrl}`);
+    if (!invite.error) return;
+
+    // Existing users cannot be invited again via inviteUserByEmail; use OTP mailer fallback.
+    if (/already registered|already been registered|already exists/i.test(invite.error.message || '')) {
+        const otp = await supabase.auth.signInWithOtp({
+            email: toEmail,
+            options: {
+                shouldCreateUser: false,
+                emailRedirectTo: acceptUrl,
+                data: { invitation_tenant_id: tenantId },
+            },
+        });
+        if (!otp.error) return;
+        throw new Error(otp.error.message || 'Failed to send invitation email via Supabase OTP');
+    }
+
+    throw new Error(invite.error.message || 'Failed to send invitation email via Supabase invite');
+}
+
+function buildSellerLinkInviteEmailHtml(acceptUrl: string, agencyName?: string, sellerName?: string): string {
+    const safeUrl = escapeHtml(acceptUrl);
+    const safeAgency = agencyName ? escapeHtml(agencyName) : 'an agency';
+    const safeSeller = sellerName ? escapeHtml(sellerName) : 'your shop';
+    return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Seller Link Request</title>
+  </head>
+  <body style="margin:0;padding:24px;background:#0b1020;font-family:Arial,Helvetica,sans-serif;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:620px;margin:0 auto;">
+      <tr>
+        <td style="background:#121a31;border:1px solid #2a355b;border-radius:16px;padding:32px;">
+          <p style="margin:0 0 12px;color:#94a3b8;font-size:12px;letter-spacing:.4px;">MAMBA SELLER LINK REQUEST</p>
+          <h1 style="margin:0 0 12px;color:#f8fafc;font-size:28px;line-height:1.2;">Agency Link Request</h1>
+          <p style="margin:0 0 20px;color:#cbd5e1;font-size:16px;line-height:1.6;">
+            <strong>${safeAgency}</strong> requested to link <strong>${safeSeller}</strong> to their agency.
+            Review and accept or decline this request.
+          </p>
+          <p style="margin:0 0 20px;">
+            <a href="${safeUrl}" style="display:inline-block;padding:14px 24px;border-radius:10px;background:#ec4899;color:#ffffff;text-decoration:none;font-weight:700;">
+              Review Request
+            </a>
+          </p>
+          <p style="margin:0;color:#94a3b8;font-size:13px;line-height:1.6;">
+            If the button does not work, copy this URL into your browser:<br />
+            <a href="${safeUrl}" style="color:#a78bfa;text-decoration:underline;word-break:break-all;">${safeUrl}</a>
+          </p>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>`;
+}
+
+async function sendSellerLinkInviteEmail(toEmail: string, acceptUrl: string, agencyName?: string, sellerName?: string): Promise<void> {
+    const html = buildSellerLinkInviteEmailHtml(acceptUrl, agencyName, sellerName);
+    const result = await sendHtmlEmail(toEmail, 'Agency seller link request on Mamba', html, {
+        fromDisplayName: (agencyName || 'Mamba').trim() || 'Mamba',
+    });
+    if (!result.delivered) {
+        throw new Error('Seller link invitation email was not delivered');
     }
 }
 
 function sanitizeIlikeQuery(q: string): string {
     return q.replace(/[%_\\]/g, '').trim().slice(0, 80);
 }
+
+/**
+ * GET /api/team/agency-seller-assignments?agencyTenantId=
+ * Agency Admin/Super Admin view of seller-to-staff assignments for this agency.
+ */
+router.get('/agency-seller-assignments', async (req, res) => {
+    try {
+        const actorId = await resolveRequestUserId(req);
+        if (!actorId) {
+            res.status(401).json({ success: false, error: 'Authorization required' });
+            return;
+        }
+
+        const agencyTenantId = typeof req.query.agencyTenantId === 'string' ? req.query.agencyTenantId : '';
+        if (!UUID_RE.test(agencyTenantId)) {
+            res.status(400).json({ success: false, error: 'Valid agencyTenantId is required' });
+            return;
+        }
+
+        let allowed = false;
+        const { data: isAgencyAdmin } = await supabase.rpc('user_is_agency_admin', {
+            p_agency_tenant_id: agencyTenantId,
+            p_user_id: actorId,
+        });
+        if (isAgencyAdmin === true) allowed = true;
+
+        if (!allowed) {
+            const { data: isPlatformSa } = await supabase.rpc('user_is_platform_super_admin', {
+                p_user_id: actorId,
+            });
+            if (isPlatformSa === true) allowed = true;
+        }
+
+        if (!allowed) {
+            const { data: profile } = await supabase.from('profiles').select('role').eq('id', actorId).maybeSingle();
+            if (profile?.role === 'admin') allowed = true;
+        }
+
+        if (!allowed) {
+            res.status(403).json({ success: false, error: 'Agency Admin or Super Admin access required' });
+            return;
+        }
+
+        const { data: assignments, error: assignErr } = await supabase
+            .from('user_seller_assignments')
+            .select('seller_tenant_id,user_id')
+            .eq('agency_tenant_id', agencyTenantId);
+        if (assignErr) throw assignErr;
+
+        const rows = assignments || [];
+        const userIds = Array.from(new Set(rows.map((r: any) => r.user_id).filter(Boolean)));
+        const profilesById = new Map<string, { full_name: string | null; email: string | null }>();
+        const rolesById = new Map<string, string | null>();
+
+        if (userIds.length > 0) {
+            const [{ data: profRows, error: profErr }, { data: membershipRows, error: membershipErr }] = await Promise.all([
+                supabase.from('profiles').select('id,full_name,email').in('id', userIds),
+                supabase
+                    .from('tenant_memberships')
+                    .select('user_id,roles(name)')
+                    .eq('tenant_id', agencyTenantId)
+                    .in('user_id', userIds)
+                    .eq('status', 'active'),
+            ]);
+            if (profErr) throw profErr;
+            if (membershipErr) throw membershipErr;
+
+            for (const p of profRows || []) {
+                profilesById.set(p.id as string, {
+                    full_name: (p as any).full_name ?? null,
+                    email: (p as any).email ?? null,
+                });
+            }
+            for (const m of membershipRows || []) {
+                rolesById.set((m as any).user_id, (m as any).roles?.name ?? null);
+            }
+        }
+
+        const data = rows.map((r: any) => ({
+            seller_tenant_id: r.seller_tenant_id,
+            user_id: r.user_id,
+            full_name: profilesById.get(r.user_id)?.full_name ?? null,
+            email: profilesById.get(r.user_id)?.email ?? null,
+            role_name: rolesById.get(r.user_id) ?? null,
+        }));
+
+        res.json({ success: true, data });
+    } catch (e: any) {
+        console.error('[team] agency-seller-assignments', e);
+        res.status(500).json({ success: false, error: e.message || 'Internal error' });
+    }
+});
 
 /**
  * GET /api/team/profile-search?tenantId=&q=
@@ -138,6 +321,352 @@ router.get('/profile-search', async (req, res) => {
 });
 
 /**
+ * GET /api/team/seller-search?agencyTenantId=&q=
+ * Agency admins/super admins: search seller tenants by name or id.
+ * Returns only sellers that are unlinked or already linked to this agency.
+ */
+router.get('/seller-search', async (req, res) => {
+    try {
+        const actorId = await resolveRequestUserId(req);
+        if (!actorId) {
+            res.status(401).json({ success: false, error: 'Authorization required' });
+            return;
+        }
+
+        const agencyTenantId = typeof req.query.agencyTenantId === 'string' ? req.query.agencyTenantId.trim() : '';
+        if (!UUID_RE.test(agencyTenantId)) {
+            res.status(400).json({ success: false, error: 'Valid agencyTenantId is required' });
+            return;
+        }
+
+        const rawQ = typeof req.query.q === 'string' ? req.query.q : '';
+        const q = sanitizeIlikeQuery(rawQ);
+        if (q.length < 2) {
+            res.json({ success: true, data: [] });
+            return;
+        }
+
+        const { data: allowed, error: permErr } = await supabase.rpc('user_can_manage_tenant_members', {
+            p_tenant_id: agencyTenantId,
+            p_actor_id: actorId,
+        });
+        if (permErr) {
+            console.error('[team] seller-search permission', permErr.message);
+            res.status(500).json({ success: false, error: 'Permission check failed' });
+            return;
+        }
+        if (allowed !== true) {
+            res.status(403).json({ success: false, error: 'Access denied' });
+            return;
+        }
+
+        const pattern = `%${q}%`;
+        const [nameSearch, uuidSearch] = await Promise.all([
+            supabase
+                .from('tenants')
+                .select('id, name, status, parent_tenant_id, type')
+                .eq('type', 'seller')
+                .ilike('name', pattern)
+                .order('name')
+                .limit(20),
+            UUID_RE.test(q)
+                ? supabase
+                      .from('tenants')
+                      .select('id, name, status, parent_tenant_id, type')
+                      .eq('type', 'seller')
+                      .eq('id', q)
+                      .limit(1)
+                : Promise.resolve({ data: [], error: null } as { data: any[]; error: null }),
+        ]);
+
+        if (nameSearch.error || uuidSearch.error) {
+            const err = nameSearch.error || uuidSearch.error;
+            console.error('[team] seller-search', err?.message);
+            res.status(500).json({ success: false, error: 'Seller search failed' });
+            return;
+        }
+
+        const merged = new Map<string, any>();
+        for (const row of [...(nameSearch.data || []), ...(uuidSearch.data || [])]) {
+            merged.set(row.id, row);
+        }
+
+        const data = Array.from(merged.values())
+            .map((row: any) => ({
+                id: row.id as string,
+                name: (row.name as string) || 'Unnamed seller',
+                status: (row.status as string) || null,
+                parent_tenant_id: (row.parent_tenant_id as string | null) ?? null,
+                already_linked: row.parent_tenant_id === agencyTenantId,
+                linkable: !row.parent_tenant_id || row.parent_tenant_id === agencyTenantId,
+                not_linkable_reason:
+                    row.parent_tenant_id && row.parent_tenant_id !== agencyTenantId
+                        ? 'already_linked_to_another_agency'
+                        : null,
+            }));
+
+        res.json({ success: true, data });
+    } catch (e: any) {
+        console.error('[team] seller-search', e);
+        res.status(500).json({ success: false, error: e.message || 'Internal error' });
+    }
+});
+
+/**
+ * POST /api/team/link-seller
+ * body: { agencyTenantId, sellerTenantId }
+ * Creates pending seller-link invitation and notifies Seller Admins.
+ */
+router.post('/link-seller', async (req, res) => {
+    try {
+        const actorId = await resolveRequestUserId(req);
+        if (!actorId) {
+            res.status(401).json({ success: false, error: 'Authorization required' });
+            return;
+        }
+
+        const { agencyTenantId, sellerTenantId } = req.body ?? {};
+        if (!UUID_RE.test(agencyTenantId) || !UUID_RE.test(sellerTenantId)) {
+            res.status(400).json({ success: false, error: 'Valid agencyTenantId and sellerTenantId are required' });
+            return;
+        }
+
+        const [{ data: isAgencyAdmin, error: agencyAdminErr }, { data: isPlatformSa, error: saErr }] = await Promise.all([
+            supabase.rpc('user_is_agency_admin', {
+                p_agency_tenant_id: agencyTenantId,
+                p_user_id: actorId,
+            }),
+            supabase.rpc('user_is_platform_super_admin', {
+                p_user_id: actorId,
+            }),
+        ]);
+        if (agencyAdminErr || saErr) {
+            console.error('[team] link-seller permission check', agencyAdminErr?.message || saErr?.message);
+            res.status(500).json({ success: false, error: 'Permission check failed' });
+            return;
+        }
+        if (isAgencyAdmin !== true && isPlatformSa !== true) {
+            res.status(403).json({ success: false, error: 'Only Agency Admin or Super Admin can link sellers' });
+            return;
+        }
+
+        const { data: agencyRowCheck, error: agencyErr } = await supabase
+            .from('tenants')
+            .select('id, type, name')
+            .eq('id', agencyTenantId)
+            .maybeSingle();
+        if (agencyErr || !agencyRowCheck || agencyRowCheck.type !== 'agency') {
+            res.status(400).json({ success: false, error: 'Invalid agency tenant' });
+            return;
+        }
+
+        const { data: sellerRowCheck, error: sellerErr } = await supabase
+            .from('tenants')
+            .select('id, type, name, parent_tenant_id, link_status')
+            .eq('id', sellerTenantId)
+            .maybeSingle();
+        if (sellerErr || !sellerRowCheck || sellerRowCheck.type !== 'seller') {
+            res.status(400).json({ success: false, error: 'Invalid seller tenant' });
+            return;
+        }
+        if (
+            sellerRowCheck.parent_tenant_id &&
+            sellerRowCheck.parent_tenant_id !== agencyTenantId &&
+            sellerRowCheck.link_status === 'active'
+        ) {
+            res.status(400).json({ success: false, error: 'Seller tenant already linked to another agency' });
+            return;
+        }
+
+        // Already linked to this agency: keep/restore active state, do not create a new pending invite.
+        if (sellerRowCheck.parent_tenant_id === agencyTenantId) {
+            if (sellerRowCheck.link_status !== 'active') {
+                const { error: restoreErr } = await supabase
+                    .from('tenants')
+                    .update({ link_status: 'active', updated_at: new Date().toISOString() })
+                    .eq('id', sellerTenantId);
+                if (restoreErr) {
+                    console.error('[team] link-seller restore active', restoreErr.message);
+                }
+            }
+            res.json({
+                success: true,
+                data: {
+                    token: '',
+                    notifiedSellerAdmins: 0,
+                    alreadyLinked: true,
+                },
+            });
+            return;
+        }
+
+        const invitationToken = randomUUID();
+        const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+        const { error: upsertErr } = await supabase
+            .from('tenant_link_invitations')
+            .upsert(
+                {
+                    agency_tenant_id: agencyTenantId,
+                    seller_tenant_id: sellerTenantId,
+                    token: invitationToken,
+                    invited_by_id: actorId,
+                    expires_at: expiresAt,
+                    accepted_at: null,
+                },
+                { onConflict: 'agency_tenant_id,seller_tenant_id' }
+            );
+        if (upsertErr) {
+            console.error('[team] link-seller upsert invitation', upsertErr.message);
+            res.status(400).json({ success: false, error: upsertErr.message || 'Failed to create seller link invitation' });
+            return;
+        }
+
+        const { error: markPendingErr } = await supabase
+            .from('tenants')
+            .update({ link_status: 'pending', updated_at: new Date().toISOString() })
+            .eq('id', sellerTenantId);
+        if (markPendingErr) {
+            console.error('[team] link-seller mark pending', markPendingErr.message);
+            res.status(400).json({ success: false, error: markPendingErr.message || 'Failed to mark seller as pending' });
+            return;
+        }
+
+        // App router mounts invitation UI at /accept-invitation; type=seller-link chooses seller-link flow.
+        const acceptPath = `/accept-invitation?type=seller-link&token=${invitationToken}`;
+        const acceptUrl = `${FRONTEND_URL}${acceptPath}`;
+        const agencyName = typeof agencyRowCheck?.name === 'string' ? agencyRowCheck.name : 'Agency';
+        const sellerName = typeof sellerRowCheck?.name === 'string' ? sellerRowCheck.name : 'Seller shop';
+
+        const { data: sellerAdmins, error: adminsErr } = await supabase
+            .from('tenant_memberships')
+            .select('user_id, profiles!tenant_memberships_user_id_fkey(email), roles(name)')
+            .eq('tenant_id', sellerTenantId)
+            .eq('status', 'active');
+        if (adminsErr) {
+            console.error('[team] link-seller load seller admins', adminsErr.message);
+        }
+
+        const recipients = (sellerAdmins || []).filter((row: any) => row?.roles?.name === 'Seller Admin');
+        for (const row of recipients) {
+            const userId = row.user_id as string;
+            const email = ((row.profiles as any)?.email || '').toString().trim().toLowerCase();
+
+            // Avoid stacking identical pending-link notifications for the same action URL.
+            const { error: cleanErr } = await supabase
+                .from('user_notifications')
+                .delete()
+                .eq('user_id', userId)
+                .eq('type', 'seller_link_invite')
+                .eq('action_url', acceptPath);
+            if (cleanErr) {
+                console.warn('[team] link-seller cleanup previous notifications', cleanErr.message);
+            }
+
+            const { error: notifErr } = await supabase.rpc('create_user_notification', {
+                p_user_id: userId,
+                p_type: 'seller_link_invite',
+                p_title: 'Agency Link Request',
+                p_message: `${agencyName} requested to link ${sellerName}. Review and accept or decline.`,
+                p_action_url: acceptPath,
+            });
+            if (notifErr) {
+                console.error('[team] link-seller create_user_notification', notifErr.message);
+            }
+
+            if (email) {
+                await sendSellerLinkInviteEmail(email, acceptUrl, agencyName, sellerName).catch((e: Error) => {
+                    console.error('[team] link-seller send email', e?.message);
+                });
+            }
+        }
+
+        res.json({
+            success: true,
+            data: {
+                token: invitationToken,
+                notifiedSellerAdmins: recipients.length,
+            },
+        });
+    } catch (e: any) {
+        console.error('[team] link-seller', e);
+        res.status(500).json({ success: false, error: e.message || 'Internal error' });
+    }
+});
+
+/**
+ * GET /api/team/pending-seller-links?agencyTenantId=
+ * Returns pending seller-link invitations for one agency.
+ */
+router.get('/pending-seller-links', async (req, res) => {
+    try {
+        const actorId = await resolveRequestUserId(req);
+        if (!actorId) {
+            res.status(401).json({ success: false, error: 'Authorization required' });
+            return;
+        }
+
+        const agencyTenantId = typeof req.query.agencyTenantId === 'string' ? req.query.agencyTenantId.trim() : '';
+        if (!UUID_RE.test(agencyTenantId)) {
+            res.status(400).json({ success: false, error: 'Valid agencyTenantId is required' });
+            return;
+        }
+
+        const [{ data: isAgencyAdmin, error: aaErr }, { data: isPlatformSa, error: saErr }] = await Promise.all([
+            supabase.rpc('user_is_agency_admin', {
+                p_agency_tenant_id: agencyTenantId,
+                p_user_id: actorId,
+            }),
+            supabase.rpc('user_is_platform_super_admin', {
+                p_user_id: actorId,
+            }),
+        ]);
+        if (aaErr || saErr) {
+            console.error('[team] pending-seller-links permission', aaErr?.message || saErr?.message);
+            res.status(500).json({ success: false, error: 'Permission check failed' });
+            return;
+        }
+        if (isAgencyAdmin !== true && isPlatformSa !== true) {
+            res.status(403).json({ success: false, error: 'Access denied' });
+            return;
+        }
+
+        const { data: rows, error } = await supabase
+            .from('tenant_link_invitations')
+            .select('seller_tenant_id, token, expires_at, accepted_at, tenants!seller_tenant_id(id, name, type, status, parent_tenant_id, link_status)')
+            .eq('agency_tenant_id', agencyTenantId)
+            .is('accepted_at', null)
+            .gt('expires_at', new Date().toISOString())
+            .order('created_at', { ascending: false });
+        if (error) {
+            console.error('[team] pending-seller-links', error.message);
+            res.status(500).json({ success: false, error: 'Failed to load pending links' });
+            return;
+        }
+
+        const data = (rows || [])
+            .map((row: any) => {
+                const seller = row?.tenants;
+                if (!seller || seller.type !== 'seller') return null;
+                return {
+                    seller_tenant_id: seller.id as string,
+                    seller_name: (seller.name as string) || 'Unnamed seller',
+                    seller_status: (seller.status as string) || null,
+                    parent_tenant_id: (seller.parent_tenant_id as string | null) ?? null,
+                    link_status: 'pending' as const,
+                    token: row.token as string,
+                    expires_at: row.expires_at as string,
+                };
+            })
+            .filter(Boolean);
+
+        res.json({ success: true, data });
+    } catch (e: any) {
+        console.error('[team] pending-seller-links', e);
+        res.status(500).json({ success: false, error: e.message || 'Internal error' });
+    }
+});
+
+/**
  * POST /api/team/invite-member
  * body: { tenantId, email, userId, roleId }
  * If the user already has a membership, it updates their role directly.
@@ -191,8 +720,7 @@ router.post('/invite-member', async (req, res) => {
             if (existingProfile?.id) {
                 targetUserId = existingProfile.id;
             } else {
-                const redirectTo =
-                    (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '') + '/';
+                const redirectTo = `${FRONTEND_URL}/`;
 
                 const inv = await supabase.auth.admin.inviteUserByEmail(normEmail, {
                     redirectTo,
@@ -238,7 +766,8 @@ router.post('/invite-member', async (req, res) => {
         if (targetProfile?.tenant_id && targetProfile.tenant_id !== tenantId) {
             res.status(400).json({
                 success: false,
-                error: 'This user already belongs to a different tenant. Phase 2 users may belong to exactly one tenant.',
+                error:
+                    'This user already belongs to a different tenant. Each account can only be linked to one tenant at a time. To move them here, go to Admin → Users, open their account, and use Transfer tenant membership.',
             });
             return;
         }
@@ -274,8 +803,12 @@ router.post('/invite-member', async (req, res) => {
             .eq('user_id', targetUserId)
             .maybeSingle();
 
+        // Re-send invite for first-time, declined, or still-pending invited members so
+        // they always receive a fresh accept token + in-app notification + email.
         const needsInvitationFlow =
-            !existingMembership || existingMembership.status === 'declined';
+            !existingMembership ||
+            existingMembership.status === 'declined' ||
+            existingMembership.status === 'invited';
 
         const { data: membershipId, error: roleErr } = await supabase.rpc('tenant_set_member_role_for_actor', {
             p_actor_id: actorId,
@@ -303,8 +836,9 @@ router.post('/invite-member', async (req, res) => {
 
             // Send accept-invitation email
             if (invToken) {
-                const frontendUrl = (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '');
-                const acceptUrl = `${frontendUrl}/accept-invitation?token=${invToken}`;
+                const acceptUrl = `${FRONTEND_URL}/accept-invitation?token=${invToken}`;
+                const { data: tenantRow } = await supabase.from('tenants').select('name').eq('id', tenantId).maybeSingle();
+                const tenantLabel = typeof tenantRow?.name === 'string' ? tenantRow.name : undefined;
 
                 let emailForInvite = normEmail;
                 if (!emailForInvite && targetUserId) {
@@ -318,7 +852,7 @@ router.post('/invite-member', async (req, res) => {
 
                 // 1. Email notification (skip if we have no address — in-app notification still fires)
                 if (emailForInvite) {
-                    await sendInvitationEmail(emailForInvite, acceptUrl).catch((e: Error) => {
+                    await sendInvitationEmail(tenantId, emailForInvite, acceptUrl).catch((e: Error) => {
                         console.error('[team] send invitation email', e?.message);
                     });
                 }
@@ -341,7 +875,7 @@ router.post('/invite-member', async (req, res) => {
                 data: { userId: targetUserId, membershipId, invited: true }
             });
         } else {
-            // Existing member (active, invited pending, or deactivated) — role updated, no new invite round-trip
+            // Existing active/deactivated member — role updated, no invite notification round-trip
             res.json({
                 success: true,
                 data: { userId: targetUserId, membershipId, invited: false }
@@ -572,6 +1106,14 @@ router.post('/unlink-seller', async (req, res) => {
         }
 
         if (!allowed) {
+            const { data: isPlatformSa, error: saErr } = await supabase.rpc('user_is_platform_super_admin', {
+                p_user_id: actorId,
+            });
+            if (saErr) console.error('[team] unlink-seller user_is_platform_super_admin', saErr.message);
+            if (isPlatformSa === true) allowed = true;
+        }
+
+        if (!allowed) {
             const { data: profile } = await supabase.from('profiles').select('role').eq('id', actorId).maybeSingle();
             if (profile?.role === 'admin') allowed = true;
         }
@@ -581,7 +1123,7 @@ router.post('/unlink-seller', async (req, res) => {
             return;
         }
 
-        await unlinkSellerFromAgencyLifecycle(agencyTenantId, sellerTenantId);
+        await unlinkSellerFromAgencyLifecycle(agencyTenantId, sellerTenantId, actorId);
 
         auditLog(req, {
             action: 'tenant.link_revoked',
@@ -599,6 +1141,418 @@ router.post('/unlink-seller', async (req, res) => {
         res.json({ success: true });
     } catch (e: any) {
         console.error('[team] unlink-seller', e);
+        res.status(500).json({ success: false, error: e.message || 'Internal error' });
+    }
+});
+
+/**
+ * POST /api/team/unassign-seller-access
+ * body: { agencyTenantId, sellerTenantId, staffUserId }
+ * Removes one AM/AC assignment to one linked seller.
+ */
+router.post('/unassign-seller-access', async (req, res) => {
+    try {
+        const actorId = await resolveRequestUserId(req);
+        if (!actorId) {
+            res.status(401).json({ success: false, error: 'Authorization required' });
+            return;
+        }
+
+        const { agencyTenantId, sellerTenantId, staffUserId } = req.body ?? {};
+        if (!UUID_RE.test(agencyTenantId) || !UUID_RE.test(sellerTenantId) || !UUID_RE.test(staffUserId)) {
+            res.status(400).json({ success: false, error: 'Valid agencyTenantId, sellerTenantId, and staffUserId are required' });
+            return;
+        }
+
+        let actorIsAgencyAdmin = false;
+        let actorIsAccountManager = false;
+
+        const { data: isAgencyAdmin } = await supabase.rpc('user_is_agency_admin', {
+            p_agency_tenant_id: agencyTenantId,
+            p_user_id: actorId,
+        });
+        actorIsAgencyAdmin = isAgencyAdmin === true;
+
+        if (!actorIsAgencyAdmin) {
+            const { data: amMembership } = await supabase
+                .from('tenant_memberships')
+                .select('id')
+                .eq('tenant_id', agencyTenantId)
+                .eq('user_id', actorId)
+                .eq('status', 'active')
+                .in(
+                    'role_id',
+                    (
+                        await supabase
+                            .from('roles')
+                            .select('id')
+                            .is('tenant_id', null)
+                            .eq('name', 'Account Manager')
+                    ).data?.map((r: any) => r.id) || ['00000000-0000-0000-0000-000000000000']
+                )
+                .maybeSingle();
+            actorIsAccountManager = !!amMembership?.id;
+        }
+
+        if (!actorIsAgencyAdmin && !actorIsAccountManager) {
+            res.status(403).json({ success: false, error: 'Only Agency Admin or Account Manager can unassign seller access' });
+            return;
+        }
+
+        // Seller must belong to this agency
+        const { data: seller } = await supabase
+            .from('tenants')
+            .select('id')
+            .eq('id', sellerTenantId)
+            .eq('type', 'seller')
+            .eq('parent_tenant_id', agencyTenantId)
+            .maybeSingle();
+        if (!seller) {
+            res.status(400).json({ success: false, error: 'Seller is not linked to this agency' });
+            return;
+        }
+
+        // Staff target role check
+        const { data: targetMembership } = await supabase
+            .from('tenant_memberships')
+            .select('id, roles(name)')
+            .eq('tenant_id', agencyTenantId)
+            .eq('user_id', staffUserId)
+            .eq('status', 'active')
+            .maybeSingle();
+        const targetRoleName = (targetMembership as any)?.roles?.name as string | undefined;
+        if (!targetMembership?.id || !targetRoleName || !['Account Manager', 'Account Coordinator'].includes(targetRoleName)) {
+            res.status(400).json({ success: false, error: 'Target user is not an active AM/AC member of this agency' });
+            return;
+        }
+
+        // AM restriction: can only unassign coordinators from sellers within AM scope
+        if (actorIsAccountManager && !actorIsAgencyAdmin) {
+            if (targetRoleName !== 'Account Coordinator') {
+                res.status(403).json({ success: false, error: 'Account Managers can only unassign Account Coordinators' });
+                return;
+            }
+
+            const { data: actorScopeRow } = await supabase
+                .from('user_seller_assignments')
+                .select('id')
+                .eq('agency_tenant_id', agencyTenantId)
+                .eq('seller_tenant_id', sellerTenantId)
+                .eq('user_id', actorId)
+                .maybeSingle();
+            if (!actorScopeRow?.id) {
+                res.status(403).json({ success: false, error: 'Account Managers can only unassign sellers from their own scope' });
+                return;
+            }
+        }
+
+        const { error: delErr } = await supabase
+            .from('user_seller_assignments')
+            .delete()
+            .eq('agency_tenant_id', agencyTenantId)
+            .eq('seller_tenant_id', sellerTenantId)
+            .eq('user_id', staffUserId);
+        if (delErr) throw delErr;
+
+        auditLog(req, {
+            action: 'assignment.seller_unassigned',
+            resourceType: 'seller_assignment',
+            resourceId: `${agencyTenantId}:${sellerTenantId}:${staffUserId}`,
+            tenantId: agencyTenantId,
+            metadata: {
+                agencyTenantId,
+                sellerTenantId,
+                staffUserId,
+                unassignedBy: actorId,
+            },
+        }).catch(() => undefined);
+
+        res.json({ success: true });
+    } catch (e: any) {
+        console.error('[team] unassign-seller-access', e);
+        res.status(500).json({ success: false, error: e.message || 'Internal error' });
+    }
+});
+
+/**
+ * GET /api/team/member-roles?tenantId=&userId=
+ * Returns active role assignments for a tenant member (membership_roles).
+ */
+router.get('/member-roles', async (req, res) => {
+    try {
+        const actorId = await resolveRequestUserId(req);
+        if (!actorId) {
+            res.status(401).json({ success: false, error: 'Authorization required' });
+            return;
+        }
+
+        const tenantId = typeof req.query.tenantId === 'string' ? req.query.tenantId : '';
+        const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+        if (!UUID_RE.test(tenantId) || !UUID_RE.test(userId)) {
+            res.status(400).json({ success: false, error: 'Valid tenantId and userId are required' });
+            return;
+        }
+
+        const { data: canManage, error: canManageErr } = await supabase.rpc('user_can_manage_tenant_members', {
+            p_tenant_id: tenantId,
+            p_actor_id: actorId,
+        });
+        if (canManageErr) throw canManageErr;
+
+        let allowed = canManage === true;
+        if (!allowed) {
+            const { data: isSa } = await supabase.rpc('user_is_platform_super_admin', { p_user_id: actorId });
+            if (isSa === true) allowed = true;
+        }
+        if (!allowed) {
+            const { data: profile } = await supabase.from('profiles').select('role').eq('id', actorId).maybeSingle();
+            if (profile?.role === 'admin') allowed = true;
+        }
+
+        if (!allowed) {
+            res.status(403).json({ success: false, error: 'Access denied' });
+            return;
+        }
+
+        const { data: membership, error: membershipErr } = await supabase
+            .from('tenant_memberships')
+            .select('id')
+            .eq('tenant_id', tenantId)
+            .eq('user_id', userId)
+            .eq('status', 'active')
+            .maybeSingle();
+        if (membershipErr) throw membershipErr;
+        if (!membership?.id) {
+            res.json({ success: true, data: [] });
+            return;
+        }
+
+        const { data: roles, error: rolesErr } = await supabase
+            .from('membership_roles')
+            .select('role_id, roles(name)')
+            .eq('membership_id', membership.id)
+            .is('revoked_at', null);
+        if (rolesErr) throw rolesErr;
+
+        res.json({
+            success: true,
+            data: (roles || []).map((r: any) => ({
+                role_id: r.role_id,
+                role_name: r.roles?.name || null,
+            })),
+        });
+    } catch (e: any) {
+        console.error('[team] member-roles', e);
+        res.status(500).json({ success: false, error: e.message || 'Internal error' });
+    }
+});
+
+/**
+ * GET /api/team/tenant-member-roles?tenantId=
+ * Returns active roles grouped by user_id for one tenant.
+ */
+router.get('/tenant-member-roles', async (req, res) => {
+    try {
+        const actorId = await resolveRequestUserId(req);
+        if (!actorId) {
+            res.status(401).json({ success: false, error: 'Authorization required' });
+            return;
+        }
+
+        const tenantId = typeof req.query.tenantId === 'string' ? req.query.tenantId : '';
+        if (!UUID_RE.test(tenantId)) {
+            res.status(400).json({ success: false, error: 'Valid tenantId is required' });
+            return;
+        }
+
+        const { data: canManage, error: canManageErr } = await supabase.rpc('user_can_manage_tenant_members', {
+            p_tenant_id: tenantId,
+            p_actor_id: actorId,
+        });
+        if (canManageErr) throw canManageErr;
+
+        let allowed = canManage === true;
+        if (!allowed) {
+            const { data: isSa } = await supabase.rpc('user_is_platform_super_admin', { p_user_id: actorId });
+            if (isSa === true) allowed = true;
+        }
+        if (!allowed) {
+            const { data: profile } = await supabase.from('profiles').select('role').eq('id', actorId).maybeSingle();
+            if (profile?.role === 'admin') allowed = true;
+        }
+        if (!allowed) {
+            res.status(403).json({ success: false, error: 'Access denied' });
+            return;
+        }
+
+        const { data: rows, error: rowsErr } = await supabase
+            .from('tenant_memberships')
+            .select('user_id, membership_roles!inner(revoked_at, roles(name))')
+            .eq('tenant_id', tenantId)
+            .eq('status', 'active')
+            .is('membership_roles.revoked_at', null);
+        if (rowsErr) throw rowsErr;
+
+        const grouped = new Map<string, string[]>();
+        for (const row of rows || []) {
+            const uid = (row as any).user_id as string;
+            const rel = (row as any).membership_roles;
+            const roleRows = Array.isArray(rel) ? rel : rel ? [rel] : [];
+            const existing = grouped.get(uid) || [];
+            for (const rr of roleRows) {
+                const name = rr?.roles?.name as string | undefined;
+                if (name && !existing.includes(name)) existing.push(name);
+            }
+            grouped.set(uid, existing);
+        }
+
+        res.json({
+            success: true,
+            data: Array.from(grouped.entries()).map(([user_id, role_names]) => ({ user_id, role_names })),
+        });
+    } catch (e: any) {
+        console.error('[team] tenant-member-roles', e);
+        res.status(500).json({ success: false, error: e.message || 'Internal error' });
+    }
+});
+
+/**
+ * POST /api/team/member-roles/sync
+ * body: { tenantId, userId, roleIds[] } - replaces active membership_roles set.
+ */
+router.post('/member-roles/sync', async (req, res) => {
+    try {
+        const actorId = await resolveRequestUserId(req);
+        if (!actorId) {
+            res.status(401).json({ success: false, error: 'Authorization required' });
+            return;
+        }
+
+        const { tenantId, userId, roleIds } = req.body ?? {};
+        const normalizedRoleIds: string[] = Array.isArray(roleIds) ? roleIds.filter((v) => typeof v === 'string' && UUID_RE.test(v)) : [];
+        if (!UUID_RE.test(tenantId) || !UUID_RE.test(userId)) {
+            res.status(400).json({ success: false, error: 'Valid tenantId and userId are required' });
+            return;
+        }
+        if (normalizedRoleIds.length === 0) {
+            res.status(400).json({ success: false, error: 'At least one role is required' });
+            return;
+        }
+
+        const { data: canManage, error: canManageErr } = await supabase.rpc('user_can_manage_tenant_members', {
+            p_tenant_id: tenantId,
+            p_actor_id: actorId,
+        });
+        if (canManageErr) throw canManageErr;
+
+        let allowed = canManage === true;
+        if (!allowed) {
+            const { data: isSa } = await supabase.rpc('user_is_platform_super_admin', { p_user_id: actorId });
+            if (isSa === true) allowed = true;
+        }
+        if (!allowed) {
+            const { data: profile } = await supabase.from('profiles').select('role').eq('id', actorId).maybeSingle();
+            if (profile?.role === 'admin') allowed = true;
+        }
+        if (!allowed) {
+            res.status(403).json({ success: false, error: 'Access denied' });
+            return;
+        }
+
+        const { data: membership, error: membershipErr } = await supabase
+            .from('tenant_memberships')
+            .select('id')
+            .eq('tenant_id', tenantId)
+            .eq('user_id', userId)
+            .eq('status', 'active')
+            .maybeSingle();
+        if (membershipErr) throw membershipErr;
+        if (!membership?.id) {
+            res.status(404).json({ success: false, error: 'Active tenant membership not found for user' });
+            return;
+        }
+
+        const { data: validRoles, error: validRolesErr } = await supabase
+            .from('roles')
+            .select('id, name')
+            .in('id', normalizedRoleIds)
+            .or(`tenant_id.is.null,tenant_id.eq.${tenantId}`)
+            .is('deleted_at', null);
+        if (validRolesErr) throw validRolesErr;
+        const validRoleIds = new Set((validRoles || []).map((r: any) => r.id as string));
+
+        const selectedSuperAdmin = (validRoles || []).some((r: any) => r?.name === 'Super Admin');
+        if (selectedSuperAdmin) {
+            res.status(400).json({ success: false, error: 'Super Admin role cannot be assigned to tenant memberships' });
+            return;
+        }
+
+        if (validRoleIds.size !== normalizedRoleIds.length) {
+            res.status(400).json({ success: false, error: 'One or more selected roles are invalid for this tenant' });
+            return;
+        }
+
+        const { data: currentRows, error: currentErr } = await supabase
+            .from('membership_roles')
+            .select('id, role_id')
+            .eq('membership_id', membership.id)
+            .is('revoked_at', null);
+        if (currentErr) throw currentErr;
+
+        const currentByRoleId = new Map<string, any>((currentRows || []).map((r: any) => [r.role_id, r]));
+        const toInsert = normalizedRoleIds.filter((rid) => !currentByRoleId.has(rid));
+        const toRevoke = (currentRows || []).filter((r: any) => !validRoleIds.has(r.role_id));
+
+        // Insert first, revoke second:
+        // avoids transient "no active roles" states that can trigger primary-role sync
+        // to null and violate tenant_memberships.role_id NOT NULL.
+        if (toInsert.length > 0) {
+            const now = new Date().toISOString();
+            const payload = toInsert.map((rid) => ({
+                membership_id: membership.id,
+                role_id: rid,
+                granted_by: actorId,
+                created_at: now,
+                snapshot_json: { source: 'api.team.member_roles.sync', actor_id: actorId },
+            }));
+            const { error: insertErr } = await supabase.from('membership_roles').insert(payload);
+            if (insertErr) throw insertErr;
+        }
+
+        if (toRevoke.length > 0) {
+            const revokeIds = toRevoke.map((r: any) => r.id);
+            const { error: revokeErr } = await supabase
+                .from('membership_roles')
+                .update({ revoked_at: new Date().toISOString() })
+                .in('id', revokeIds);
+            if (revokeErr) throw revokeErr;
+        }
+
+        auditLog(req, {
+            action: 'role.assignment_update',
+            resourceType: 'membership_role',
+            resourceId: membership.id,
+            tenantId,
+            metadata: {
+                actorId,
+                targetUserId: userId,
+                roleIds: normalizedRoleIds,
+                inserted: toInsert.length,
+                revoked: toRevoke.length,
+            },
+        }).catch(() => undefined);
+
+        res.json({
+            success: true,
+            data: {
+                membershipId: membership.id,
+                roleIds: normalizedRoleIds,
+                inserted: toInsert.length,
+                revoked: toRevoke.length,
+            },
+        });
+    } catch (e: any) {
+        console.error('[team] member-roles/sync', e);
         res.status(500).json({ success: false, error: e.message || 'Internal error' });
     }
 });
@@ -693,7 +1647,7 @@ router.patch('/agency-tenant/:tenantId', async (req, res) => {
 
         const lifecycle = tenantStatusTriggersLifecycle('agency', (updates.status as string | undefined) ?? null);
         if (lifecycle.deactivateAgency) {
-            await deactivateAgencyLifecycle(tenantId);
+            await deactivateAgencyLifecycle(tenantId, actorId);
         }
 
         res.json({ success: true, data: row });

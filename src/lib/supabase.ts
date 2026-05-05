@@ -14,6 +14,8 @@ export interface Profile {
   email: string;
   full_name: string;
   role: 'admin' | 'client' | 'moderator' | 'accountant';
+  /** Set after first product tenant (seller/agency) membership; null until onboarding. */
+  tenant_id?: string | null;
   created_at: string;
   updated_at: string;
 }

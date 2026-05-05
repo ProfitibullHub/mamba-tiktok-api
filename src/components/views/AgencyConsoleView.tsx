@@ -5,7 +5,6 @@ import {
     Settings,
     Store,
     Loader2,
-    AlertCircle,
     Shield,
     Check,
     Link2,
@@ -18,10 +17,24 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { supabase } from '../../lib/supabase';
 import { useTenantContext } from '../../contexts/TenantContext';
 import { useAuth } from '../../contexts/AuthContext';
-import { agencyLinkSellerTenant, agencyGrantStaffSellerAccess } from '../../lib/agencyRpc';
+import { agencyGrantStaffSellerAccess, agencyLinkSellerTenant } from '../../lib/agencyRpc';
 import { tenantSetMemberRole } from '../../lib/tenantRolesRpc';
-import { inviteTeamMember, searchTeamProfiles, unlinkAgencySeller, type TeamProfileRow } from '../../lib/teamApi';
+import {
+    getPendingSellerLinks,
+    inviteTeamMember,
+    linkSellerToAgency,
+    searchTeamProfiles,
+    searchSellerTenants,
+    unlinkAgencySeller,
+    getAgencySellerAssignments,
+    unassignSellerAccess,
+    type AgencySellerAssignmentRow,
+    type PendingSellerLinkRow,
+    type SellerSearchRow,
+    type TeamProfileRow,
+} from '../../lib/teamApi';
 import { patchAgencyTenantAsAdmin } from '../../lib/adminTenantsApi';
+import { showAppToast } from '../../store/useAppToastStore';
 
 type ChildTenant = {
     id: string;
@@ -29,6 +42,7 @@ type ChildTenant = {
     type: string;
     status: string;
     parent_tenant_id: string | null;
+    link_status?: 'pending' | 'active';
 };
 
 export function AgencyConsoleView() {
@@ -48,12 +62,15 @@ export function AgencyConsoleView() {
     const [assignStaffUserId, setAssignStaffUserId] = useState('');
     const [assignSellerTenantId, setAssignSellerTenantId] = useState('');
     const [busy, setBusy] = useState<string | null>(null);
-    const [msg, setMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
     const [copied, setCopied] = useState<string | null>(null);
     const [agencySettingsName, setAgencySettingsName] = useState('');
     const [agencySettingsOpen, setAgencySettingsOpen] = useState(false);
 
     const [sellerSearchQuery, setSellerSearchQuery] = useState('');
+    const [sellerLookupQuery, setSellerLookupQuery] = useState('');
+    const [sellerLookupResults, setSellerLookupResults] = useState<SellerSearchRow[]>([]);
+    const [sellerLookupLoading, setSellerLookupLoading] = useState(false);
+    const [sellerLookupSelection, setSellerLookupSelection] = useState<SellerSearchRow | null>(null);
     const [staffFilterQuery, setStaffFilterQuery] = useState('');
 
     useEffect(() => {
@@ -68,17 +85,18 @@ export function AgencyConsoleView() {
     );
     const canAdmin = selectedAgencyId ? isAgencyAdminOn(selectedAgencyId) : false;
     const canManageStaff = canAdmin || (selectedAgencyId ? isAccountManagerOn(selectedAgencyId) : false);
+    const hasCoordinatorRoleOnSelectedAgency =
+        !!selectedAgencyId &&
+        memberships.some((m: any) => {
+            if (m.tenant_id !== selectedAgencyId || m.tenants?.type !== 'agency' || m.status !== 'active') return false;
+            if (m.roles?.name === 'Account Coordinator') return true;
+            const linked = Array.isArray(m.membership_roles) ? m.membership_roles : [];
+            return linked.some((mr: any) => !mr?.revoked_at && mr?.roles?.name === 'Account Coordinator');
+        });
     /** AC may list agency team (RPC returns names); only AA/AM may add staff / assign sellers. */
     const canLoadTeamDirectoryRpc =
         canManageStaff ||
-        (!!selectedAgencyId &&
-            memberships.some(
-                (m) =>
-                    m.tenant_id === selectedAgencyId &&
-                    m.tenants?.type === 'agency' &&
-                    m.roles?.name === 'Account Coordinator' &&
-                    m.status === 'active'
-            ));
+        hasCoordinatorRoleOnSelectedAgency;
 
     const { data: agencyDetail, isLoading: loadingAgencyDetail } = useQuery({
         queryKey: ['agency-console-tenant', selectedAgencyId],
@@ -96,14 +114,33 @@ export function AgencyConsoleView() {
         queryFn: async () => {
             if (!selectedAgencyId) return [];
             if (canAdmin) {
-                const { data, error } = await supabase
+                const { data: activeRows, error: activeErr } = await supabase
                     .from('tenants')
-                    .select('id, name, type, status, parent_tenant_id')
+                    .select('id, name, type, status, parent_tenant_id, link_status')
                     .eq('parent_tenant_id', selectedAgencyId)
                     .eq('type', 'seller')
                     .order('name');
-                if (error) throw error;
-                return (data || []) as ChildTenant[];
+                if (activeErr) throw activeErr;
+
+                const pendingRows = await getPendingSellerLinks(selectedAgencyId);
+
+                const merged = new Map<string, ChildTenant>();
+                for (const row of activeRows || []) {
+                    const seller = row as ChildTenant;
+                    merged.set(seller.id, { ...seller, link_status: seller.link_status || 'active' });
+                }
+                for (const row of pendingRows || ([] as PendingSellerLinkRow[])) {
+                    merged.set(row.seller_tenant_id, {
+                        id: row.seller_tenant_id,
+                        name: row.seller_name,
+                        type: 'seller',
+                        status: row.seller_status || 'active',
+                        parent_tenant_id: row.parent_tenant_id,
+                        link_status: 'pending',
+                    });
+                }
+
+                return Array.from(merged.values()).sort((a, b) => a.name.localeCompare(b.name));
             }
 
             const { data, error } = await supabase
@@ -185,6 +222,34 @@ export function AgencyConsoleView() {
         };
     }, [staffSearchQuery, selectedAgencyId, canAdmin]);
 
+    useEffect(() => {
+        if (!selectedAgencyId || !canAdmin) {
+            setSellerLookupResults([]);
+            return;
+        }
+        const q = sellerLookupQuery.trim();
+        if (q.length < 2) {
+            setSellerLookupResults([]);
+            return;
+        }
+        let cancelled = false;
+        const t = setTimeout(async () => {
+            setSellerLookupLoading(true);
+            try {
+                const rows = await searchSellerTenants(selectedAgencyId, q);
+                if (!cancelled) setSellerLookupResults(rows);
+            } catch {
+                if (!cancelled) setSellerLookupResults([]);
+            } finally {
+                if (!cancelled) setSellerLookupLoading(false);
+            }
+        }, 300);
+        return () => {
+            cancelled = true;
+            clearTimeout(t);
+        };
+    }, [sellerLookupQuery, selectedAgencyId, canAdmin]);
+
     const { data: agencyTeam = [], isLoading: loadingTeam } = useQuery({
         queryKey: ['agency-team', selectedAgencyId, canLoadTeamDirectoryRpc],
         queryFn: async () => {
@@ -226,6 +291,24 @@ export function AgencyConsoleView() {
         enabled: !!selectedAgencyId,
     });
 
+    const { data: sellerAssignments = [], isLoading: loadingAssignments } = useQuery({
+        queryKey: ['agency-seller-assignments', selectedAgencyId],
+        queryFn: async () => {
+            if (!selectedAgencyId) return [];
+            if (canAdmin) {
+                return await getAgencySellerAssignments(selectedAgencyId);
+            }
+            const { data, error } = await supabase
+                .from('user_seller_assignments')
+                .select('seller_tenant_id,user_id')
+                .eq('agency_tenant_id', selectedAgencyId)
+                .eq('user_id', user!.id);
+            if (error) throw error;
+            return (data || []) as AgencySellerAssignmentRow[];
+        },
+        enabled: !!selectedAgencyId && !!user?.id,
+    });
+
     const filteredSellers = useMemo(() => {
         if (!sellerSearchQuery.trim()) return linkedSellers;
         const q = sellerSearchQuery.toLowerCase();
@@ -243,10 +326,59 @@ export function AgencyConsoleView() {
         );
     }, [agencyTeam, staffFilterQuery]);
 
+    const sellerLookupGrouped = useMemo(() => {
+        const linkable = sellerLookupResults.filter((s) => s.linkable);
+        const notLinkable = sellerLookupResults.filter((s) => !s.linkable);
+        return { linkable, notLinkable };
+    }, [sellerLookupResults]);
+
     // Staff members that can be assigned a seller (AM or AC)
     const assignableStaff = useMemo(() => {
         return agencyTeam.filter((u: any) => u.role_name === 'Account Manager' || u.role_name === 'Account Coordinator');
     }, [agencyTeam]);
+
+    const sellerAssignmentsBySeller = useMemo(() => {
+        const teamByUserId = new Map<string, any>();
+        for (const member of agencyTeam) {
+            teamByUserId.set(member.user_id, member);
+        }
+
+        const grouped = new Map<string, any[]>();
+        for (const row of sellerAssignments) {
+            const member = teamByUserId.get(row.user_id);
+            const withFallback = member || {
+                user_id: row.user_id,
+                full_name: null,
+                email: null,
+                role_name: 'Unknown',
+            };
+            const existing = grouped.get(row.seller_tenant_id) || [];
+            existing.push(withFallback);
+            grouped.set(row.seller_tenant_id, existing);
+        }
+        return grouped;
+    }, [agencyTeam, sellerAssignments]);
+
+    const sellerAssignmentCoverage = useMemo(() => {
+        const amAssigned: ChildTenant[] = [];
+        const acAssigned: ChildTenant[] = [];
+        const unassigned: ChildTenant[] = [];
+
+        for (const seller of linkedSellers) {
+            const assignees = sellerAssignmentsBySeller.get(seller.id) || [];
+            const hasAM = assignees.some((a: any) => a.role_name === 'Account Manager');
+            const hasAC = assignees.some((a: any) => a.role_name === 'Account Coordinator');
+
+            if (!hasAM && !hasAC) {
+                unassigned.push(seller);
+                continue;
+            }
+            if (hasAM) amAssigned.push(seller);
+            if (hasAC) acAssigned.push(seller);
+        }
+
+        return { amAssigned, acAssigned, unassigned };
+    }, [linkedSellers, sellerAssignmentsBySeller]);
 
     const copyId = async (id: string) => {
         await navigator.clipboard.writeText(id);
@@ -255,8 +387,7 @@ export function AgencyConsoleView() {
     };
 
     const flash = (type: 'ok' | 'err', text: string) => {
-        setMsg({ type, text });
-        setTimeout(() => setMsg(null), 5000);
+        showAppToast(text, type === 'ok' ? 'ok' : 'err');
     };
 
 
@@ -264,10 +395,35 @@ export function AgencyConsoleView() {
         if (!selectedAgencyId || !sellerTenantToLink.trim()) return;
         setBusy('link');
         try {
-            await agencyLinkSellerTenant(selectedAgencyId, sellerTenantToLink.trim());
+            let result: { token: string; notifiedSellerAdmins: number; alreadyLinked: boolean } | null = null;
+            try {
+                result = await linkSellerToAgency(selectedAgencyId, sellerTenantToLink.trim());
+            } catch (e: any) {
+                const msg = String(e?.message || '');
+                // Fallback path: keep link flow working even if API auth token is stale.
+                if (/Not authenticated|401/.test(msg)) {
+                    await agencyLinkSellerTenant(selectedAgencyId, sellerTenantToLink.trim());
+                    result = { token: '', notifiedSellerAdmins: 0, alreadyLinked: false };
+                    flash(
+                        'err',
+                        'Link request created, but notification delivery needs a fresh login. Please sign out/in and retry to notify Seller Admin.'
+                    );
+                } else {
+                    throw e;
+                }
+            }
             setSellerTenantToLink('');
+            setSellerLookupSelection(null);
+            setSellerLookupQuery('');
+            setSellerLookupResults([]);
             await queryClient.invalidateQueries({ queryKey: ['agency-sellers', selectedAgencyId] });
-            flash('ok', 'Seller tenant linked under this agency.');
+            if (result?.alreadyLinked) {
+                flash('ok', 'Seller is already linked to this agency.');
+            } else if (result && result.notifiedSellerAdmins > 0) {
+                flash('ok', 'Seller link request sent. Seller Admin received notification/email. Status stays Pending until accepted.');
+            } else {
+                flash('ok', 'Seller link request is pending. If no notification appeared, verify seller has an active Seller Admin and retry after re-login.');
+            }
         } catch (e: any) {
             flash('err', e.message || 'Link failed');
         } finally {
@@ -279,12 +435,21 @@ export function AgencyConsoleView() {
         if (!selectedAgencyId || !staffPickedUser || !staffRoleId) return;
         setBusy('staff');
         try {
-            const { error } = await tenantSetMemberRole(selectedAgencyId, staffPickedUser.id, staffRoleId);
-            if (error) throw error;
+            const r = await inviteTeamMember(
+                selectedAgencyId,
+                staffPickedUser.email || undefined,
+                staffRoleId,
+                staffPickedUser.id
+            );
             setStaffPickedUser(null);
             setStaffSearchQuery('');
             await queryClient.invalidateQueries({ queryKey: ['agency-team', selectedAgencyId] });
-            flash('ok', 'Staff membership updated.');
+            flash(
+                'ok',
+                r.invited
+                    ? 'Invitation sent. User will see it in Notifications and receive email.'
+                    : 'Existing active member found — role assigned successfully.'
+            );
         } catch (e: any) {
             flash('err', e.message || 'Failed to add staff');
         } finally {
@@ -376,6 +541,23 @@ export function AgencyConsoleView() {
         }
     };
 
+    const handleUnassignSellerAccess = async (sellerTenantId: string, staffUserId: string) => {
+        if (!selectedAgencyId || !canManageStaff) return;
+        setBusy(`unassign-${sellerTenantId}-${staffUserId}`);
+        try {
+            await unassignSellerAccess(selectedAgencyId, sellerTenantId, staffUserId);
+            await Promise.all([
+                queryClient.invalidateQueries({ queryKey: ['agency-seller-assignments', selectedAgencyId] }),
+                queryClient.invalidateQueries({ queryKey: ['agency-sellers', selectedAgencyId] }),
+            ]);
+            flash('ok', 'Seller unassigned from staff.');
+        } catch (e: any) {
+            flash('err', e.message || 'Unassign failed');
+        } finally {
+            setBusy(null);
+        }
+    };
+
     return (
         <div className="w-full max-w-none space-y-10 animate-in fade-in duration-500 pb-12 relative">
             <div className="absolute inset-x-0 top-0 h-64 bg-gradient-to-b from-violet-500/10 via-fuchsia-500/5 to-transparent -z-10 rounded-full blur-[100px] opacity-60 pointer-events-none" />
@@ -392,20 +574,6 @@ export function AgencyConsoleView() {
                     Data isolation is enforced in Postgres (RLS) and on the API for TikTok routes.
                 </p>
             </div>
-
-            {msg && (
-                <div
-                    className={`flex items-center gap-2 rounded-xl px-4 py-3 text-sm ${msg.type === 'ok'
-                            ? 'bg-emerald-500/10 border border-emerald-500/30 text-emerald-300'
-                            : 'bg-red-500/10 border border-red-500/30 text-red-300'
-                        }`}
-                >
-                    {msg.type === 'err' ? <AlertCircle className="w-4 h-4 shrink-0" /> : <Check className="w-4 h-4 shrink-0" />}
-                    {msg.text}
-                </div>
-            )}
-
-
 
             {/* Select agency */}
             {agencyMemberships.length > 0 && (
@@ -462,7 +630,7 @@ export function AgencyConsoleView() {
                                 <div>
                                     <h2 className="text-lg font-bold text-white">Agency settings</h2>
                                     <p className="text-sm text-gray-400 mt-1 max-w-xl">
-                                        Organization name, status, and ID for this agency. Setting an agency inactive or suspended immediately removes access to linked sellers.
+                                        Organization name, status, and ID for this agency. Setting an agency inactive or suspended immediately removes access to linked sellers. Seller-facing colors and display name are configured under <strong className="text-gray-300">Seller branding</strong> in the sidebar.
                                     </p>
                                     {loadingAgencyDetail ? (
                                         <Loader2 className="w-5 h-5 animate-spin text-gray-500 mt-3" />
@@ -589,30 +757,123 @@ export function AgencyConsoleView() {
                                 <p className="text-[12px] text-gray-400 leading-relaxed mb-4">
                                     Agency Admin sees all linked sellers. Account Managers and Coordinators only see sellers assigned to them.
                                 </p>
+                                {canAdmin && (
+                                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
+                                        <div className="rounded-xl border border-violet-500/30 bg-violet-500/10 px-3 py-2">
+                                            <p className="text-[10px] uppercase tracking-wider text-violet-300 font-bold">AM Assigned</p>
+                                            <p className="text-xl font-extrabold text-white">{sellerAssignmentCoverage.amAssigned.length}</p>
+                                        </div>
+                                        <div className="rounded-xl border border-cyan-500/30 bg-cyan-500/10 px-3 py-2">
+                                            <p className="text-[10px] uppercase tracking-wider text-cyan-300 font-bold">AC Assigned</p>
+                                            <p className="text-xl font-extrabold text-white">{sellerAssignmentCoverage.acAssigned.length}</p>
+                                        </div>
+                                        <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2">
+                                            <p className="text-[10px] uppercase tracking-wider text-amber-300 font-bold">Unassigned</p>
+                                            <p className="text-xl font-extrabold text-white">{sellerAssignmentCoverage.unassigned.length}</p>
+                                        </div>
+                                    </div>
+                                )}
                                 
                                 {canAdmin ? (
-                                    <div className="flex gap-2 mb-4 shrink-0">
-                                        <input
-                                            value={sellerTenantToLink}
-                                            onChange={(e) => setSellerTenantToLink(e.target.value)}
-                                            placeholder="Enter Seller Tenant UUID"
-                                            className="flex-1 px-3 py-2 bg-gray-950/50 border border-white/10 rounded-lg text-sm text-white placeholder-gray-500 focus:border-fuchsia-500/50 focus:outline-none"
-                                        />
-                                        <button
-                                            type="button"
-                                            disabled={busy === 'link' || !sellerTenantToLink.trim()}
-                                            onClick={handleLinkSeller}
-                                            className="px-4 py-2 rounded-lg font-bold bg-fuchsia-600 hover:bg-fuchsia-500 text-white text-sm disabled:opacity-50 transition-colors"
-                                        >
-                                            Link
-                                        </button>
+                                    <div className="mb-4 shrink-0 space-y-2">
+                                        <div className="relative">
+                                            <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" />
+                                            <input
+                                                value={sellerLookupQuery}
+                                                onChange={(e) => {
+                                                    const next = e.target.value;
+                                                    setSellerLookupQuery(next);
+                                                    setSellerLookupSelection(null);
+                                                    setSellerTenantToLink(next);
+                                                }}
+                                                placeholder="Search seller name or seller tenant UUID..."
+                                                className="w-full pl-9 pr-4 py-2.5 bg-gray-950/50 border border-white/10 rounded-lg text-sm text-white placeholder-gray-500 focus:border-fuchsia-500/50 focus:outline-none"
+                                            />
+                                        </div>
+                                        {sellerLookupLoading && (
+                                            <div className="text-xs text-gray-500 flex items-center gap-2">
+                                                <Loader2 className="w-3 h-3 animate-spin" />
+                                                Searching sellers...
+                                            </div>
+                                        )}
+                                        {sellerLookupResults.length > 0 && (
+                                            <div className="max-h-56 overflow-y-auto rounded-xl border border-white/10 bg-gray-950/95">
+                                                {sellerLookupGrouped.linkable.length > 0 && (
+                                                    <>
+                                                        <div className="px-3 py-2 text-[10px] uppercase tracking-widest text-emerald-300 bg-emerald-500/10 border-b border-emerald-500/20 font-bold">
+                                                            Linkable Sellers
+                                                        </div>
+                                                        <ul className="divide-y divide-white/5">
+                                                            {sellerLookupGrouped.linkable.map((seller) => (
+                                                                <li key={seller.id}>
+                                                                    <button
+                                                                        type="button"
+                                                                        onClick={() => {
+                                                                            setSellerLookupSelection(seller);
+                                                                            setSellerLookupQuery(seller.name);
+                                                                            setSellerTenantToLink(seller.id);
+                                                                            setSellerLookupResults([]);
+                                                                        }}
+                                                                        className="w-full text-left px-3 py-2.5 hover:bg-white/5 transition-colors"
+                                                                    >
+                                                                        <div className="text-sm font-semibold text-gray-100 flex items-center gap-2">
+                                                                            {seller.name}
+                                                                            {seller.already_linked && (
+                                                                                <span className="text-[10px] px-1.5 py-0.5 rounded-md border border-cyan-500/40 text-cyan-300 bg-cyan-500/10 uppercase tracking-wide">
+                                                                                    Already linked here
+                                                                                </span>
+                                                                            )}
+                                                                        </div>
+                                                                        <div className="text-[11px] text-gray-500 font-mono mt-0.5">{seller.id}</div>
+                                                                    </button>
+                                                                </li>
+                                                            ))}
+                                                        </ul>
+                                                    </>
+                                                )}
+                                                {sellerLookupGrouped.notLinkable.length > 0 && (
+                                                    <>
+                                                        <div className="px-3 py-2 text-[10px] uppercase tracking-widest text-amber-300 bg-amber-500/10 border-y border-amber-500/20 font-bold">
+                                                            Not linkable (already linked to another agency)
+                                                        </div>
+                                                        <ul className="divide-y divide-white/5">
+                                                            {sellerLookupGrouped.notLinkable.map((seller) => (
+                                                                <li key={seller.id} className="px-3 py-2.5 opacity-80">
+                                                                    <div className="text-sm font-semibold text-gray-200">{seller.name}</div>
+                                                                    <div className="text-[11px] text-gray-500 font-mono mt-0.5">{seller.id}</div>
+                                                                </li>
+                                                            ))}
+                                                        </ul>
+                                                    </>
+                                                )}
+                                            </div>
+                                        )}
+                                        <div className="flex gap-2">
+                                            <input
+                                                value={sellerTenantToLink}
+                                                onChange={(e) => setSellerTenantToLink(e.target.value)}
+                                                placeholder="Selected seller UUID"
+                                                className="flex-1 px-3 py-2 bg-gray-950/50 border border-white/10 rounded-lg text-sm text-white placeholder-gray-500 focus:border-fuchsia-500/50 focus:outline-none"
+                                            />
+                                            <button
+                                                type="button"
+                                                disabled={busy === 'link' || !sellerTenantToLink.trim()}
+                                                onClick={handleLinkSeller}
+                                                className="px-4 py-2 rounded-lg font-bold bg-fuchsia-600 hover:bg-fuchsia-500 text-white text-sm disabled:opacity-50 transition-colors"
+                                            >
+                                                Link
+                                            </button>
+                                        </div>
+                                        <p className="text-[11px] text-gray-500">
+                                            Search by seller name, then link. UUID paste still works as fallback.
+                                        </p>
                                     </div>
                                 ) : (
                                     <p className="text-amber-400/90 text-sm mb-4 bg-amber-500/10 p-2 rounded-lg border border-amber-500/20 shrink-0">Only Agency Admins can link sellers.</p>
                                 )}
 
                                 <div className="h-[600px] overflow-y-auto border border-white/5 rounded-xl bg-gray-950/30 scrollbar-thin scrollbar-thumb-gray-700">
-                                    {loadingSellers ? (
+                                    {loadingSellers || loadingAssignments ? (
                                         <div className="flex justify-center p-8">
                                             <Loader2 className="w-6 h-6 animate-spin text-gray-500" />
                                         </div>
@@ -626,6 +887,7 @@ export function AgencyConsoleView() {
                                             <thead className="text-xs text-gray-500 uppercase bg-gray-900/50 sticky top-0 z-10 backdrop-blur-md border-b border-white/5">
                                                 <tr>
                                                     <th className="px-4 py-3 font-semibold">Seller Name</th>
+                                                    <th className="px-4 py-3 font-semibold">Assignment</th>
                                                     <th className="px-4 py-3 font-semibold w-40 text-right">Actions</th>
                                                 </tr>
                                             </thead>
@@ -644,6 +906,55 @@ export function AgencyConsoleView() {
                                                             <div className="text-[10px] text-gray-500 font-mono mt-0.5" title={s.id}>
                                                                 {s.id.substring(0, 12)}...
                                                             </div>
+                                                        </td>
+                                                        <td className="px-4 py-3">
+                                                            {(() => {
+                                                                const assignees = sellerAssignmentsBySeller.get(s.id) || [];
+                                                                if (assignees.length === 0) {
+                                                                    return (
+                                                                        <span className="inline-flex items-center text-[10px] bg-amber-500/20 text-amber-300 border border-amber-500/30 px-2 py-1 rounded-md font-bold uppercase tracking-wide">
+                                                                            Unassigned
+                                                                        </span>
+                                                                    );
+                                                                }
+                                                                return (
+                                                                    <div className="flex flex-wrap gap-1.5">
+                                                                        {assignees.slice(0, 3).map((a: any) => (
+                                                                            <span
+                                                                                key={`${s.id}:${a.user_id}`}
+                                                                                className={`inline-flex items-center text-[10px] px-2 py-1 rounded-md font-bold border ${
+                                                                                    a.role_name === 'Account Manager'
+                                                                                        ? 'bg-violet-500/20 text-violet-200 border-violet-500/30'
+                                                                                        : a.role_name === 'Account Coordinator'
+                                                                                            ? 'bg-cyan-500/20 text-cyan-200 border-cyan-500/30'
+                                                                                            : 'bg-gray-500/20 text-gray-200 border-gray-500/30'
+                                                                                }`}
+                                                                                title={a.email || a.user_id}
+                                                                            >
+                                                                                {a.role_name === 'Account Manager' ? 'AM' : a.role_name === 'Account Coordinator' ? 'AC' : 'Staff'}:
+                                                                                {' '}
+                                                                                {(a.full_name || a.email || a.user_id).toString().slice(0, 18)}
+                                                                                {canManageStaff && (
+                                                                                    <button
+                                                                                        type="button"
+                                                                                        onClick={() => handleUnassignSellerAccess(s.id, a.user_id)}
+                                                                                        disabled={busy === `unassign-${s.id}-${a.user_id}`}
+                                                                                        className="ml-1 inline-flex items-center text-[10px] font-black opacity-70 hover:opacity-100 disabled:opacity-40"
+                                                                                        title="Unassign this seller from this staff user"
+                                                                                    >
+                                                                                        {busy === `unassign-${s.id}-${a.user_id}` ? '…' : 'x'}
+                                                                                    </button>
+                                                                                )}
+                                                                            </span>
+                                                                        ))}
+                                                                        {assignees.length > 3 && (
+                                                                            <span className="inline-flex items-center text-[10px] px-2 py-1 rounded-md font-bold border bg-white/10 text-gray-200 border-white/20">
+                                                                                +{assignees.length - 3} more
+                                                                            </span>
+                                                                        )}
+                                                                    </div>
+                                                                );
+                                                            })()}
                                                         </td>
                                                         <td className="px-4 py-3 text-right">
                                                             <div className="flex items-center justify-end gap-3">

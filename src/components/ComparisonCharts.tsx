@@ -10,7 +10,16 @@ import {
     BarChart, Bar, PieChart, Pie, Cell, Legend
 } from 'recharts';
 import { Order } from '../store/useShopStore';
-import { getShopDayStartTimestamp, formatShopDate, formatShopDateISO } from '../utils/dateUtils';
+import { useSellerBranding } from '../contexts/SellerBrandingContext';
+import {
+    getShopDayStartTimestamp,
+    getShopDayEndExclusiveTimestamp,
+    getPreviousPeriodRange,
+    nextCalendarDayISO,
+    previousCalendarDayISO,
+    formatShopDate,
+    formatShopDateISO,
+} from '../utils/dateUtils';
 import { calculateOrderGMV } from '../utils/gmvCalculations';
 import { isCancelledOrRefunded } from '../utils/orderFinancials';
 
@@ -23,6 +32,8 @@ interface ComparisonChartsProps {
     startDate?: string; // Optional: YYYY-MM-DD format
     endDate?: string;   // Optional: YYYY-MM-DD format
     timezone?: string;  // Shop timezone for date calculations
+    /** Matches OverviewView Key Metrics trends & previous-period fetch extension (LA hybrid offset when true). */
+    useHybridTimezone?: boolean;
     includeCancelledInTotal?: boolean;
     includeCancelledFinancials?: boolean;
 }
@@ -34,6 +45,8 @@ interface DailyData {
     date: string;
     dayLabel: string;
     previousDateLabel: string;
+    /** Full heading for tooltip when hourly buckets would duplicate short axis labels */
+    tooltipHeading?: string;
     current: number;
     previous: number;
 }
@@ -43,9 +56,19 @@ export function ComparisonCharts({
     startDate = '',
     endDate = '',
     timezone = 'America/Los_Angeles',
+    useHybridTimezone = false,
     includeCancelledInTotal = false,
     includeCancelledFinancials = false
 }: ComparisonChartsProps) {
+    const { data: sellerBrand } = useSellerBranding();
+    const chartPrimary = sellerBrand.chartSeries1 || sellerBrand.primaryColor;
+    const chartSecondary = sellerBrand.chartSeries2 || sellerBrand.secondaryColor;
+    const chartMuted = sellerBrand.chartAxis || sellerBrand.textMutedColor || '#94a3b8';
+    const chartPositive = sellerBrand.chartPositive || sellerBrand.profitColor || '#34d399';
+    const chartNegative = sellerBrand.chartNegative || sellerBrand.lossColor || '#f87171';
+    const chartGrid = sellerBrand.chartGrid || 'rgba(148,163,184,0.25)';
+    const chartCursor = sellerBrand.interactiveHoverBg || 'rgba(148,163,184,0.15)';
+
     const [selectedMetric, setSelectedMetric] = useState<MetricType>('orders');
     // Removed timeRange state - strictly controlled by props now
     const [chartType, setChartType] = useState<ChartType>('line');
@@ -72,42 +95,14 @@ export function ComparisonCharts({
         return Math.max(1, days);
     }, [startDate, endDate, timezone]);
 
-    // Use endDate prop directly as reference
-    const referenceEndDate = endDate;
-
-    // Compute previous period date range for 30D fetch
-    const previousPeriodRange = useMemo(() => {
-        // Use Shop Timezone for accurate previous period calculation
-        // Calculate timestamps first
-        // Add 86400 to include the full end day (make it exclusive upper bound)
-        const refEndTs = getShopDayStartTimestamp(referenceEndDate, timezone) + 86400;
-        const currentStartTs = refEndTs - (daysToCompare * 86400); // Start of current period
-        const prevEndTs = currentStartTs; // End of previous period (exclusive)
-        const prevStartTs = prevEndTs - (daysToCompare * 86400); // Start of previous period
-
-        // Convert back to YYYY-MM-DD strings for API
-        // Use formatShopDateISO which returns YYYY-MM-DD format required by backend
-
-        // Safety: ensure positive timestamps
-        const safePrevStart = Math.max(0, prevStartTs);
-        const safePrevEnd = Math.max(0, prevEndTs);
-
-        // For API, endDate is usually exclusive, but let's check strict YYYY-MM-DD
-        // The API filters as >= startDate AND < endDate (or <= if inclusive)
-        // Let's use the explicit dates derived from timestamps
-
-        return {
-            startDate: formatShopDateISO(safePrevStart * 1000, timezone),
-            // Subtract 1 second to get the actual last day of previous period for display/logic if needed,
-            // but for API "endDate" is usually up to that date.
-            // Let's stick to the boundary timestamp strategy.
-            endDate: formatShopDateISO(safePrevEnd * 1000, timezone),
-
-            // Helpful timestamps for logic
-            startTs: safePrevStart,
-            endTs: safePrevEnd
-        };
-    }, [referenceEndDate, daysToCompare, timezone]);
+    /** Same boundaries as OverviewView calculatedMetrics (current shop window + previous trend window). */
+    const comparisonBounds = useMemo(() => {
+        if (!startDate || !endDate) return null;
+        const shopPeriodStart = getShopDayStartTimestamp(startDate, timezone);
+        const shopPeriodEndExclusive = getShopDayEndExclusiveTimestamp(endDate, timezone);
+        const { prevStart, prevEndExclusive } = getPreviousPeriodRange(startDate, endDate, timezone, useHybridTimezone);
+        return { shopPeriodStart, shopPeriodEndExclusive, prevStart, prevEndExclusive };
+    }, [startDate, endDate, timezone, useHybridTimezone]);
 
     // Check if the loaded orders cover the previous period
     const needsFetch = useMemo(() => {
@@ -121,8 +116,10 @@ export function ComparisonCharts({
         const oldestOrderTs = Math.min(...orders.map(o => getOrderTs(o)));
 
         // Check 3: Does our oldest order go back far enough to cover the previous period?
-        const { startTs } = previousPeriodRange;
-        const needsOlderData = oldestOrderTs > startTs + 86400; // Allow 1 day tolerance
+        if (!comparisonBounds) return false;
+
+        const { prevStart } = comparisonBounds;
+        const needsOlderData = oldestOrderTs > prevStart + 86400; // Allow 1 day tolerance
 
         if (needsOlderData) {
             // Just warn in console, don't fetch
@@ -130,41 +127,36 @@ export function ComparisonCharts({
         }
 
         return false;
-    }, [orders, previousPeriodRange]);
+    }, [orders, comparisonBounds]);
 
 
     // Calculate comparison data
     // Note: orders prop now includes merged historical data from store
     const chartData = useMemo(() => {
-        // Precise Timezone-based Bucketing
+        const empty = {
+            current: { gmv: 0, orders: 0, avgOrder: 0 },
+            previous: { gmv: 0, orders: 0, avgOrder: 0 },
+            dailyData: [] as DailyData[],
+            pieData: [] as { name: string; value: number }[],
+            periodLabel: { current: '', previous: '' },
+        };
 
-        // 1. Determine End Timestamp
-        // For daily data generation, we need to work with full day boundaries
-        // to ensure each day in the chart represents a complete calendar day
-        const now = Math.floor(Date.now() / 1000);
-        const refDayStart = getShopDayStartTimestamp(referenceEndDate, timezone);
-        const refDayEnd = refDayStart + 86400;
+        if (!comparisonBounds || !startDate || !endDate) return empty;
 
-        // Use current time if we're viewing today's data, otherwise use end of day
-        const currentEndTs = (now >= refDayStart && now < refDayEnd) ? now : refDayEnd;
+        const { shopPeriodStart, shopPeriodEndExclusive, prevStart, prevEndExclusive } = comparisonBounds;
 
-        // 2. Determine Intervals
-        // CRITICAL: Calculate currentStartTs from the START of the reference day,
-        // not from the current timestamp, to ensure we get full calendar days
-        const currentStartTs = refDayStart - ((daysToCompare - 1) * 86400);
-        const previousEndTs = currentStartTs;
-        const previousStartTs = previousEndTs - (daysToCompare * 86400);
+        if (shopPeriodStart >= shopPeriodEndExclusive || prevStart >= prevEndExclusive) return empty;
 
         // Filter orders (excluding ONLY sample orders here - cancellation logic applied later)
         const baseValidOrder = (o: Order) => o.is_sample_order !== true;
 
         const currentOrders = orders.filter(o => {
             const ts = getOrderTs(o);
-            return ts >= currentStartTs && ts < currentEndTs && baseValidOrder(o);
+            return ts >= shopPeriodStart && ts < shopPeriodEndExclusive && baseValidOrder(o);
         });
         const previousOrders = orders.filter(o => {
             const ts = getOrderTs(o);
-            return ts >= previousStartTs && ts < previousEndTs && baseValidOrder(o);
+            return ts >= prevStart && ts < prevEndExclusive && baseValidOrder(o);
         });
 
 
@@ -194,28 +186,74 @@ export function ComparisonCharts({
 
         // Helper to format dates for display (using shop timezone)
         const formatDateLabel = (ts: number) => {
-            // formatShopDate returns MM/DD/YYYY, we can simplify for chart to MMM D
-            // But let's reuse formatShopDate first to be safe
             const fullDate = formatShopDate(ts * 1000, timezone);
             const d = new Date(fullDate);
             return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
         };
 
-        // Daily Data Generation
+        const formatHourTick = (ts: number) =>
+            new Date(ts * 1000).toLocaleTimeString('en-US', {
+                hour: 'numeric',
+                timeZone: timezone,
+            });
+
+        const formatDateHourTooltip = (ts: number) =>
+            new Date(ts * 1000).toLocaleString('en-US', {
+                month: 'short',
+                day: 'numeric',
+                hour: 'numeric',
+                timeZone: timezone,
+            });
+
+        /** Single calendar day selected → hourly buckets so line charts aren't a single dot per series */
+        const singleCalendarDayWindow = startDate === endDate;
+
+        let currentBounds: { start: number; end: number }[] = [];
+        let prevBounds: { start: number; end: number }[] = [];
+
+        if (singleCalendarDayWindow) {
+            for (let t = shopPeriodStart; t < shopPeriodEndExclusive; ) {
+                const segEnd = Math.min(t + 3600, shopPeriodEndExclusive);
+                currentBounds.push({ start: t, end: segEnd });
+                t = segEnd;
+            }
+            const nHourly = Math.max(1, currentBounds.length);
+            const prevDuration = prevEndExclusive - prevStart;
+            for (let i = 0; i < nHourly; i++) {
+                const segStart = prevStart + Math.floor((prevDuration * i) / nHourly);
+                const segEnd = i === nHourly - 1 ? prevEndExclusive : prevStart + Math.floor((prevDuration * (i + 1)) / nHourly);
+                prevBounds.push({ start: segStart, end: Math.max(segStart, segEnd) });
+            }
+        } else {
+            // Daily buckets: calendar-aware current slices (DST-safe); partition previous trend window equally so totals match aggregates (including hybrid skew).
+            for (let d = startDate; ; ) {
+                const ds = getShopDayStartTimestamp(d, timezone);
+                const de = getShopDayEndExclusiveTimestamp(d, timezone);
+                const sliceStart = Math.max(ds, shopPeriodStart);
+                const sliceEnd = Math.min(de, shopPeriodEndExclusive);
+                if (sliceStart < sliceEnd) {
+                    currentBounds.push({ start: sliceStart, end: sliceEnd });
+                }
+                if (d === endDate) break;
+                d = nextCalendarDayISO(d, timezone);
+            }
+
+            const n = Math.max(1, currentBounds.length);
+            const prevDuration = prevEndExclusive - prevStart;
+            for (let i = 0; i < n; i++) {
+                const segStart = prevStart + Math.floor((prevDuration * i) / n);
+                const segEnd = i === n - 1 ? prevEndExclusive : prevStart + Math.floor((prevDuration * (i + 1)) / n);
+                prevBounds.push({ start: segStart, end: Math.max(segStart, segEnd) });
+            }
+        }
+
+        const nBuckets = Math.max(1, currentBounds.length);
         const dailyData: DailyData[] = [];
 
+        for (let i = 0; i < nBuckets; i++) {
+            const { start: currentDayStart, end: currentDayEnd } = currentBounds[i];
+            const { start: previousDayStart, end: previousDayEnd } = prevBounds[i];
 
-
-        // We iterate day by day
-        for (let i = 0; i < daysToCompare; i++) {
-            // Day Start Timestamps
-            const currentDayStart = currentStartTs + (i * 86400);
-            const currentDayEnd = currentDayStart + 86400; // exclusive upper bound
-
-            const previousDayStart = previousStartTs + (i * 86400);
-            const previousDayEnd = previousDayStart + 86400; // exclusive upper bound
-
-            // Filter by day AND by cancellation logic
             const currentDayOrders = currentOrders.filter(o => {
                 const ts = getOrderTs(o);
                 return ts >= currentDayStart && ts < currentDayEnd && shouldIncludeOrder(o);
@@ -246,13 +284,26 @@ export function ComparisonCharts({
                     break;
             }
 
-            const dayLabel = formatDateLabel(currentDayStart);
+            const dayLabel = singleCalendarDayWindow ? formatHourTick(currentDayStart) : formatDateLabel(currentDayStart);
 
+            let previousDateLabel: string;
+            let tooltipHeading: string | undefined;
+            if (singleCalendarDayWindow) {
+                previousDateLabel = formatHourTick(previousDayStart);
+                tooltipHeading = `${formatDateHourTooltip(currentDayStart)} vs ${formatDateHourTooltip(previousDayStart)}`;
+            } else {
+                const currentDayYmd = formatShopDateISO(currentDayStart * 1000, timezone);
+                const prevCompanionYmd = previousCalendarDayISO(currentDayYmd, timezone);
+                const previousLabelTs = getShopDayStartTimestamp(prevCompanionYmd, timezone);
+                previousDateLabel = formatDateLabel(previousLabelTs);
+                tooltipHeading = undefined;
+            }
 
             dailyData.push({
-                date: formatShopDate(currentDayStart * 1000, timezone), // Strict date string
+                date: formatShopDate(currentDayStart * 1000, timezone),
                 dayLabel,
-                previousDateLabel: formatDateLabel(previousDayStart),
+                previousDateLabel,
+                tooltipHeading,
                 current: Number(currentValue.toFixed(2)),
                 previous: Number(previousValue.toFixed(2))
             });
@@ -294,6 +345,30 @@ export function ComparisonCharts({
             return rangeLabel;
         };
 
+        const shopTodayStr = formatShopDateISO(Date.now(), timezone);
+
+        let periodLabel: { current: string; previous: string };
+
+        // Hybrid trend windows span slightly more UTC than a calendar label; copy still reads "Today vs Yesterday".
+        if (startDate === endDate && startDate === shopTodayStr) {
+            periodLabel = { current: 'Today', previous: 'Yesterday' };
+        } else if (startDate === endDate) {
+            const curTs = getShopDayStartTimestamp(startDate, timezone);
+            const prevDayStr = previousCalendarDayISO(startDate, timezone);
+            const prevTs = getShopDayStartTimestamp(prevDayStr, timezone);
+            periodLabel = {
+                current: getSmartLabel(curTs, curTs),
+                previous: getSmartLabel(prevTs, prevTs),
+            };
+        } else {
+            const periodCurrentStart = getShopDayStartTimestamp(startDate, timezone);
+            const periodCurrentEndDayStart = getShopDayStartTimestamp(endDate, timezone);
+            periodLabel = {
+                current: getSmartLabel(periodCurrentStart, periodCurrentEndDayStart),
+                previous: getSmartLabel(prevStart, prevEndExclusive > prevStart ? prevEndExclusive - 1 : prevStart),
+            };
+        }
+
         return {
             current: {
                 gmv: currentGMV,
@@ -307,12 +382,9 @@ export function ComparisonCharts({
             },
             dailyData,
             pieData,
-            periodLabel: {
-                current: getSmartLabel(currentStartTs, refDayStart),
-                previous: getSmartLabel(previousStartTs, previousEndTs - 86400)
-            }
+            periodLabel,
         };
-    }, [orders, selectedMetric, daysToCompare, referenceEndDate, timezone, includeCancelledInTotal, includeCancelledFinancials]);
+    }, [orders, selectedMetric, startDate, endDate, timezone, includeCancelledInTotal, includeCancelledFinancials, comparisonBounds]);
 
     // Format helpers
     const formatValue = (value: number) => {
@@ -341,37 +413,62 @@ export function ComparisonCharts({
         return `Your ${metricName} shows a ${absChange}% ${trend} compared to the preceding ${daysToCompare} ${dayWord} (${chartData.periodLabel.previous}).`;
     };
 
-    // Chart Colors
-    const COLORS = ['#EC4899', '#06B6D4', '#A855F7', '#EAB308', '#22C55E', '#EF4444'];
+    // Chart Colors — align pie slices with agency primary/secondary + accents
+    const COLORS = useMemo(
+        () => [
+            chartPrimary,
+            chartSecondary,
+            sellerBrand.chartSeries3 || '#a855f7',
+            sellerBrand.chartSeries4 || '#eab308',
+            sellerBrand.chartSeries5 || chartPositive,
+            sellerBrand.chartSeries6 || chartNegative,
+        ],
+        [
+            chartPrimary,
+            chartSecondary,
+            sellerBrand.chartSeries3,
+            sellerBrand.chartSeries4,
+            sellerBrand.chartSeries5,
+            sellerBrand.chartSeries6,
+            chartPositive,
+            chartNegative,
+        ],
+    );
 
     // Custom Tooltip
     const CustomTooltip = ({ active, payload, label }: any) => {
         if (active && payload && payload.length) {
             if (chartType === 'pie') {
                 return (
-                    <div className="bg-gray-900 border border-gray-700 p-3 rounded-lg shadow-xl z-50">
-                        <p className="text-gray-300 text-sm mb-1">{payload[0].name}</p>
-                        <p className="text-white font-medium">{formatValue(payload[0].value)}</p>
+                    <div className="brand-toolbar p-3 rounded-lg shadow-xl z-50">
+                        <p className="brand-muted text-sm mb-1">{payload[0].name}</p>
+                        <p className="brand-text font-medium">{formatValue(payload[0].value)}</p>
                     </div>
                 );
             }
 
             return (
-                <div className="bg-gray-900 border border-gray-700 p-3 rounded-lg shadow-xl z-50">
-                    <p className="text-gray-300 text-sm mb-2 font-semibold">
-                        {label} <span className="text-gray-500 font-normal">vs</span> {payload[0]?.payload?.previousDateLabel}
+                <div className="brand-toolbar p-3 rounded-lg shadow-xl z-50">
+                    <p className="brand-text text-sm mb-2 font-semibold">
+                        {payload[0]?.payload?.tooltipHeading ?? (
+                            <>
+                                {label}{' '}
+                                <span className="brand-muted font-normal">vs</span>{' '}
+                                {payload[0]?.payload?.previousDateLabel}
+                            </>
+                        )}
                     </p>
                     {payload.map((entry: any, index: number) => (
                         <div key={index} className="flex items-center gap-2 text-sm justify-between min-w-[180px]">
                             <div className="flex items-center gap-2">
                                 <div className="w-2 h-2 rounded-full" style={{ backgroundColor: entry.color }} />
-                                <span className={entry.dataKey === 'current' ? 'text-white' : 'text-gray-400'}>
+                                <span className={entry.dataKey === 'current' ? 'brand-text' : 'brand-muted'}>
                                     {entry.name === 'Current Period' ? 'Current' :
                                         entry.name === 'Previous Period' ? 'Previous' :
                                             entry.name}
                                 </span>
                             </div>
-                            <span className="text-white font-medium">
+                            <span className="brand-text font-medium">
                                 {formatValue(entry.value)}
                             </span>
                         </div>
@@ -383,26 +480,26 @@ export function ComparisonCharts({
     };
 
     return (
-        <div className="bg-gray-800/50 rounded-xl border border-gray-700 p-6 animate-fade-in">
+        <div className="brand-card rounded-xl p-6 animate-fade-in">
             {/* Header Controls */}
             <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 mb-6">
                 <div>
-                    <h3 className="text-lg font-semibold text-white flex items-center gap-2">
-                        {chartType === 'line' ? <LineChartIcon className="text-pink-500" size={20} /> :
-                            chartType === 'bar' ? <BarChart2 className="text-cyan-500" size={20} /> :
-                                <PieChartIcon className="text-purple-500" size={20} />}
+                    <h3 className="text-lg font-semibold brand-text flex items-center gap-2">
+                        {chartType === 'line' ? <LineChartIcon style={{ color: 'var(--brand-primary)' }} size={20} /> :
+                            chartType === 'bar' ? <BarChart2 style={{ color: 'var(--brand-secondary)' }} size={20} /> :
+                                <PieChartIcon style={{ color: 'color-mix(in srgb, var(--brand-primary) 70%, var(--brand-secondary))' }} size={20} />}
                         Performance {chartType === 'pie' ? 'Breakdown' : 'Comparison'}
                     </h3>
                     <div className="flex items-center gap-2 mt-1">
-                        <p className="text-sm text-gray-400">
+                        <p className="text-sm brand-muted">
                             {chartType === 'pie'
                                 ? `${chartData.periodLabel.current} `
                                 : `${chartData.periodLabel.current} vs ${chartData.periodLabel.previous} `
                             }
                         </p>
                         <div className="group relative">
-                            <Info size={14} className="text-gray-500 cursor-help" />
-                            <div className="absolute left-0 bottom-full mb-2 w-64 bg-gray-900 border border-gray-700 p-3 rounded-lg text-xs text-gray-300 shadow-xl opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-50">
+                            <Info size={14} className="brand-muted cursor-help opacity-80" />
+                            <div className="absolute left-0 bottom-full mb-2 w-64 brand-toolbar p-3 rounded-lg text-xs brand-text shadow-xl opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-50">
                                 Compares the last {daysToCompare} {daysToCompare === 1 ? 'day' : 'days'} with the preceding {daysToCompare} {daysToCompare === 1 ? 'day' : 'days'}.
                                 {needsFetch && ' Historical data might be incomplete.'}
                             </div>
@@ -412,37 +509,40 @@ export function ComparisonCharts({
 
                 <div className="flex flex-wrap items-center gap-3">
                     {/* Chart Type Toggle */}
-                    <div className="bg-gray-700 p-1 rounded-lg flex">
+                    <div className="bg-black/25 border border-white/10 p-1 rounded-lg flex">
                         <button
                             onClick={() => setChartType('line')}
-                            className={`p-2 rounded transition-colors ${chartType === 'line' ? 'bg-gray-600 text-pink-400' : 'text-gray-400 hover:text-white'}`}
+                            className={`p-2 rounded transition-colors ${chartType === 'line' ? 'brand-on-primary' : 'brand-nav-idle'}`}
+                            style={chartType === 'line' ? { backgroundColor: 'color-mix(in srgb, var(--brand-primary) 45%, transparent)' } : undefined}
                             title="Line Chart"
                         >
                             <LineChartIcon size={16} />
                         </button>
                         <button
                             onClick={() => setChartType('bar')}
-                            className={`p-2 rounded transition-colors ${chartType === 'bar' ? 'bg-gray-600 text-cyan-400' : 'text-gray-400 hover:text-white'}`}
+                            className={`p-2 rounded transition-colors ${chartType === 'bar' ? 'brand-on-primary' : 'brand-nav-idle'}`}
+                            style={chartType === 'bar' ? { backgroundColor: 'color-mix(in srgb, var(--brand-secondary) 45%, transparent)' } : undefined}
                             title="Bar Chart"
                         >
                             <BarChart2 size={16} />
                         </button>
                         <button
                             onClick={() => setChartType('pie')}
-                            className={`p-2 rounded transition-colors ${chartType === 'pie' ? 'bg-gray-600 text-purple-400' : 'text-gray-400 hover:text-white'}`}
+                            className={`p-2 rounded transition-colors ${chartType === 'pie' ? 'brand-on-primary' : 'brand-nav-idle'}`}
+                            style={chartType === 'pie' ? { backgroundColor: 'color-mix(in srgb, var(--brand-primary) 35%, var(--brand-secondary) 35%)' } : undefined}
                             title="Pie Chart"
                         >
                             <PieChartIcon size={16} />
                         </button>
                     </div>
 
-                    <div className="h-6 w-px bg-gray-700 mx-1 hidden sm:block"></div>
+                    <div className="h-6 w-px bg-white/10 mx-1 hidden sm:block"></div>
 
                     {/* Metric Selector */}
                     <div className="relative z-20">
                         <button
                             onClick={() => setShowDropdown(!showDropdown)}
-                            className="flex items-center gap-2 px-3 py-2 bg-gray-700 rounded-lg text-sm text-white hover:bg-gray-600 transition-colors min-w-[140px]"
+                            className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm brand-text border border-white/10 bg-black/20 hover:bg-black/30 transition-colors min-w-[140px]"
                         >
                             {metrics.find(m => m.id === selectedMetric)?.icon}
                             <span>{metrics.find(m => m.id === selectedMetric)?.label}</span>
@@ -450,7 +550,7 @@ export function ComparisonCharts({
                         </button>
 
                         {showDropdown && (
-                            <div className="absolute right-0 mt-2 w-48 bg-gray-800 border border-gray-700 rounded-lg shadow-xl overflow-hidden animate-in fade-in zoom-in duration-200 z-50">
+                            <div className="absolute right-0 mt-2 w-48 brand-card rounded-lg shadow-xl overflow-hidden animate-in fade-in zoom-in duration-200 z-50">
                                 {metrics.map(metric => (
                                     <button
                                         key={metric.id}
@@ -459,9 +559,10 @@ export function ComparisonCharts({
                                             setShowDropdown(false);
                                         }}
                                         className={`w-full flex items-center gap-2 px-4 py-3 text-sm text-left transition-colors ${selectedMetric === metric.id
-                                            ? 'bg-pink-500/10 text-pink-400 border-l-2 border-pink-500'
-                                            : 'text-gray-300 hover:bg-gray-700'
+                                            ? 'bg-white/5 brand-text border-l-2'
+                                            : 'brand-muted hover:bg-white/5'
                                             }`}
+                                        style={selectedMetric === metric.id ? { borderLeftColor: 'var(--brand-primary)' } : undefined}
                                     >
                                         {metric.icon}
                                         {metric.label}
@@ -475,39 +576,39 @@ export function ComparisonCharts({
 
             {/* Summary Stats Row */}
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6 relative z-10">
-                <div className="bg-gray-900/40 rounded-lg p-4 border border-gray-700/50 relative group">
-                    <div className="absolute inset-0 bg-gradient-to-br from-pink-500/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity rounded-lg pointer-events-none" />
+                <div className="brand-card rounded-lg p-4 relative group">
+                    <div className="absolute inset-0 bg-gradient-to-br from-white/[0.03] to-transparent opacity-0 group-hover:opacity-100 transition-opacity rounded-lg pointer-events-none" />
                     <div className="flex items-center gap-1 mb-1">
-                        <p className="text-xs text-gray-400 font-medium">Current Period</p>
+                        <p className="text-xs brand-muted font-medium">Current Period</p>
                         <CalculationTooltip
                             source="Orders / Statements"
                             calculation={`Sum of ${selectedMetric} for last ${daysToCompare} days`}
                             api="GET /orders/search or GET /finance/statements"
                         />
                     </div>
-                    <p className="text-2xl font-bold text-white tracking-tight">
+                    <p className="text-2xl font-bold brand-text tracking-tight">
                         {formatValue(currentValue)}
                     </p>
                 </div>
 
-                <div className="bg-gray-900/40 rounded-lg p-4 border border-gray-700/50 group">
+                <div className="brand-card rounded-lg p-4 group">
                     <div className="flex items-center gap-1 mb-1">
-                        <p className="text-xs text-gray-500 font-medium">Previous Period</p>
+                        <p className="text-xs brand-muted font-medium opacity-90">Previous Period</p>
                         <CalculationTooltip
                             source="Orders / Statements"
                             calculation={`Sum of ${selectedMetric} for preceding ${daysToCompare} days`}
                             api="GET /orders/search or GET /finance/statements"
                         />
                     </div>
-                    <p className="text-2xl font-bold text-gray-400 tracking-tight">
+                    <p className="text-2xl font-bold brand-muted tracking-tight">
                         {formatValue(previousValue)}
                     </p>
                 </div>
 
-                <div className="bg-gray-900/40 rounded-lg p-4 border border-gray-700/50 flex items-center justify-between">
+                <div className="brand-card rounded-lg p-4 flex items-center justify-between">
                     <div>
                         <div className="flex items-center gap-1 mb-1">
-                            <p className="text-xs text-gray-500 font-medium">Growth</p>
+                            <p className="text-xs brand-muted font-medium">Growth</p>
                             <CalculationTooltip
                                 source="Calculated"
                                 calculation="(Current - Previous) / Previous * 100"
@@ -545,24 +646,24 @@ export function ComparisonCharts({
                         <AreaChart data={chartData.dailyData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
                             <defs>
                                 <linearGradient id="colorCurrent" x1="0" y1="0" x2="0" y2="1">
-                                    <stop offset="5%" stopColor="#EC4899" stopOpacity={0.3} />
-                                    <stop offset="95%" stopColor="#EC4899" stopOpacity={0} />
+                                    <stop offset="5%" stopColor={chartPrimary} stopOpacity={0.35} />
+                                    <stop offset="95%" stopColor={chartPrimary} stopOpacity={0} />
                                 </linearGradient>
                                 <linearGradient id="colorPrevious" x1="0" y1="0" x2="0" y2="1">
-                                    <stop offset="5%" stopColor="#9CA3AF" stopOpacity={0.1} />
-                                    <stop offset="95%" stopColor="#9CA3AF" stopOpacity={0} />
+                                    <stop offset="5%" stopColor={chartMuted} stopOpacity={0.12} />
+                                    <stop offset="95%" stopColor={chartMuted} stopOpacity={0} />
                                 </linearGradient>
                             </defs>
-                            <CartesianGrid strokeDasharray="3 3" stroke="#374151" vertical={false} />
+                            <CartesianGrid strokeDasharray="3 3" stroke={chartGrid} vertical={false} />
                             <XAxis
                                 dataKey="dayLabel"
-                                tick={{ fill: '#9CA3AF', fontSize: 12 }}
+                                tick={{ fill: chartMuted, fontSize: 12 }}
                                 axisLine={false}
                                 tickLine={false}
                                 minTickGap={30}
                             />
                             <YAxis
-                                tick={{ fill: '#9CA3AF', fontSize: 12 }}
+                                tick={{ fill: chartMuted, fontSize: 12 }}
                                 tickFormatter={(val) => selectedMetric === 'gmv' ? `$${val} ` : val}
                                 axisLine={false}
                                 tickLine={false}
@@ -574,12 +675,12 @@ export function ComparisonCharts({
                                 type="linear"
                                 dataKey="previous"
                                 name="Previous Period"
-                                stroke="#9CA3AF"
+                                stroke={chartMuted}
                                 strokeDasharray="5 5"
                                 strokeWidth={2}
                                 fillOpacity={1}
                                 fill="url(#colorPrevious)"
-                                dot={{ fill: '#9CA3AF', strokeWidth: 0, r: 3 }}
+                                dot={{ fill: chartMuted, strokeWidth: 0, r: 3 }}
                                 activeDot={{ r: 5 }}
                                 isAnimationActive={false}
                             />
@@ -587,45 +688,45 @@ export function ComparisonCharts({
                                 type="linear"
                                 dataKey="current"
                                 name="Current Period"
-                                stroke="#EC4899"
+                                stroke={chartPrimary}
                                 strokeWidth={2}
                                 fillOpacity={1}
                                 fill="url(#colorCurrent)"
-                                dot={{ fill: '#EC4899', strokeWidth: 0, r: 4 }}
+                                dot={{ fill: chartPrimary, strokeWidth: 0, r: 4 }}
                                 activeDot={{ r: 6 }}
                                 isAnimationActive={false}
                             />
                         </AreaChart>
                     ) : chartType === 'bar' ? (
                         <BarChart data={chartData.dailyData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
-                            <CartesianGrid strokeDasharray="3 3" stroke="#374151" vertical={false} />
+                            <CartesianGrid strokeDasharray="3 3" stroke={chartGrid} vertical={false} />
                             <XAxis
                                 dataKey="dayLabel"
-                                tick={{ fill: '#9CA3AF', fontSize: 12 }}
+                                tick={{ fill: chartMuted, fontSize: 12 }}
                                 axisLine={false}
                                 tickLine={false}
                             />
                             <YAxis
-                                tick={{ fill: '#9CA3AF', fontSize: 12 }}
+                                tick={{ fill: chartMuted, fontSize: 12 }}
                                 tickFormatter={(val) => selectedMetric === 'gmv' ? `$${val} ` : val}
                                 axisLine={false}
                                 tickLine={false}
                                 width={60}
                             />
-                            <Tooltip content={<CustomTooltip />} cursor={{ fill: '#374151', opacity: 0.4 }} />
+                            <Tooltip content={<CustomTooltip />} cursor={{ fill: chartCursor, opacity: 0.5 }} />
                             <Legend wrapperStyle={{ paddingTop: '20px' }} />
                             <Bar
                                 dataKey="previous"
                                 name="Previous Period"
-                                fill="#4B5563"
+                                fill={chartMuted}
                                 radius={[4, 4, 0, 0]}
-                                opacity={0.5}
+                                opacity={0.45}
                                 isAnimationActive={false}
                             />
                             <Bar
                                 dataKey="current"
                                 name="Current Period"
-                                fill="#06B6D4"
+                                fill={chartSecondary}
                                 radius={[4, 4, 0, 0]}
                                 isAnimationActive={false}
                             />

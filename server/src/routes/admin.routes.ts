@@ -31,9 +31,121 @@ function getActorId(req: express.Request): string | null {
     return (req as any).user?.id ?? null;
 }
 
+/**
+ * Before deleting a tenant: clear canonical product tenant on profiles and remove memberships
+ * for this tenant (cascades assignment rows tied to those memberships).
+ */
+async function detachUsersFromTenantBeforeDelete(tenantId: string): Promise<{
+    profilesCleared: number;
+    membershipsRemoved: number;
+}> {
+    const { count: profCount, error: cErr } = await supabase
+        .from('profiles')
+        .select('*', { count: 'exact', head: true })
+        .eq('tenant_id', tenantId);
+    if (cErr) throw cErr;
+    const { error: pErr } = await supabase.from('profiles').update({ tenant_id: null }).eq('tenant_id', tenantId);
+    if (pErr) throw pErr;
+
+    const { count: memCount, error: mcErr } = await supabase
+        .from('tenant_memberships')
+        .select('*', { count: 'exact', head: true })
+        .eq('tenant_id', tenantId);
+    if (mcErr) throw mcErr;
+    const { error: mErr } = await supabase.from('tenant_memberships').delete().eq('tenant_id', tenantId);
+    if (mErr) throw mErr;
+
+    return {
+        profilesCleared: profCount ?? 0,
+        membershipsRemoved: memCount ?? 0,
+    };
+}
+
+/**
+ * Other users (not `exceptUserId`) whose profiles.tenant_id still points at this tenant.
+ * Used before orphan tenant delete on user wipe so we do not null canonical tenant for others.
+ */
+async function listOtherCanonicalHolderIds(tenantId: string, exceptUserId: string): Promise<string[]> {
+    const { data, error } = await supabase.from('profiles').select('id').eq('tenant_id', tenantId).neq('id', exceptUserId);
+    if (error) throw error;
+    return (data || []).map((r: any) => r.id as string);
+}
+
+/**
+ * Prevent orphaning agency/seller tenants by removing the last tenant admin.
+ * Returns blocked tenant rows where target user is the only active admin.
+ */
+async function findLastAdminBlocksForUser(targetUserId: string): Promise<
+    Array<{ tenantId: string; tenantType: 'agency' | 'seller'; adminRole: 'Agency Admin' | 'Seller Admin' }>
+> {
+    const { data: adminMemberships, error } = await supabase
+        .from('tenant_memberships')
+        .select('tenant_id, roles(name), tenants(type)')
+        .eq('user_id', targetUserId)
+        .eq('status', 'active');
+    if (error) throw error;
+
+    const candidateMemberships = (adminMemberships || []).filter((m: any) => {
+        const tenantType = m.tenants?.type as string | undefined;
+        const roleName = m.roles?.name as string | undefined;
+        return (
+            (tenantType === 'agency' && roleName === 'Agency Admin') ||
+            (tenantType === 'seller' && roleName === 'Seller Admin')
+        );
+    });
+
+    const blocked: Array<{ tenantId: string; tenantType: 'agency' | 'seller'; adminRole: 'Agency Admin' | 'Seller Admin' }> = [];
+
+    for (const membership of candidateMemberships) {
+        const tenantId = membership.tenant_id as string;
+        const tenantType = membership.tenants?.type as 'agency' | 'seller';
+        const adminRole = (membership.roles?.name as 'Agency Admin' | 'Seller Admin');
+
+        const { data: adminRoleRows, error: roleErr } = await supabase
+            .from('roles')
+            .select('id')
+            .is('tenant_id', null)
+            .eq('name', adminRole);
+        if (roleErr) throw roleErr;
+        const adminRoleIds = (adminRoleRows || []).map((r: any) => r.id);
+        if (adminRoleIds.length === 0) continue;
+
+        const { count: activeAdminCount, error: cntErr } = await supabase
+            .from('tenant_memberships')
+            .select('*', { count: 'exact', head: true })
+            .eq('tenant_id', tenantId)
+            .eq('status', 'active')
+            .in('role_id', adminRoleIds);
+        if (cntErr) throw cntErr;
+
+        if ((activeAdminCount || 0) <= 1) {
+            blocked.push({ tenantId, tenantType, adminRole });
+        }
+    }
+
+    return blocked;
+}
+
+async function activeMembershipCountForTenant(tenantId: string): Promise<number> {
+    const { count, error } = await supabase
+        .from('tenant_memberships')
+        .select('*', { count: 'exact', head: true })
+        .eq('tenant_id', tenantId)
+        .eq('status', 'active');
+    if (error) throw error;
+    return count ?? 0;
+}
+
 /** Remove user from tenants; delete orphan seller/agency tenants when user was the only active member. */
-async function removeUserFromTenantsWithOrphanCleanup(targetUserId: string): Promise<{ tenantsDeleted: string[] }> {
+async function removeUserFromTenantsWithOrphanCleanup(
+    targetUserId: string,
+    actorId: string
+): Promise<{
+    tenantsDeleted: string[];
+    tenantsRetained: { tenantId: string; reason: string; otherUserIds: string[] }[];
+}> {
     const tenantsDeleted: string[] = [];
+    const tenantsRetained: { tenantId: string; reason: string; otherUserIds: string[] }[] = [];
 
     const { data: memberships, error: memErr } = await supabase
         .from('tenant_memberships')
@@ -96,7 +208,7 @@ async function removeUserFromTenantsWithOrphanCleanup(targetUserId: string): Pro
             if (chErr) throw chErr;
             if ((childCount ?? 0) > 0) {
                 for (const child of childSellers || []) {
-                    await unlinkSellerFromAgencyLifecycle(tenantId, (child as any).id);
+                    await unlinkSellerFromAgencyLifecycle(tenantId, (child as any).id, actorId);
                 }
                 const { error: delMemErr } = await supabase
                     .from('tenant_memberships')
@@ -107,6 +219,22 @@ async function removeUserFromTenantsWithOrphanCleanup(targetUserId: string): Pro
                 continue;
             }
 
+            const otherHolders = await listOtherCanonicalHolderIds(tenantId, targetUserId);
+            if (otherHolders.length > 0) {
+                const { error: delMemErr } = await supabase
+                    .from('tenant_memberships')
+                    .delete()
+                    .eq('user_id', targetUserId)
+                    .eq('tenant_id', tenantId);
+                if (delMemErr) throw delMemErr;
+                tenantsRetained.push({
+                    tenantId,
+                    reason: 'other_profiles_reference_canonical_tenant',
+                    otherUserIds: otherHolders,
+                });
+                continue;
+            }
+
             const { error: delTenantErr } = await supabase.from('tenants').delete().eq('id', tenantId);
             if (delTenantErr) throw delTenantErr;
             tenantsDeleted.push(tenantId);
@@ -114,6 +242,22 @@ async function removeUserFromTenantsWithOrphanCleanup(targetUserId: string): Pro
         }
 
         if (tType === 'seller') {
+            const otherHolders = await listOtherCanonicalHolderIds(tenantId, targetUserId);
+            if (otherHolders.length > 0) {
+                const { error: delMemErr } = await supabase
+                    .from('tenant_memberships')
+                    .delete()
+                    .eq('user_id', targetUserId)
+                    .eq('tenant_id', tenantId);
+                if (delMemErr) throw delMemErr;
+                tenantsRetained.push({
+                    tenantId,
+                    reason: 'other_profiles_reference_canonical_tenant',
+                    otherUserIds: otherHolders,
+                });
+                continue;
+            }
+
             const { error: accDelErr } = await supabase.from('accounts').delete().eq('tenant_id', tenantId);
             if (accDelErr) throw accDelErr;
             const { error: delTenantErr } = await supabase.from('tenants').delete().eq('id', tenantId);
@@ -122,11 +266,45 @@ async function removeUserFromTenantsWithOrphanCleanup(targetUserId: string): Pro
         }
     }
 
-    return { tenantsDeleted };
+    return { tenantsDeleted, tenantsRetained };
 }
 
 // Apply admin middleware to all routes
 router.use(adminMiddleware);
+
+// GET /api/admin/tenant-branding-map?tenantIds=uuid,uuid — display names + colors for console grouping (service role read)
+router.get('/tenant-branding-map', async (req, res) => {
+    try {
+        const raw = req.query.tenantIds;
+        const ids =
+            typeof raw === 'string'
+                ? raw
+                      .split(',')
+                      .map((s) => s.trim())
+                      .filter((id) => UUID_RE.test(id))
+                : [];
+        if (ids.length === 0) {
+            return res.json({ success: true, data: {} });
+        }
+        if (ids.length > 100) {
+            return res.status(400).json({ success: false, error: 'Too many tenant ids' });
+        }
+        const { data, error } = await supabase
+            .from('tenant_branding')
+            .select('tenant_id, display_name, primary_color')
+            .in('tenant_id', ids);
+        if (error) throw error;
+        const map: Record<string, { displayName: string | null; primaryColor: string | null }> = {};
+        for (const row of data || []) {
+            const r = row as { tenant_id: string; display_name: string | null; primary_color: string | null };
+            map[r.tenant_id] = { displayName: r.display_name, primaryColor: r.primary_color };
+        }
+        res.json({ success: true, data: map });
+    } catch (e: any) {
+        console.error('[Admin API] tenant-branding-map', e);
+        res.status(500).json({ success: false, error: e.message || 'Failed to load branding map' });
+    }
+});
 
 // GET /api/admin/stats - Platform-wide tenant-aware statistics
 router.get('/stats', async (req, res) => {
@@ -274,7 +452,16 @@ router.delete('/users/:id', async (req, res) => {
             return res.status(403).json({ success: false, error: 'You cannot delete your own account' });
         }
 
-        const { tenantsDeleted } = await removeUserFromTenantsWithOrphanCleanup(targetId);
+        const blockedByLastAdminRule = await findLastAdminBlocksForUser(targetId);
+        if (blockedByLastAdminRule.length > 0) {
+            return res.status(409).json({
+                success: false,
+                error: 'Cannot delete user: they are the last active tenant admin in one or more tenants',
+                data: { blockedTenants: blockedByLastAdminRule },
+            });
+        }
+
+        const { tenantsDeleted, tenantsRetained } = await removeUserFromTenantsWithOrphanCleanup(targetId, actorId);
 
         const { error: delAuthErr } = await supabase.auth.admin.deleteUser(targetId);
         if (delAuthErr) {
@@ -287,15 +474,80 @@ router.delete('/users/:id', async (req, res) => {
             action: 'admin.user_wipe',
             resourceType: 'user',
             resourceId: targetId,
-            metadata: { tenantsDeleted, deletedBy: actorId },
+            metadata: { tenantsDeleted, tenantsRetained, deletedBy: actorId },
         }).catch(() => undefined);
 
         res.json({
             success: true,
-            data: { deletedUserId: targetId, tenantsDeleted },
+            data: { deletedUserId: targetId, tenantsDeleted, tenantsRetained },
         });
     } catch (error: any) {
         console.error('[Admin API] DELETE user error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// POST /api/admin/users/:id/delete-with-owned-tenants
+// Force-delete user only when last-admin blocks are solely-owned seller tenants.
+router.post('/users/:id/delete-with-owned-tenants', async (req, res) => {
+    try {
+        const targetId = req.params.id;
+        const actorId = getActorId(req);
+        if (!UUID_RE.test(targetId)) {
+            return res.status(400).json({ success: false, error: 'Invalid user id' });
+        }
+        if (!actorId || targetId === actorId) {
+            return res.status(403).json({ success: false, error: 'You cannot delete your own account' });
+        }
+
+        const blockedByLastAdminRule = await findLastAdminBlocksForUser(targetId);
+        const hardBlocks: typeof blockedByLastAdminRule = [];
+
+        for (const block of blockedByLastAdminRule) {
+            if (block.tenantType !== 'seller') {
+                hardBlocks.push(block);
+                continue;
+            }
+            const activeCount = await activeMembershipCountForTenant(block.tenantId);
+            if (activeCount > 1) {
+                hardBlocks.push(block);
+            }
+        }
+
+        if (hardBlocks.length > 0) {
+            return res.status(409).json({
+                success: false,
+                error:
+                    'Cannot force-delete user while they are the last admin of shared tenants or agency tenants. Promote another admin first.',
+                data: { blockedTenants: hardBlocks },
+            });
+        }
+
+        const { tenantsDeleted, tenantsRetained } = await removeUserFromTenantsWithOrphanCleanup(targetId, actorId);
+
+        const { error: delAuthErr } = await supabase.auth.admin.deleteUser(targetId);
+        if (delAuthErr) {
+            return res.status(400).json({ success: false, error: delAuthErr.message });
+        }
+
+        auditLog(req, {
+            action: 'admin.user_wipe',
+            resourceType: 'user',
+            resourceId: targetId,
+            metadata: {
+                deletedBy: actorId,
+                mode: 'delete_with_owned_tenants',
+                tenantsDeleted,
+                tenantsRetained,
+            },
+        }).catch(() => undefined);
+
+        return res.json({
+            success: true,
+            data: { deletedUserId: targetId, tenantsDeleted, tenantsRetained },
+        });
+    } catch (error: any) {
+        console.error('[Admin API] delete-with-owned-tenants error:', error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
@@ -312,7 +564,16 @@ router.post('/users/:id/revoke-memberships', async (req, res) => {
             return res.status(403).json({ success: false, error: 'You cannot revoke your own memberships' });
         }
 
-        const { tenantsDeleted } = await removeUserFromTenantsWithOrphanCleanup(targetId);
+        const blockedByLastAdminRule = await findLastAdminBlocksForUser(targetId);
+        if (blockedByLastAdminRule.length > 0) {
+            return res.status(409).json({
+                success: false,
+                error: 'Cannot revoke memberships: user is the last active tenant admin in one or more tenants',
+                data: { blockedTenants: blockedByLastAdminRule },
+            });
+        }
+
+        const { tenantsDeleted, tenantsRetained } = await removeUserFromTenantsWithOrphanCleanup(targetId, actorId);
 
         const { error: wipeErr } = await supabase.from('tenant_memberships').delete().eq('user_id', targetId);
         if (wipeErr) throw wipeErr;
@@ -322,12 +583,12 @@ router.post('/users/:id/revoke-memberships', async (req, res) => {
             action: 'member.remove',
             resourceType: 'tenant_membership',
             resourceId: targetId,
-            metadata: { tenantsDeleted, revokedBy: actorId, scope: 'all_memberships' },
+            metadata: { tenantsDeleted, tenantsRetained, revokedBy: actorId, scope: 'all_memberships' },
         }).catch(() => undefined);
 
         res.json({
             success: true,
-            data: { userId: targetId, tenantsDeleted },
+            data: { userId: targetId, tenantsDeleted, tenantsRetained },
         });
     } catch (error: any) {
         console.error('[Admin API] revoke-memberships error:', error);
@@ -397,6 +658,15 @@ router.post('/users/:id/suspend', async (req, res) => {
         }
         if (!actorId || targetId === actorId) {
             return res.status(403).json({ success: false, error: 'You cannot suspend your own account' });
+        }
+
+        const blockedByLastAdminRule = await findLastAdminBlocksForUser(targetId);
+        if (blockedByLastAdminRule.length > 0) {
+            return res.status(409).json({
+                success: false,
+                error: 'Cannot suspend user: they are the last active tenant admin in one or more tenants',
+                data: { blockedTenants: blockedByLastAdminRule },
+            });
         }
 
         const { error } = await supabase.auth.admin.updateUserById(targetId, {
@@ -629,10 +899,14 @@ router.patch('/tenants/:id', async (req, res) => {
             (tenant as any).type,
             (updates.status as string | undefined) ?? null
         );
+        const patchActorId = getActorId(req);
+        if (!patchActorId) {
+            return res.status(401).json({ success: false, error: 'Unauthorized' });
+        }
         if (lifecycle.deactivateAgency) {
-            await deactivateAgencyLifecycle(id);
+            await deactivateAgencyLifecycle(id, patchActorId);
         } else if (lifecycle.deactivateSeller) {
-            await deactivateSellerLifecycle(id);
+            await deactivateSellerLifecycle(id, patchActorId);
         }
 
         res.json({ success: true, data: row });
@@ -660,6 +934,13 @@ router.delete('/tenants/:id', async (req, res) => {
             return res.status(400).json({ success: false, error: 'Cannot delete platform tenant' });
         }
 
+        const deleteActorId = getActorId(req);
+        if (!deleteActorId) {
+            return res.status(401).json({ success: false, error: 'Unauthorized' });
+        }
+
+        const detached = await detachUsersFromTenantBeforeDelete(id);
+
         if (tType === 'agency') {
             const { data: linkedSellers, error: linkedErr } = await supabase
                 .from('tenants')
@@ -669,7 +950,7 @@ router.delete('/tenants/:id', async (req, res) => {
             if (linkedErr) throw linkedErr;
 
             for (const seller of linkedSellers || []) {
-                await unlinkSellerFromAgencyLifecycle(id, (seller as any).id);
+                await unlinkSellerFromAgencyLifecycle(id, (seller as any).id, deleteActorId);
             }
             const { error: delErr } = await supabase.from('tenants').delete().eq('id', id);
             if (delErr) throw delErr;
@@ -679,9 +960,22 @@ router.delete('/tenants/:id', async (req, res) => {
                 resourceId: id,
                 tenantId: id,
                 beforeState: { type: 'agency' },
-                metadata: { unlinkedSellers: true },
+                metadata: {
+                    unlinkedSellers: true,
+                    profilesCanonicalCleared: detached.profilesCleared,
+                    membershipsRemoved: detached.membershipsRemoved,
+                },
             }).catch(() => undefined);
-            return res.json({ success: true, data: { deletedId: id, type: 'agency', unlinkedSellers: true } });
+            return res.json({
+                success: true,
+                data: {
+                    deletedId: id,
+                    type: 'agency',
+                    unlinkedSellers: true,
+                    profilesCanonicalCleared: detached.profilesCleared,
+                    membershipsRemoved: detached.membershipsRemoved,
+                },
+            });
         }
 
         if (tType === 'seller') {
@@ -695,9 +989,22 @@ router.delete('/tenants/:id', async (req, res) => {
                 resourceId: id,
                 tenantId: id,
                 beforeState: { type: 'seller' },
-                metadata: { accountsDeleted: true },
+                metadata: {
+                    accountsDeleted: true,
+                    profilesCanonicalCleared: detached.profilesCleared,
+                    membershipsRemoved: detached.membershipsRemoved,
+                },
             }).catch(() => undefined);
-            return res.json({ success: true, data: { deletedId: id, type: 'seller' } });
+            return res.json({
+                success: true,
+                data: {
+                    deletedId: id,
+                    type: 'seller',
+                    accountsDeleted: true,
+                    profilesCanonicalCleared: detached.profilesCleared,
+                    membershipsRemoved: detached.membershipsRemoved,
+                },
+            });
         }
 
         return res.status(400).json({ success: false, error: 'Unsupported tenant type' });

@@ -29,18 +29,18 @@ export function NewOrdersToast() {
 
     return (
         <div
-            className={`fixed top-8 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 rounded-2xl bg-gray-900/95 backdrop-blur-md px-5 py-3.5 shadow-2xl border border-gray-700/50 transition-all duration-400 ease-out ${
+            className={`fixed top-8 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 rounded-2xl brand-toast-info backdrop-blur-md px-5 py-3.5 shadow-2xl transition-all duration-400 ease-out ${
                 visible ? 'opacity-100 translate-y-0 scale-100' : 'opacity-0 -translate-y-4 scale-95 pointer-events-none'
             }`}
         >
-            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
-                <ShoppingBag className="h-4 w-4 text-indigo-400" />
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full" style={{ backgroundColor: 'var(--brand-info-bg)' }}>
+                <ShoppingBag className="h-4 w-4" style={{ color: 'var(--brand-toast-info-icon)' }} />
             </div>
             <div className="flex flex-col">
-                <span className="text-sm font-semibold text-white">
+                <span className="text-sm font-semibold brand-text">
                     {notification.count} new order{notification.count !== 1 ? 's' : ''} found
                 </span>
-                <span className="text-xs text-gray-400">Synced in the background</span>
+                <span className="text-xs brand-muted">Synced in the background</span>
             </div>
         </div>
     );

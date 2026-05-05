@@ -1,14 +1,15 @@
 import { useState } from 'react';
 import { Account } from '../../lib/supabase';
+import { getApiOrigin } from '../../lib/apiClient';
 import { toLocalDateString } from '../../utils/dateUtils';
+
+const API_BASE_URL = getApiOrigin();
 
 interface DataAuditViewProps {
     account: Account;
     shopId?: string;
     timezone?: string;
 }
-
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001';
 
 interface ApiResult {
     api_name: string;

@@ -10,11 +10,11 @@ interface ProductCardProps {
 export function ProductCard({ product, onClick, salesCount }: ProductCardProps) {
     const getStatusColor = (status: string) => {
         switch (status?.toLowerCase()) {
-            case 'active': return 'text-green-400 bg-green-900/50';
-            case 'inactive': return 'text-gray-400 bg-gray-700/50';
-            case 'frozen': return 'text-blue-400 bg-blue-900/50';
-            case 'deleted': return 'text-red-400 bg-red-900/50';
-            default: return 'text-gray-400 bg-gray-700/50';
+            case 'active': return 'brand-state-success';
+            case 'inactive': return 'brand-card brand-muted';
+            case 'frozen': return 'brand-state-info';
+            case 'deleted': return 'brand-state-danger';
+            default: return 'brand-card brand-muted';
         }
     };
 
@@ -38,9 +38,9 @@ export function ProductCard({ product, onClick, salesCount }: ProductCardProps) 
     return (
         <div
             onClick={onClick}
-            className="bg-gray-800 rounded-xl p-4 border border-gray-700 hover:border-pink-500 transition-all cursor-pointer group flex flex-col h-full"
+            className="brand-card rounded-xl p-4 transition-all cursor-pointer group flex flex-col h-full brand-card-hover"
         >
-            <div className="relative aspect-square mb-4 rounded-lg overflow-hidden bg-gray-700">
+            <div className="relative aspect-square mb-4 rounded-lg overflow-hidden" style={{ backgroundColor: 'var(--brand-interactive-hover-bg)' }}>
                 {product.main_image_url ? (
                     <img
                         src={product.main_image_url}
@@ -49,20 +49,20 @@ export function ProductCard({ product, onClick, salesCount }: ProductCardProps) 
                     />
                 ) : (
                     <div className="w-full h-full flex items-center justify-center">
-                        <Package size={48} className="text-gray-600" />
+                        <Package size={48} className="brand-muted" />
                     </div>
                 )}
                 <div className="absolute top-2 right-2 flex gap-2 ">
-                    <span className={`px-2 py-1 bg-gray-700/100 rounded-full text-xs font-medium ${getStatusColor(product.status)}`}>
+                    <span className={`px-2 py-1 rounded-full text-xs font-medium ${getStatusColor(product.status)}`}>
                         {product.status}
                     </span>
                     {product.is_fbt && (
-                        <span className="px-2 py-1 rounded-full text-xs font-medium bg-blue-900/100 text-blue-400" title="Fulfilled by TikTok">
+                        <span className="px-2 py-1 rounded-full text-xs font-medium brand-state-info" title="Fulfilled by TikTok">
                             FBT
                         </span>
                     )}
                     {hasMultipleSkus && (
-                        <span className="px-2 py-1 rounded-full text-xs font-medium bg-pink-900/100 text-pink-400">
+                        <span className="px-2 py-1 rounded-full text-xs font-medium" style={{ color: 'var(--brand-primary)', backgroundColor: 'var(--brand-interactive-hover-bg)', border: '1px solid var(--brand-card-border)' }}>
                             {skus.length} variants
                         </span>
                     )}
@@ -70,33 +70,33 @@ export function ProductCard({ product, onClick, salesCount }: ProductCardProps) 
             </div>
 
             <div className="flex-1">
-                <h3 className="text-white font-medium line-clamp-2 mb-2 h-12" title={product.name}>
+                <h3 className="brand-text font-medium line-clamp-2 mb-2 h-12" title={product.name}>
                     {product.name}
                 </h3>
 
                 <div className="flex items-baseline gap-1 mb-4">
                     {hasPriceRange ? (
-                        <span className="text-lg font-bold text-pink-500">
+                        <span className="text-lg font-bold" style={{ color: 'var(--brand-primary)' }}>
                             {product.currency} {minPrice.toFixed(2)} - {maxPrice.toFixed(2)}
                         </span>
                     ) : (
-                        <span className="text-lg font-bold text-pink-500">
+                        <span className="text-lg font-bold" style={{ color: 'var(--brand-primary)' }}>
                             {product.currency} {product.price}
                         </span>
                     )}
                 </div>
 
                 <div className="grid grid-cols-2 gap-2 text-sm">
-                    <div className="bg-gray-700/30 p-2 rounded-lg">
-                        <p className="text-gray-400 text-xs mb-1">Stock</p>
-                        <p className="text-white font-medium flex items-center gap-1">
+                    <div className="p-2 rounded-lg" style={{ backgroundColor: 'var(--brand-interactive-hover-bg)' }}>
+                        <p className="brand-muted text-xs mb-1">Stock</p>
+                        <p className="brand-text font-medium flex items-center gap-1">
                             <Package size={12} />
                             {displayStock}
                         </p>
                     </div>
-                    <div className="bg-gray-700/30 p-2 rounded-lg">
-                        <p className="text-gray-400 text-xs mb-1">Sales</p>
-                        <p className="text-white font-medium flex items-center gap-1">
+                    <div className="p-2 rounded-lg" style={{ backgroundColor: 'var(--brand-interactive-hover-bg)' }}>
+                        <p className="brand-muted text-xs mb-1">Sales</p>
+                        <p className="brand-text font-medium flex items-center gap-1">
                             <BarChart2 size={12} />
                             {salesCount !== undefined ? salesCount : product.sales_count}
                         </p>
@@ -105,7 +105,7 @@ export function ProductCard({ product, onClick, salesCount }: ProductCardProps) 
             </div>
 
             {displayStock === 0 && (
-                <div className="mt-3 flex items-center gap-2 text-red-400 text-xs bg-red-900/20 p-2 rounded-lg">
+                <div className="mt-3 flex items-center gap-2 text-xs p-2 rounded-lg brand-state-danger">
                     <AlertCircle size={12} />
                     <span>Out of stock</span>
                 </div>
@@ -113,7 +113,7 @@ export function ProductCard({ product, onClick, salesCount }: ProductCardProps) 
 
             {/* Show COGS missing indicator for all products without COGS */}
             {(product.cogs === null || product.cogs === undefined || product.cogs === 0) && (
-                <div className="mt-3 flex items-center gap-2 text-orange-400 text-xs bg-orange-900/20 p-2 rounded-lg">
+                <div className="mt-3 flex items-center gap-2 text-xs p-2 rounded-lg brand-state-warning">
                     <DollarSign size={12} />
                     <span>COGS not set — Click to add</span>
                 </div>

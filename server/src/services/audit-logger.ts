@@ -53,6 +53,8 @@ export type AuditAction =
     | 'auth.tiktok_start'
     | 'auth.tiktok_finalize'
     | 'auth.ads_connect'
+    | 'branding.create'
+    | 'branding.update'
     // Generic escape hatch
     | (string & {});
 

@@ -1,7 +1,10 @@
 import { createContext, useContext, useMemo, type ReactNode } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { supabase } from '../lib/supabase';
+import { fetchBranding } from '../lib/brandingApi';
 import { useAuth } from './AuthContext';
+
+const SELLER_FACING_BRANDING_QUERY_KEY = 'seller-facing-branding';
 
 export type MembershipRow = {
     id: string;
@@ -21,6 +24,15 @@ export type MembershipRow = {
         scope: string;
         type: string;
     } | null;
+    membership_roles?: Array<{
+        revoked_at: string | null;
+        roles: {
+            id: string;
+            name: string;
+            scope: string;
+            type: string;
+        } | null;
+    }>;
 };
 
 export type ManageableTenant = {
@@ -45,25 +57,38 @@ export type PrimaryRoleBadge = {
     variant: PrimaryRoleBadgeVariant;
 };
 
+function membershipActiveRoleNames(m: MembershipRow): string[] {
+    const names = new Set<string>();
+    if (m.roles?.name) names.add(m.roles.name);
+    for (const mr of m.membership_roles || []) {
+        if (!mr?.revoked_at && mr.roles?.name) names.add(mr.roles.name);
+    }
+    return Array.from(names);
+}
+
 /** Pick one label to show when the user has several tenant roles. */
 export function computePrimaryRoleBadge(memberships: MembershipRow[]): PrimaryRoleBadge | null {
-    const active = memberships.filter((m) => m.status === 'active' && m.roles?.name);
-    if (active.some((m) => m.tenants?.type === 'platform' && m.roles?.name === 'Super Admin')) {
+    const active = memberships.filter((m) => m.status === 'active');
+    const hasRole = (name: string, tenantType?: string) =>
+        active.some((m) => (!tenantType || m.tenants?.type === tenantType) && membershipActiveRoleNames(m).includes(name));
+
+    if (hasRole('Super Admin', 'platform')) {
         return { label: 'SUPER ADMIN', variant: 'super' };
     }
-    if (active.some((m) => m.tenants?.type === 'agency' && m.roles?.name === 'Agency Admin')) {
+    if (hasRole('Agency Admin', 'agency')) {
         return { label: 'AGENCY ADMIN', variant: 'agency' };
     }
-    if (active.some((m) => m.roles?.name === 'Account Manager')) {
-        return { label: 'ACCOUNT MANAGER', variant: 'account_mgr' };
+    const hasAM = hasRole('Account Manager');
+    const hasAC = hasRole('Account Coordinator');
+    if (hasAM && hasAC) {
+        return { label: 'AC & AM', variant: 'account_mgr' };
     }
-    if (active.some((m) => m.roles?.name === 'Account Coordinator')) {
-        return { label: 'ACCOUNT COORDINATOR', variant: 'account_coord' };
-    }
-    if (active.some((m) => m.tenants?.type === 'seller' && m.roles?.name === 'Seller Admin')) {
+    if (hasAM) return { label: 'ACCOUNT MANAGER', variant: 'account_mgr' };
+    if (hasAC) return { label: 'ACCOUNT COORDINATOR', variant: 'account_coord' };
+    if (hasRole('Seller Admin', 'seller')) {
         return { label: 'SELLER ADMIN', variant: 'seller_admin' };
     }
-    if (active.some((m) => m.roles?.name === 'Seller User')) {
+    if (hasRole('Seller User')) {
         return { label: 'SELLER USER', variant: 'seller_user' };
     }
 
@@ -114,6 +139,16 @@ export function primaryRoleBadgeClassName(variant: PrimaryRoleBadgeVariant): str
 }
 
 type TenantContextValue = {
+    /** `profiles.tenant_id` for the signed-in user (JWT product context). */
+    profileTenantId: string | null;
+    /** Type of the canonical tenant row (`tenants.type`), when resolved. Used for agency-branded console without waiting on memberships. */
+    profileTenantType: string | null;
+    /** Status of canonical tenant row (`active` | `inactive` | `suspended`). */
+    profileTenantStatus: string | null;
+    /** Seller tenant's managing agency (`tenants.parent_tenant_id`); null if standalone seller. */
+    profileTenantParentId: string | null;
+    /** True when JWT tenant is an agency or a seller linked to an agency — seller-facing branding API applies. */
+    sellerFacingBrandingEligible: boolean;
     memberships: MembershipRow[];
     loading: boolean;
     refetch: () => void;
@@ -129,48 +164,107 @@ type TenantContextValue = {
     hasAgencyAccess: boolean;
     /** True when user is a system Account Manager assigned to this seller tenant (AM scope). */
     isAccountManagerAssignedToSeller: (sellerTenantId: string | null | undefined) => boolean;
+    /** True when the current tenant context is inactive/suspended. */
+    isTenantAccessLocked: boolean;
+    tenantAccessLockReason: 'inactive' | 'suspended' | null;
 };
 
 const TenantContext = createContext<TenantContextValue | null>(null);
 
 export function TenantProvider({ children }: { children: ReactNode }) {
     const { user } = useAuth();
+    const queryClient = useQueryClient();
 
-    const { data: profileTenant, isLoading: loadingProfileTenant } = useQuery({
+    const { data: profileContext, isLoading: loadingProfileTenant } = useQuery({
         queryKey: ['profile-tenant', user?.id],
         queryFn: async () => {
             const { data, error } = await supabase
                 .from('profiles')
-                .select('tenant_id')
+                .select('tenant_id, tenants(type,status,parent_tenant_id)')
                 .eq('id', user!.id)
-                .single();
+                .maybeSingle();
             if (error) throw error;
-            return data?.tenant_id as string | null;
+            const tenantId = (data?.tenant_id ?? null) as string | null;
+            const t = data?.tenants as
+                | { type?: string; status?: string; parent_tenant_id?: string | null }
+                | { type?: string; status?: string; parent_tenant_id?: string | null }[]
+                | null
+                | undefined;
+            const row = Array.isArray(t) ? t[0] : t;
+            let tenantType = row?.type ?? null;
+            let tenantStatus = row?.status ?? null;
+            let tenantParentId = (row?.parent_tenant_id ?? null) as string | null;
+            if (tenantId && (!tenantType || !tenantStatus)) {
+                const { data: trow, error: tErr } = await supabase
+                    .from('tenants')
+                    .select('type, status, parent_tenant_id')
+                    .eq('id', tenantId)
+                    .maybeSingle();
+                if (!tErr && trow?.type) tenantType = trow.type as string;
+                if (!tErr && trow?.status) tenantStatus = trow.status as string;
+                if (!tErr && trow && 'parent_tenant_id' in trow) {
+                    tenantParentId = (trow.parent_tenant_id ?? null) as string | null;
+                }
+            }
+
+            const brandingEligible =
+                Boolean(tenantId && tenantType) &&
+                (tenantType === 'agency' || (tenantType === 'seller' && tenantParentId != null));
+
+            if (brandingEligible && tenantId) {
+                try {
+                    await queryClient.prefetchQuery({
+                        queryKey: [SELLER_FACING_BRANDING_QUERY_KEY, tenantId],
+                        queryFn: () => fetchBranding(),
+                        staleTime: 30 * 60 * 1000,
+                        gcTime: 60 * 60 * 1000,
+                    });
+                } catch (e) {
+                    console.warn('[TenantProvider] branding prefetch failed', e);
+                }
+            }
+
+            return { tenantId, tenantType, tenantStatus, tenantParentId };
         },
         enabled: !!user?.id,
     });
 
+    const profileTenantId = profileContext?.tenantId ?? null;
+    const profileTenantType = profileContext?.tenantType ?? null;
+    const profileTenantStatus = profileContext?.tenantStatus ?? null;
+    const profileTenantParentId = profileContext?.tenantParentId ?? null;
+
+    const sellerFacingBrandingEligible = useMemo(() => {
+        if (!profileTenantId || !profileTenantType) return false;
+        if (profileTenantType === 'agency') return true;
+        if (profileTenantType === 'seller') return profileTenantParentId != null;
+        return false;
+    }, [profileTenantId, profileTenantType, profileTenantParentId]);
+
     const { data: memberships = [], isLoading: loadingMemberships, refetch } = useQuery({
-        queryKey: ['tenant-memberships', user?.id, profileTenant],
+        queryKey: ['tenant-memberships', user?.id, profileTenantId],
         queryFn: async () => {
             const { data, error } = await supabase
                 .from('tenant_memberships')
                 .select(
-                    `id, tenant_id, role_id, status, tenants ( id, name, type, parent_tenant_id, status ), roles ( id, name, scope, type )`
+                    `id, tenant_id, role_id, status, tenants ( id, name, type, parent_tenant_id, status ), roles ( id, name, scope, type ), membership_roles ( revoked_at, roles ( id, name, scope, type ) )`
                 )
                 .eq('user_id', user!.id)
                 .eq('status', 'active');
             if (error) throw error;
 
+            const tid = profileTenantId;
             const rows = ((data || []) as unknown as MembershipRow[]).filter((m) => {
                 const type = m.tenants?.type;
                 if (type === 'platform') return true;
-                return !!profileTenant && m.tenant_id === profileTenant;
+                return !!tid && m.tenant_id === tid;
             });
 
             return rows;
         },
-        enabled: !!user?.id,
+        // Wait for profile tenant — otherwise profileTenantId is undefined, filter strips seller/agency rows,
+        // primaryRoleBadge is wrong briefly (Sidebar falls back to profiles.role "CLIENT").
+        enabled: Boolean(user?.id && !loadingProfileTenant),
     });
 
     const isLoading = loadingProfileTenant || loadingMemberships;
@@ -216,8 +310,16 @@ export function TenantProvider({ children }: { children: ReactNode }) {
                 .in('agency_tenant_id', agencyMembershipIds);
             if (error) throw error;
             return (data || [])
-                .map((row: any) => row.tenants)
-                .filter((t: any) => t && t.status === 'active') as { id: string; name: string; type: string }[];
+                .map((row: any) => ({
+                    seller_tenant_id: row.seller_tenant_id as string,
+                    agency_tenant_id: row.agency_tenant_id as string,
+                    tenant: row.tenants as { id: string; name: string; type: string; status: string } | null,
+                }))
+                .filter((row: any) => row.tenant && row.tenant.status === 'active') as {
+                    seller_tenant_id: string;
+                    agency_tenant_id: string;
+                    tenant: { id: string; name: string; type: string; status: string };
+                }[];
         },
         enabled: !!user?.id && agencyMembershipIds.length > 0,
     });
@@ -229,24 +331,24 @@ export function TenantProvider({ children }: { children: ReactNode }) {
                 (m) =>
                     m.tenant_id === agencyTenantId &&
                     m.tenants?.type === 'agency' &&
-                    m.roles?.name === 'Agency Admin'
+                    membershipActiveRoleNames(m).includes('Agency Admin')
             );
         const isAccountManagerOn = (agencyTenantId: string) =>
             memberships.some(
                 (m) =>
                     m.tenant_id === agencyTenantId &&
                     m.tenants?.type === 'agency' &&
-                    m.roles?.name === 'Account Manager'
+                    membershipActiveRoleNames(m).includes('Account Manager')
             );
         const isSellerAdminOn = (sellerTenantId: string) =>
             memberships.some(
                 (m) =>
                     m.tenant_id === sellerTenantId &&
                     m.tenants?.type === 'seller' &&
-                    m.roles?.name === 'Seller Admin'
+                    membershipActiveRoleNames(m).includes('Seller Admin')
             );
         const isPlatformSuperAdmin = memberships.some(
-            (m) => m.tenants?.type === 'platform' && m.roles?.name === 'Super Admin'
+            (m) => m.tenants?.type === 'platform' && membershipActiveRoleNames(m).includes('Super Admin')
         );
         const primaryRoleBadge = computePrimaryRoleBadge(memberships);
         const manageableAdminTenants: ManageableTenant[] = [];
@@ -254,11 +356,11 @@ export function TenantProvider({ children }: { children: ReactNode }) {
         for (const m of memberships) {
             const t = m.tenants;
             if (!t || seen.has(m.tenant_id)) continue;
-            if (t.type === 'agency' && m.roles?.name === 'Agency Admin') {
+            if (t.type === 'agency' && membershipActiveRoleNames(m).includes('Agency Admin')) {
                 seen.add(m.tenant_id);
                 manageableAdminTenants.push({ id: m.tenant_id, name: t.name, type: 'agency' });
             }
-            if (t.type === 'seller' && m.roles?.name === 'Seller Admin') {
+            if (t.type === 'seller' && membershipActiveRoleNames(m).includes('Seller Admin')) {
                 seen.add(m.tenant_id);
                 manageableAdminTenants.push({ id: m.tenant_id, name: t.name, type: 'seller' });
             }
@@ -271,17 +373,37 @@ export function TenantProvider({ children }: { children: ReactNode }) {
             }
         }
         // Include sellers assigned to AM memberships
-        for (const seller of amAssignedSellerTenants) {
+        for (const row of amAssignedSellerTenants) {
+            const seller = row.tenant;
             if (!seen.has(seller.id)) {
                 seen.add(seller.id);
                 manageableAdminTenants.push({ id: seller.id, name: seller.name, type: 'seller' });
             }
         }
-        const assignedSellerIds = new Set(amAssignedSellerTenants.map((s) => s.id));
+        // Strictly AM-only: assignment alone is not enough (AC assignments must not enable AM-only actions).
+        const assignedSellerIds = new Set(
+            amAssignedSellerTenants
+                .filter((row) => isAccountManagerOn(row.agency_tenant_id))
+                .map((row) => row.seller_tenant_id)
+        );
         const isAccountManagerAssignedToSeller = (sellerTenantId: string | null | undefined) =>
             Boolean(sellerTenantId && assignedSellerIds.has(sellerTenantId));
+        const lockSourceStatus =
+            profileTenantStatus ||
+            memberships.find((m) => m.tenant_id === profileTenantId)?.tenants?.status ||
+            null;
+        const isTenantAccessLocked = lockSourceStatus === 'inactive' || lockSourceStatus === 'suspended';
+        const tenantAccessLockReason =
+            lockSourceStatus === 'inactive' || lockSourceStatus === 'suspended'
+                ? (lockSourceStatus as 'inactive' | 'suspended')
+                : null;
 
         return {
+            profileTenantId: profileTenantId ?? null,
+            profileTenantType: profileTenantType ?? null,
+            profileTenantStatus,
+            profileTenantParentId,
+            sellerFacingBrandingEligible,
             memberships,
             loading: isLoading,
             refetch,
@@ -294,8 +416,21 @@ export function TenantProvider({ children }: { children: ReactNode }) {
             manageableAdminTenants,
             hasAgencyAccess: agencyMemberships.length > 0,
             isAccountManagerAssignedToSeller,
+            isTenantAccessLocked,
+            tenantAccessLockReason,
         };
-    }, [memberships, isLoading, refetch, linkedSellerTenants, amAssignedSellerTenants]);
+    }, [
+        profileTenantId,
+        profileTenantType,
+        profileTenantStatus,
+        profileTenantParentId,
+        sellerFacingBrandingEligible,
+        memberships,
+        isLoading,
+        refetch,
+        linkedSellerTenants,
+        amAssignedSellerTenants,
+    ]);
 
     return <TenantContext.Provider value={value}>{children}</TenantContext.Provider>;
 }

@@ -1,5 +1,6 @@
 import type { NextFunction, Request, Response } from 'express';
 import { supabase } from '../config/supabase.js';
+import { statusDisablesTenantAccess } from '../services/tenant-lifecycle.service.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -7,6 +8,7 @@ export type RequestTenantContext = {
     userId: string;
     tenantId: string;
     tenantType: 'seller' | 'agency';
+    tenantStatus: string;
     assignedSellerIds: string[];
 };
 
@@ -59,6 +61,29 @@ export async function resolveRequestTenantContext(req: Request): Promise<Request
 
     const row = Array.isArray(data) ? data[0] : data;
     if (!row?.tenant_id || (row.tenant_type !== 'seller' && row.tenant_type !== 'agency')) {
+        // Platform-level super admins may not have a product tenant context row.
+        // Return a synthetic active context so downstream auth can apply super-admin bypass.
+        if (await userIsPlatformSuperAdmin(userId)) {
+            return {
+                userId,
+                tenantId: '00000000-0000-0000-0000-000000000000',
+                tenantType: 'agency',
+                tenantStatus: 'active',
+                assignedSellerIds: [],
+            };
+        }
+        return null;
+    }
+
+    const { data: tenantRow, error: tenantErr } = await supabase
+        .from('tenants')
+        .select('status')
+        .eq('id', row.tenant_id)
+        .maybeSingle();
+    if (tenantErr || !tenantRow?.status) {
+        if (tenantErr) {
+            console.error('[account-access] resolve tenant status', tenantErr.message);
+        }
         return null;
     }
 
@@ -66,6 +91,7 @@ export async function resolveRequestTenantContext(req: Request): Promise<Request
         userId,
         tenantId: row.tenant_id,
         tenantType: row.tenant_type,
+        tenantStatus: tenantRow.status as string,
         assignedSellerIds: uniqueIds(row.assigned_seller_ids),
     };
 }
@@ -166,6 +192,10 @@ export async function enforceRequestAccountAccess(req: Request, res: Response, n
             res.status(401).json({ success: false, error: 'Authorization required' });
             return;
         }
+        if (statusDisablesTenantAccess(ctx.tenantStatus)) {
+            res.status(403).json({ success: false, error: 'Access blocked while tenant is inactive or suspended' });
+            return;
+        }
         for (const accountId of ids) {
             const ok = await userCanAccessAccount(ctx.userId, accountId, req.method, req);
             if (!ok) {
@@ -197,6 +227,10 @@ export function verifyAccountIdParam(req: Request, res: Response, next: NextFunc
                 res.status(401).json({ success: false, error: 'Authorization required' });
                 return;
             }
+            if (statusDisablesTenantAccess(ctx.tenantStatus)) {
+                res.status(403).json({ success: false, error: 'Access blocked while tenant is inactive or suspended' });
+                return;
+            }
             const ok = await userCanAccessAccount(ctx.userId, accountId, req.method, req);
             if (!ok) {
                 res.status(403).json({
@@ -225,6 +259,10 @@ export async function enforceBodyAccountAccess(req: Request, res: Response, next
         const ctx = await resolveRequestTenantContext(req);
         if (!ctx) {
             res.status(401).json({ success: false, error: 'Authorization required' });
+            return;
+        }
+        if (statusDisablesTenantAccess(ctx.tenantStatus)) {
+            res.status(403).json({ success: false, error: 'Access blocked while tenant is inactive or suspended' });
             return;
         }
         const ok = await userCanAccessAccount(ctx.userId, accountId, req.method, req);

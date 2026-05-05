@@ -5,6 +5,7 @@ import { supabase } from '../../lib/supabase';
 import { platformCreateAgencyWithOwner, platformLinkSellerToAgency, type PlatformProfileSearchRow, type PlatformTenantSearchRow } from '../../lib/platformRpc';
 import { grantSuperAdminMembership, listPlatformSuperAdmins, revokeSuperAdminMembership } from '../../lib/tenantRolesRpc';
 import { useTenantContext } from '../../contexts/TenantContext';
+import { showAppToast } from '../../store/useAppToastStore';
 import { OperatorProfilePicker, OperatorTenantPicker } from '../platform/PlatformOperatorPickers';
 
 type SuperAdminRow = {
@@ -23,7 +24,6 @@ export function PlatformTenantsView() {
 
     const [tab, setTab] = useState<TabId>('agencies');
     const [busy, setBusy] = useState<string | null>(null);
-    const [msg, setMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
 
     const [agencyName, setAgencyName] = useState('');
     const [agencyOwner, setAgencyOwner] = useState<PlatformProfileSearchRow | null>(null);
@@ -74,8 +74,7 @@ export function PlatformTenantsView() {
     });
 
     const flash = (type: 'ok' | 'err', text: string) => {
-        setMsg({ type, text });
-        setTimeout(() => setMsg(null), 6000);
+        showAppToast(text, type === 'ok' ? 'ok' : 'err');
     };
 
     const superGrantTargetId = superGrantUser?.id?.trim() || superAdminUuidFallback.trim();
@@ -184,18 +183,6 @@ export function PlatformTenantsView() {
                     </button>
                 ))}
             </div>
-
-            {msg && (
-                <div
-                    className={`mb-6 text-sm px-4 py-3 rounded-xl border ${
-                        msg.type === 'ok'
-                            ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
-                            : 'bg-red-500/10 border-red-500/30 text-red-300'
-                    }`}
-                >
-                    {msg.text}
-                </div>
-            )}
 
             {tab === 'guide' && (
                 <section className="rounded-2xl border border-gray-700 bg-gray-900/40 p-6 text-sm text-gray-300 space-y-4">

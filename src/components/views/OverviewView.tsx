@@ -30,9 +30,23 @@ import {
   mergeStatementShipping,
   feesBaseFromStatements,
 } from '../../utils/plFeeAggregation';
+import { scopedPlDataFromCache } from '../../utils/plDataRangeGuard';
 
 // Use paid_time for filtering (matches backend which loads by paid_time)
 const getOrderTs = (o: Order): number => Number(o.paid_time || o.created_time);
+
+/** Legacy metric id `netSales` pointed at TikTok statement totals; the slot now shows gross profit. */
+function normalizeDashboardMetricIds(ids: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const id of ids) {
+    const next = id === 'netSales' ? 'grossProfit' : id;
+    if (seen.has(next)) continue;
+    seen.add(next);
+    out.push(next);
+  }
+  return out;
+}
 
 import { DateRangePicker, DateRange } from '../DateRangePicker';
 import { TokenExpirationWarning } from '../TokenExpirationWarning';
@@ -74,6 +88,67 @@ function formatKeyMetricTrendPercent(pct: number): string {
   }).format(Math.abs(pct));
 }
 
+const DASHBOARD_RECIPIENT_EMAIL_MAX_LEN = 254;
+
+/**
+ * Client-side checks before calling email / digest APIs (length, structure, allowed characters).
+ */
+function validateDashboardRecipientEmail(raw: string): { ok: true; email: string } | { ok: false; message: string } {
+  const email = raw.trim();
+  if (!email) {
+    return { ok: false, message: 'Enter the email address you want to send the report to.' };
+  }
+  if (email.length > DASHBOARD_RECIPIENT_EMAIL_MAX_LEN) {
+    return { ok: false, message: 'That email address is too long.' };
+  }
+  if (/[\s\u0000-\u001F]/.test(email)) {
+    return { ok: false, message: 'Remove spaces and line breaks from the email address.' };
+  }
+  const at = email.indexOf('@');
+  const lastAt = email.lastIndexOf('@');
+  if (at === -1 || at !== lastAt) {
+    return { ok: false, message: 'Use exactly one @ (for example, name@company.com).' };
+  }
+  const local = email.slice(0, at);
+  const domain = email.slice(at + 1);
+  if (!local || local.length > 64) {
+    return { ok: false, message: 'The part before @ is missing or too long (max 64 characters).' };
+  }
+  if (!domain || domain.length > 253) {
+    return { ok: false, message: 'The part after @ is missing or too long.' };
+  }
+  if (local.startsWith('.') || local.endsWith('.') || local.includes('..')) {
+    return { ok: false, message: 'The part before @ cannot start or end with a dot, or contain two dots in a row.' };
+  }
+  if (
+    domain.startsWith('.') ||
+    domain.endsWith('.') ||
+    domain.includes('..') ||
+    domain.startsWith('-') ||
+    domain.endsWith('-')
+  ) {
+    return { ok: false, message: 'Enter a valid domain after @ (for example, company.com).' };
+  }
+  const labels = domain.split('.');
+  if (labels.length < 2 || labels.some((l) => !l.length)) {
+    return { ok: false, message: 'Include a domain with a dot (for example, name@company.com).' };
+  }
+  const tld = labels[labels.length - 1];
+  if (tld.length < 2 || !/^[a-zA-Z0-9-]+$/.test(tld)) {
+    return { ok: false, message: 'The domain ending (after the last dot) must be at least two letters or numbers.' };
+  }
+  if (!/^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+$/.test(local)) {
+    return { ok: false, message: 'That email contains characters that are not allowed before @.' };
+  }
+  if (!/^[a-zA-Z0-9.-]+$/.test(domain)) {
+    return { ok: false, message: 'The domain contains characters that are not allowed.' };
+  }
+  if (!labels.every((label) => /^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$/.test(label))) {
+    return { ok: false, message: 'Each segment of the domain must be valid (letters, numbers, hyphens).' };
+  }
+  return { ok: true, email };
+}
+
 export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles', onTimezoneChange, onTabChange }: OverviewViewProps) {
   const { user } = useAuth();
   const { loading: tenantCtxLoading, isAccountManagerAssignedToSeller } = useTenantContext();
@@ -92,17 +167,20 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
   const syncData = useShopStore(state => state.syncData);
   const cacheMetadata = useShopStore(state => state.cacheMetadata);
   const syncProgress = useShopStore(state => state.syncProgress);
+  const syncProgressShopId = useShopStore(state => state.syncProgressShopId);
+  const shopDataFetchQueued = useShopStore(state => state.shopDataFetchQueued);
+  const queuedShopDataRequestShopId = useShopStore(state => state.queuedShopDataRequestShopId);
+  const queuedShopDataRequestRange = useShopStore(state => state.queuedShopDataRequestRange);
   const dismissRefreshPrompt = useShopStore(state => state.dismissRefreshPrompt);
 
   const orders = useShopStore(state => state.orders);
   const products = useShopStore(state => state.products);
   const finance = useShopStore(state => state.finance);
   const dataVersion = useShopStore(state => state.dataVersion);
-  const plData = useShopStore(state => state.plData);
+  const plDataRaw = useShopStore(state => state.plData);
+  const plDataKey = useShopStore(state => state.plDataKey);
+  const plDataCache = useShopStore(state => state.plDataCache);
   const fetchPLData = useShopStore(state => state.fetchPLData);
-
-  // TikTok Ads store
-
 
   // Load default date preset from localStorage
   const [defaultDatePreset, setDefaultDatePreset] = useState<string>(() => {
@@ -115,6 +193,18 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
 
   // Initialize date range based on saved preset
   const [dateRange, setDateRange] = useState<DateRange>(getDefaultDateRange(timezone));
+
+  /** Ignore stale global `plData` while a fetch for a different range is in flight (avoids fee/statement mismatch). */
+  const plData = useMemo(
+    () => scopedPlDataFromCache(plDataRaw, plDataKey, plDataCache, account.id, shopId, dateRange.startDate, dateRange.endDate),
+    [plDataRaw, plDataKey, plDataCache, account.id, shopId, dateRange.startDate, dateRange.endDate]
+  );
+
+  const restrictedFieldSet = useMemo(
+    () => new Set(plData?.financial_visibility?.restricted_fields || []),
+    [plData?.financial_visibility?.restricted_fields]
+  );
+  const isRestricted = useCallback((field: string) => restrictedFieldSet.has(field), [restrictedFieldSet]);
 
   // Default Load Days — how many days to initially fetch from Supabase
   const [defaultLoadDays, setDefaultLoadDays] = useState<number>(() => {
@@ -141,6 +231,9 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
   const [emailIncludeOrder, setEmailIncludeOrder] = useState(true);
   const [emailIncludePl, setEmailIncludePl] = useState(true);
   const [digestHourUtc, setDigestHourUtc] = useState(14);
+  const [digestFrequency, setDigestFrequency] = useState<'daily' | 'weekly' | 'monthly'>('daily');
+  const [digestDayOfWeek, setDigestDayOfWeek] = useState(1); // Monday
+  const [digestDayOfMonth, setDigestDayOfMonth] = useState(1);
   const [emailBusy, setEmailBusy] = useState(false);
   const [emailErr, setEmailErr] = useState<string | null>(null);
 
@@ -193,6 +286,10 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
   // Affiliate Settlements
   const fetchAffiliateSettlements = useShopStore(state => state.fetchAffiliateSettlements);
   const affiliateSettlements = useShopStore(state => state.finance.affiliateSettlements);
+  const affiliateSettlementsInRange = useMemo(
+    () => affiliateSettlements.filter(s => s.date >= dateRange.startDate && s.date <= dateRange.endDate),
+    [affiliateSettlements, dateRange.startDate, dateRange.endDate]
+  );
 
   // Agency Fees
   const fetchAgencyFees = useShopStore(state => state.fetchAgencyFees);
@@ -306,7 +403,9 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
   }, [syncSummaryToast]);
 
   const syncStatusText = useMemo(() => {
-    if (cacheMetadata.isSyncing) {
+    if (!shopId) return null;
+
+    if (cacheMetadata.isSyncing && cacheMetadata.shopId === shopId) {
       const currentLabel = syncProgress.currentStep === 'orders'
         ? 'Orders'
         : syncProgress.currentStep === 'products'
@@ -336,16 +435,54 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       }
       return `${currentLabel} ${processed}`;
     }
+
+    if (
+      !cacheMetadata.isSyncing &&
+      syncProgressShopId === shopId &&
+      syncProgress.isActive &&
+      syncProgress.message?.trim()
+    ) {
+      return syncProgress.message.trim();
+    }
+
     return null;
   }, [
     cacheMetadata.isSyncing,
+    cacheMetadata.shopId,
+    shopId,
+    syncProgressShopId,
     syncProgress.currentStep,
+    syncProgress.isActive,
+    syncProgress.message,
     syncProgress.ordersFetched,
     syncProgress.ordersTotal,
     syncProgress.productsFetched,
     syncProgress.productsTotal,
     syncProgress.settlementsFetched,
     syncProgress.settlementsTotal,
+  ]);
+
+  const shopDataQueuedNotice = useMemo(() => {
+    if (!shopId || !shopDataFetchQueued || queuedShopDataRequestShopId !== shopId) return null;
+    const a = queuedShopDataRequestRange.startDate;
+    const b = queuedShopDataRequestRange.endDate;
+    if (!a || !b) {
+      return 'An additional date-range load is queued and will start when the current request finishes.';
+    }
+    const fmt = (iso: string) => {
+      const parts = iso.split('-').map(Number);
+      if (parts.length !== 3 || parts.some(Number.isNaN)) return iso;
+      const [y, m, d] = parts;
+      return new Date(y, m - 1, d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    };
+    const rangeLabel = a === b ? fmt(a) : `${fmt(a)} – ${fmt(b)}`;
+    return `${rangeLabel} is queued and will load when the current request finishes.`;
+  }, [
+    shopId,
+    shopDataFetchQueued,
+    queuedShopDataRequestShopId,
+    queuedShopDataRequestRange.startDate,
+    queuedShopDataRequestRange.endDate,
   ]);
 
   // Handle reconnect - redirect to TikTok auth
@@ -365,8 +502,19 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
   };
 
 
+  const settledFinanceSnapshotRef = useRef<{
+    key: string;
+    metrics: {
+      netProfit: number;
+      grossProfit: number;
+      statementNetSales: number;
+      totalRevenue: number;
+      avgOrderValue: number;
+    };
+  } | null>(null);
+
   // Calculate metrics using P&L data (matching ProfitLossView exactly)
-  const { calculatedMetrics, completedOrders, sampleOrderMetrics, cancelledRefundedMetrics, totalOrdersRaw, metricsData } = useMemo(() => {
+  const rawOverviewMetricsBundle = useMemo(() => {
 
     // Use Shop Timezone for filtering — [shopPeriodStart, shopPeriodEndExclusive) matches server paid_time gte/lt.
     const shopPeriodStart = getShopDayStartTimestamp(dateRange.startDate, timezone);
@@ -494,7 +642,6 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
     const orderTotalRevenue = totalGMV;
 
     const statementNetSales = filteredStatements.reduce((sum, s) => sum + parseFloat(s.net_sales_amount || '0'), 0);
-    const netSales = statementNetSales;
 
     // Calculate COGS + product shipping cost
     let totalCogs = 0;
@@ -541,7 +688,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
     }, 0);
 
     // Manual affiliate retainers
-    const manualAffiliateRetainers = affiliateSettlements.reduce((sum, s) => sum + Number(s.amount), 0);
+    const manualAffiliateRetainers = affiliateSettlementsInRange.reduce((sum, s) => sum + Number(s.amount), 0);
 
     const adSpendTotal = adsSpendData?.totals.total_spend || 0;
 
@@ -653,7 +800,8 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
         totalRevenue: totalRevenue,
         netProfit: netProfitFinal,
         grossProfit,
-        netSales,
+        /** Sum of TikTok settlement `net_sales_amount` in range (for reports / reference only). */
+        statementNetSales,
         avgOrderValue: currentTotalOrders > 0 ? orderTotalRevenue / currentTotalOrders : 0
       },
       completedOrders: completedOrdersCount,
@@ -683,7 +831,68 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
         itemsSoldChange
       },
     };
-  }, [orders, finance.statements, dateRange, products, dataVersion, syncRenderKey, useHybridTimezone, affiliateSettlements, agencyFees, adsSpendData, timezone, includeCancelledFinancials, plData]);
+  }, [orders, finance.statements, dateRange, products, dataVersion, syncRenderKey, useHybridTimezone, affiliateSettlementsInRange, agencyFees, adsSpendData, timezone, includeCancelledFinancials, plData]);
+
+  const shopFetchInProgress = useShopStore((state) => state.fetchInProgress);
+  const plFetchInFlight = useShopStore((state) => state.plFetchInFlight);
+
+  /**
+   * Freeze headline profit figures during active shop HTTP / TikTok sync / P&L round-trip so cards don't oscillate.
+   * Omit global `dataLoadIncomplete` — it can remain true for a wider background range (e.g. 30-day prefetch)
+   * while Overview's selected days are already usable, and would otherwise pin Net Profit to a stale snapshot ($0).
+   */
+  const overviewFinanceUnsettled =
+    shopFetchInProgress || plFetchInFlight || cacheMetadata.isSyncing;
+
+  /** Scoped P&L payload is authoritative for fee/shipping lines used in net profit — never overlay snapshot once it's present. */
+  const headlinePlReady = Boolean(plData?.statement_totals);
+
+  useEffect(() => {
+    settledFinanceSnapshotRef.current = null;
+  }, [account.id, shopId, dateRange.startDate, dateRange.endDate]);
+
+  const overviewMetricsBundle = useMemo(() => {
+    const raw = rawOverviewMetricsBundle;
+    const keyFinance = `${account.id}:${shopId ?? ''}:${dateRange.startDate}:${dateRange.endDate}`;
+
+    if (!overviewFinanceUnsettled) {
+      settledFinanceSnapshotRef.current = {
+        key: keyFinance,
+        metrics: {
+          netProfit: raw.calculatedMetrics.netProfit,
+          grossProfit: raw.calculatedMetrics.grossProfit,
+          statementNetSales: raw.calculatedMetrics.statementNetSales,
+          totalRevenue: raw.calculatedMetrics.totalRevenue,
+          avgOrderValue: raw.calculatedMetrics.avgOrderValue,
+        },
+      };
+      return raw;
+    }
+
+    const snap = settledFinanceSnapshotRef.current;
+    if (snap?.key === keyFinance && !headlinePlReady) {
+      return {
+        ...raw,
+        calculatedMetrics: {
+          ...raw.calculatedMetrics,
+          ...snap.metrics,
+        },
+      };
+    }
+
+    return raw;
+  }, [
+    rawOverviewMetricsBundle,
+    overviewFinanceUnsettled,
+    headlinePlReady,
+    account.id,
+    shopId,
+    dateRange.startDate,
+    dateRange.endDate,
+  ]);
+
+  const { calculatedMetrics, completedOrders, sampleOrderMetrics, cancelledRefundedMetrics, totalOrdersRaw, metricsData } =
+    overviewMetricsBundle;
 
 
   // Calculate Quick Stats
@@ -722,12 +931,6 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       lowStockProducts
     };
   }, [orders, products, dataVersion, syncRenderKey, timezone]);
-
-  useEffect(() => {
-    if (emailModalOpen && user?.email) {
-      setEmailTo((prev) => (prev.trim() ? prev : user.email || ''));
-    }
-  }, [emailModalOpen, user?.email]);
 
   // Timezone changes do not re-fetch orders: the same UTC order timestamps are re-bucketed
   // client-side via getShopDayStartTimestamp / formatShopDateISO in memoized metrics.
@@ -830,6 +1033,11 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       setEmailErr('Choose at least one: order-based summary and/or P&L summary.');
       return;
     }
+    const recipientCheck = validateDashboardRecipientEmail(emailTo);
+    if (!recipientCheck.ok) {
+      setEmailErr(recipientCheck.message);
+      return;
+    }
     setEmailErr(null);
     setEmailBusy(true);
     try {
@@ -843,7 +1051,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
               gmv: metricsData.gmv,
               totalOrders: metricsData.totalOrders,
               totalRevenue: calculatedMetrics.totalRevenue,
-              netSales: calculatedMetrics.netSales,
+              netSales: calculatedMetrics.statementNetSales,
               grossProfit: calculatedMetrics.grossProfit,
               netProfit: calculatedMetrics.netProfit,
               adSpend: adsSpendData?.totals?.total_spend ?? 0,
@@ -857,7 +1065,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
           shopId,
           startDate: dateRange.startDate,
           endDate: dateRange.endDate,
-          to: emailTo.trim(),
+          to: recipientCheck.email,
           timezone,
           reportTypes,
           ...(plSummary ? { plSummary } : {}),
@@ -870,8 +1078,9 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       }
       const payload = data as { data?: { emailDelivered?: boolean } };
       const delivered = payload.data?.emailDelivered !== false;
-      setEmailSentTo(emailTo.trim());
+      setEmailSentTo(recipientCheck.email);
       setEmailWasDelivered(delivered);
+      setEmailTo('');
       setEmailModalStep('sent');
     } catch (e: unknown) {
       setEmailErr(e instanceof Error ? e.message : 'Failed to send email');
@@ -894,6 +1103,11 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
 
   const handleCreateDigestSchedule = useCallback(async () => {
     if (!shopId) return;
+    const recipientCheck = validateDashboardRecipientEmail(emailTo);
+    if (!recipientCheck.ok) {
+      setEmailErr(recipientCheck.message);
+      return;
+    }
     setEmailErr(null);
     setEmailBusy(true);
     try {
@@ -902,9 +1116,16 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
         body: JSON.stringify({
           accountId: account.id,
           shopId,
-          recipientEmail: emailTo.trim(),
+          recipientEmail: recipientCheck.email,
           timezone,
           hourUtc: digestHourUtc,
+          frequency: digestFrequency,
+          dayOfWeek: digestFrequency === 'weekly' ? digestDayOfWeek : null,
+          dayOfMonth: digestFrequency === 'monthly' ? digestDayOfMonth : null,
+          reportTypes: [
+            ...(emailIncludeOrder ? ['order'] : []),
+            ...(emailIncludePl ? ['pl'] : []),
+          ],
         }),
       });
       const data = await res.json().catch(() => ({}));
@@ -912,20 +1133,33 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
         setEmailErr((data as { error?: string }).error || 'Failed to save schedule');
         return;
       }
-      setEmailSentTo(emailTo.trim());
+      setEmailSentTo(recipientCheck.email);
+      setEmailTo('');
       setEmailModalStep('scheduleSaved');
     } catch (e: unknown) {
       setEmailErr(e instanceof Error ? e.message : 'Failed to save schedule');
     } finally {
       setEmailBusy(false);
     }
-  }, [shopId, account.id, emailTo, timezone, digestHourUtc]);
+  }, [
+    shopId,
+    account.id,
+    emailTo,
+    timezone,
+    digestHourUtc,
+    digestFrequency,
+    digestDayOfWeek,
+    digestDayOfMonth,
+    emailIncludeOrder,
+    emailIncludePl,
+  ]);
 
   const closeEmailModal = useCallback(() => {
     if (emailBusy) return;
     setEmailModalOpen(false);
     setEmailModalStep('form');
     setEmailErr(null);
+    setEmailTo('');
   }, [emailBusy]);
 
   // ═══════════════════ CUSTOMIZABLE METRIC CARDS ═══════════════════
@@ -934,19 +1168,20 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
     id: string;
     label: string;
     getValue: () => string;
-    borderColor: string;
+    accentColor: string;
     trendChange?: number; // percentage change vs previous period
     subtitle?: string;
     isCurrency?: boolean;
     onClick?: () => void;
   }
 
+  const netProfitHidden = isRestricted('net_profit');
   const metricRegistry: MetricDef[] = useMemo(() => [
     {
       id: 'gmv',
       label: 'GMV',
       getValue: () => formatCurrency(metricsData.gmv),
-      borderColor: 'border-pink-500/30',
+      accentColor: 'var(--brand-primary)',
       trendChange: metricsData.gmvChange,
       subtitle: dateRangeSubtitle,
       isCurrency: true,
@@ -955,7 +1190,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       id: 'totalOrders',
       label: 'Total Orders',
       getValue: () => metricsData.totalOrders.toLocaleString(),
-      borderColor: 'border-cyan-500/30',
+      accentColor: 'var(--brand-info-text)',
       trendChange: metricsData.ordersChange,
       subtitle: dateRangeSubtitle,
     },
@@ -963,7 +1198,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       id: 'totalCustomers',
       label: 'Total Customers',
       getValue: () => metricsData.totalCustomers.toLocaleString(),
-      borderColor: 'border-purple-500/30',
+      accentColor: 'var(--brand-secondary)',
       trendChange: metricsData.customersChange,
       subtitle: dateRangeSubtitle,
     },
@@ -972,7 +1207,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       id: 'itemsSold',
       label: 'Items Sold',
       getValue: () => metricsData.itemsSold.toLocaleString(),
-      borderColor: 'border-orange-500/30',
+      accentColor: 'var(--brand-warning-text)',
       trendChange: metricsData.itemsSoldChange,
       subtitle: dateRangeSubtitle,
     },
@@ -980,7 +1215,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       id: 'totalRevenue',
       label: 'Total Revenue',
       getValue: () => formatCurrency(calculatedMetrics.totalRevenue),
-      borderColor: 'border-green-500/30',
+      accentColor: 'var(--brand-profit)',
       subtitle: `${dateRangeSubtitle} (GMV - Cancellations)`,
       isCurrency: true,
     },
@@ -988,45 +1223,45 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       id: 'avgOrderValue',
       label: 'Avg. Order Value',
       getValue: () => formatCurrency(calculatedMetrics.avgOrderValue),
-      borderColor: 'border-amber-500/30',
+      accentColor: 'var(--brand-warning-text)',
       subtitle: 'Per transaction',
       isCurrency: true,
     },
     {
       id: 'netProfit',
       label: 'Net Profit',
-      getValue: () => formatCurrency(calculatedMetrics.netProfit),
-      borderColor: calculatedMetrics.netProfit >= 0 ? 'border-emerald-500/30' : 'border-red-500/30',
-      subtitle: 'Settlement - COGS',
+      getValue: () => (netProfitHidden ? 'Restricted' : formatCurrency(calculatedMetrics.netProfit)),
+      accentColor: calculatedMetrics.netProfit >= 0 ? 'var(--brand-profit)' : 'var(--brand-loss)',
+      subtitle: netProfitHidden ? 'Hidden by seller visibility policy' : 'Settlement - COGS',
       isCurrency: true,
     },
     {
-      id: 'netSales',
-      label: 'Net Sales',
-      getValue: () => formatCurrency(calculatedMetrics.netSales),
-      borderColor: 'border-blue-500/30',
-      subtitle: 'From settlement records',
+      id: 'grossProfit',
+      label: 'Gross Profit',
+      getValue: () => formatCurrency(calculatedMetrics.grossProfit),
+      accentColor: 'var(--brand-profit)',
+      subtitle: 'Net revenue − COGS − product shipping − affiliate',
       isCurrency: true,
     },
     {
       id: 'completedOrders',
       label: 'Completed Orders',
       getValue: () => completedOrders.toLocaleString(),
-      borderColor: 'border-teal-500/30',
+      accentColor: 'var(--brand-success-text)',
       subtitle: dateRangeSubtitle,
     },
     {
       id: 'cancelledRefunded',
       label: 'Cancelled/Refunded',
       getValue: () => cancelledRefundedMetrics.count.toString(),
-      borderColor: 'border-red-500/30',
+      accentColor: 'var(--brand-loss)',
       subtitle: 'Orders excluded from P&L',
     },
     {
       id: 'cancelledFinancials',
       label: 'Cancelled Value',
       getValue: () => formatCurrency(cancelledRefundedMetrics.value),
-      borderColor: 'border-red-500/30',
+      accentColor: 'var(--brand-loss)',
       subtitle: 'Total value of cancelled orders',
       isCurrency: true,
     },
@@ -1034,17 +1269,17 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       id: 'sampleOrders',
       label: 'Sample Orders',
       getValue: () => sampleOrderMetrics.count.toString(),
-      borderColor: 'border-sky-500/30',
+      accentColor: 'var(--brand-info-text)',
       subtitle: sampleOrderMetrics.count > 0 ? `${formatCurrency(sampleOrderMetrics.revenue)} revenue` : 'None in period',
     },
     {
       id: 'totalOrdersRaw',
       label: 'Total Orders (Raw)',
       getValue: () => totalOrdersRaw.toString(),
-      borderColor: 'border-gray-500/30',
+      accentColor: 'var(--brand-text-muted)',
       subtitle: `${dateRangeSubtitle} - Unfiltered from API`,
     },
-  ], [metricsData, calculatedMetrics, completedOrders, cancelledRefundedMetrics, sampleOrderMetrics, totalOrdersRaw, dateRangeSubtitle]);
+  ], [metricsData, calculatedMetrics, completedOrders, cancelledRefundedMetrics, sampleOrderMetrics, totalOrdersRaw, dateRangeSubtitle, netProfitHidden]);
 
   // Same auto-affiliate total as Profit & Loss, with per-line breakdown for the card
   const autoAffiliateCommissionDetail = useMemo(() => {
@@ -1104,7 +1339,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       const saved = localStorage.getItem(storageKey);
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+        if (Array.isArray(parsed) && parsed.length > 0) return normalizeDashboardMetricIds(parsed);
       }
     } catch { }
     return DEFAULT_METRICS;
@@ -1212,7 +1447,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       if (saved) {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed) && parsed.length > 0) {
-          setSelectedMetricIds(parsed);
+          setSelectedMetricIds(normalizeDashboardMetricIds(parsed));
         }
       }
     } catch { }
@@ -1232,9 +1467,10 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
         if (!error && data?.preference_value) {
           const val = data.preference_value;
           if (Array.isArray(val) && val.length > 0) {
-            setSelectedMetricIds(val);
+            const normalized = normalizeDashboardMetricIds(val);
+            setSelectedMetricIds(normalized);
             // Update localStorage cache
-            try { localStorage.setItem(storageKey, JSON.stringify(val)); } catch { }
+            try { localStorage.setItem(storageKey, JSON.stringify(normalized)); } catch { }
           }
         }
       } catch (err) {
@@ -1468,12 +1704,12 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
     <div className="space-y-6">
       {syncSummaryToast && (
         <div
-          className={`fixed top-8 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 rounded-2xl bg-gray-900/95 backdrop-blur-md px-5 py-3.5 shadow-2xl border border-gray-700/50 transition-all duration-400 ease-out ${
+          className={`fixed top-8 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 rounded-2xl brand-card backdrop-blur-md px-5 py-3.5 shadow-2xl transition-all duration-400 ease-out ${
             syncSummaryToastVisible ? 'opacity-100 translate-y-0 scale-100' : 'opacity-0 -translate-y-4 scale-95 pointer-events-none'
           }`}
         >
           <div className="flex flex-col">
-            <span className="text-sm font-semibold text-white">{syncSummaryToast}</span>
+            <span className="text-sm font-semibold brand-text">{syncSummaryToast}</span>
           </div>
         </div>
       )}
@@ -1498,16 +1734,16 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
 
 
       {error && (
-        <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-4 flex items-center justify-between gap-3">
+        <div className="brand-state-warning rounded-xl p-4 flex items-center justify-between gap-3">
           <div className="flex items-center gap-3">
-            <AlertCircle className="w-5 h-5 text-amber-500" />
-            <p className="text-amber-200 text-sm">
+            <AlertCircle className="w-5 h-5" style={{ color: 'var(--brand-warning-text)' }} />
+            <p className="text-sm">
               We're having trouble fetching some data. Some information might be outdated.
             </p>
           </div>
           <button
             onClick={() => fetchShopData(account.id, shopId, { forceRefresh: true })}
-            className="px-3 py-1 bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 text-xs font-medium rounded-lg transition-colors flex items-center gap-1"
+            className="px-3 py-1 text-xs font-medium rounded-lg transition-colors flex items-center gap-1 brand-card brand-card-hover"
           >
             <RefreshCw className="w-3 h-3" />
             Refresh
@@ -1515,31 +1751,34 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
         </div>
       )}
       {/* Account Header — single toolbar row; scrolls horizontally on narrow viewports */}
-      <div className="bg-gradient-to-r from-pink-500/10 to-red-500/10 border border-pink-500/30 rounded-xl px-4 py-3 sm:px-5 sm:py-3.5">
+      <div className="brand-toolbar rounded-xl px-4 py-3 sm:px-5 sm:py-3.5">
         <div className="flex flex-row items-center justify-between gap-3 min-w-0">
           <div className="flex items-center gap-3 min-w-0 shrink-0 pr-2">
             {account.avatar_url ? (
               <img src={account.avatar_url} alt={account.name} className="w-11 h-11 sm:w-12 sm:h-12 rounded-full shrink-0" />
             ) : (
-              <div className="w-11 h-11 sm:w-12 sm:h-12 rounded-full bg-gradient-to-r from-pink-500 to-red-500 flex items-center justify-center text-white text-lg font-bold shrink-0">
+              <div
+                className="w-11 h-11 sm:w-12 sm:h-12 rounded-full flex items-center justify-center text-lg font-bold shrink-0 brand-on-primary"
+                style={{ background: 'linear-gradient(135deg, var(--brand-primary), var(--brand-secondary))' }}
+              >
                 {account.name.charAt(0)}
               </div>
             )}
             <div className="min-w-0">
-              <h2 className="text-base sm:text-lg font-bold text-white truncate leading-tight">{account.name}</h2>
+              <h2 className="text-base sm:text-lg font-bold brand-text truncate leading-tight">{account.name}</h2>
               <div className="flex items-center gap-1.5 mt-0.5 min-w-0">
-                <p className="text-xs text-gray-400 truncate">
+                <p className="text-xs brand-muted truncate">
                   {(account as any).tiktok_handle || account.tiktok_handle || 'TikTok Shop'}
                 </p>
                 {(account as any).owner_role && (
-                  <span className="px-1.5 py-0.5 rounded-full text-[9px] font-bold uppercase tracking-wider bg-pink-500/20 text-pink-400 border border-pink-500/30 shrink-0 hidden sm:inline">
+                  <span className="px-1.5 py-0.5 rounded-full text-[9px] font-bold uppercase tracking-wider brand-primary-card shrink-0 hidden sm:inline">
                     {(account as any).owner_role.toUpperCase()}
                   </span>
                 )}
                 {metrics.shopRating > 0 && (
-                  <div className="flex items-center gap-0.5 bg-yellow-500/10 px-1.5 py-0.5 rounded-full border border-yellow-500/20 shrink-0">
-                    <Star className="w-2.5 h-2.5 text-yellow-400 fill-yellow-400" />
-                    <span className="text-[10px] text-yellow-200">{metrics.shopRating.toFixed(1)}</span>
+                  <div className="flex items-center gap-0.5 px-1.5 py-0.5 rounded-full shrink-0 brand-state-warning">
+                    <Star className="w-2.5 h-2.5 fill-current" />
+                    <span className="text-[10px]">{metrics.shopRating.toFixed(1)}</span>
                   </div>
                 )}
               </div>
@@ -1550,14 +1789,15 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
               absolutely positioned dropdowns (timezone panel, date picker calendar, etc.). */}
           <div className="flex min-w-0 flex-1 items-center justify-end gap-1.5 sm:gap-2 py-0.5">
             <div className="flex min-w-0 flex-1 items-center justify-end gap-1.5 sm:gap-2 overflow-x-auto [-webkit-overflow-scrolling:touch]">
-            <div className="inline-flex h-9 shrink-0 items-stretch rounded-lg border border-white/10 bg-black/30 p-0.5 gap-0.5">
+            <div className="inline-flex h-9 shrink-0 items-stretch rounded-lg brand-toolbar p-0.5 gap-0.5">
               <button
                 type="button"
                 onClick={handleTodayClick}
                 className={`flex items-center gap-1 px-2 sm:px-2.5 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${isTodayActive()
-                  ? 'bg-pink-600 text-white'
-                  : 'text-gray-400 hover:text-white hover:bg-white/5'
+                  ? 'brand-on-primary'
+                  : 'brand-nav-idle hover:bg-white/5'
                   }`}
+                style={isTodayActive() ? { backgroundColor: 'var(--brand-primary)' } : undefined}
               >
                 <Calendar className="w-3.5 h-3.5 shrink-0" />
                 Today
@@ -1566,9 +1806,10 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
                 type="button"
                 onClick={handleYesterdayClick}
                 className={`flex items-center gap-1 px-2 sm:px-2.5 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${isYesterdayActive()
-                  ? 'bg-pink-600 text-white'
-                  : 'text-gray-400 hover:text-white hover:bg-white/5'
+                  ? 'brand-on-primary'
+                  : 'brand-nav-idle hover:bg-white/5'
                   }`}
+                style={isYesterdayActive() ? { backgroundColor: 'var(--brand-primary)' } : undefined}
               >
                 <Calendar className="w-3.5 h-3.5 shrink-0" />
                 Yesterday
@@ -1591,16 +1832,25 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
               disabled={!canSyncShop || cacheMetadata.isSyncing}
               title={!canSyncShop ? 'You do not have access to sync this shop' : undefined}
               className={`inline-flex shrink-0 items-center justify-center gap-1.5 h-9 px-3 sm:px-3.5 rounded-lg text-xs sm:text-sm font-semibold transition-colors ${cacheMetadata.isSyncing
-                ? 'bg-gray-700 text-gray-400 cursor-not-allowed'
-                : 'bg-pink-600 hover:bg-pink-500 text-white disabled:opacity-50'
+                ? 'brand-card brand-muted cursor-not-allowed'
+                : 'disabled:opacity-50 brand-on-primary'
                 }`}
+              style={!cacheMetadata.isSyncing ? { backgroundColor: 'var(--brand-primary)' } : undefined}
             >
               <RefreshCw className={`w-3.5 h-3.5 sm:w-4 sm:h-4 ${cacheMetadata.isSyncing ? 'animate-spin' : ''}`} />
               <span className="hidden min-[380px]:inline">{cacheMetadata.isSyncing ? 'Syncing…' : 'Sync'}</span>
             </button>
             {syncStatusText && (
-              <span className="hidden md:inline shrink-0 text-[10px] text-gray-400 whitespace-nowrap">
+              <span className="hidden md:inline shrink-0 text-[10px] brand-muted whitespace-nowrap">
                 {syncStatusText}
+              </span>
+            )}
+            {shopDataQueuedNotice && (
+              <span
+                className="hidden sm:inline shrink-0 text-[10px] text-amber-300/95 whitespace-nowrap max-w-[min(18rem,28vw)] truncate"
+                title={shopDataQueuedNotice}
+              >
+                {shopDataQueuedNotice}
               </span>
             )}
 
@@ -1609,10 +1859,11 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
                 type="button"
                 onClick={() => {
                   setEmailErr(null);
+                  setEmailTo('');
                   setEmailModalStep('form');
                   setEmailModalOpen(true);
                 }}
-                className="inline-flex shrink-0 items-center justify-center gap-1.5 h-9 px-2.5 sm:px-3 rounded-lg text-xs sm:text-sm font-medium border border-white/10 bg-gray-900/70 text-gray-200 hover:bg-gray-800 hover:text-white transition-colors whitespace-nowrap"
+                className="inline-flex shrink-0 items-center justify-center gap-1.5 h-9 px-2.5 sm:px-3 rounded-lg text-xs sm:text-sm font-medium brand-card brand-text brand-card-hover transition-colors whitespace-nowrap"
                 title="Email dashboard summary (Account Managers assigned to this seller)"
               >
                 <Mail className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
@@ -1623,12 +1874,13 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
             <button
               type="button"
               onClick={() => onTabChange && onTabChange('notifications')}
-              className="relative inline-flex shrink-0 items-center justify-center h-9 w-9 rounded-lg border border-white/10 bg-gray-900/70 hover:bg-gray-800 transition-colors"
+              className="relative inline-flex shrink-0 items-center justify-center h-9 w-9 rounded-lg brand-card brand-card-hover transition-colors"
               title="Notifications"
             >
-              <Bell className="w-4 h-4 text-gray-400" />
+              <Bell className="w-4 h-4 brand-muted" />
               {unreadCount > 0 && (
-                <span className="absolute -top-1 -right-1 min-w-[1.125rem] h-4 px-1 flex items-center justify-center rounded-full bg-pink-500 text-[9px] font-bold text-white border-2 border-gray-950 leading-none">
+                <span className="absolute -top-1 -right-1 min-w-[1.125rem] h-4 px-1 flex items-center justify-center rounded-full text-[9px] font-bold brand-on-primary leading-none"
+                  style={{ backgroundColor: 'var(--brand-primary)', border: '2px solid var(--brand-bg)' }}>
                   {unreadCount > 99 ? '99+' : unreadCount}
                 </span>
               )}
@@ -1647,7 +1899,8 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
             )}
 
             <span
-              className="hidden lg:inline shrink-0 text-[10px] text-gray-500 whitespace-nowrap pl-2 ml-0.5 border-l border-white/10 tabular-nums"
+              className="hidden lg:inline shrink-0 text-[10px] brand-muted whitespace-nowrap pl-2 ml-0.5 tabular-nums"
+              style={{ borderLeft: '1px solid var(--brand-card-border)' }}
               title={`Current time in ${timezone}`}
             >
               {formatShopTimeOnly(liveClock, timezone)}
@@ -1660,13 +1913,14 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
         <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
           <button
             type="button"
-            className="absolute inset-0 bg-black/70 backdrop-blur-sm"
+            className="absolute inset-0 backdrop-blur-sm"
+            style={{ backgroundColor: 'color-mix(in srgb, var(--brand-bg) 76%, black)' }}
             aria-label="Close"
             onClick={closeEmailModal}
           />
-          <div className="relative w-full max-w-md rounded-2xl border border-white/10 bg-gray-950 p-6 shadow-2xl">
+          <div className="relative w-full max-w-md rounded-2xl brand-card p-6 shadow-2xl">
             <div className="flex items-start justify-between gap-3 mb-4">
-              <h3 className="text-lg font-bold text-white">
+              <h3 className="text-lg font-bold brand-text">
                 {emailModalStep === 'form' && 'Email report'}
                 {emailModalStep === 'sent' && (emailWasDelivered ? 'Report sent' : 'Email not delivered')}
                 {emailModalStep === 'scheduleSaved' && 'Digest saved'}
@@ -1675,7 +1929,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
                 type="button"
                 disabled={emailBusy}
                 onClick={closeEmailModal}
-                className="p-1 rounded-lg text-gray-400 hover:text-white hover:bg-white/10"
+                className="p-1 rounded-lg brand-muted brand-nav-idle brand-card-hover"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -1684,25 +1938,28 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
             {emailModalStep === 'sent' && (
               <div className="py-2">
                 <CheckCircle
-                  className={`w-14 h-14 mx-auto mb-4 ${emailWasDelivered ? 'text-emerald-400' : 'text-amber-400'}`}
+                  className={`w-14 h-14 mx-auto mb-4 ${emailWasDelivered ? 'brand-profit' : ''}`}
+                  style={!emailWasDelivered ? { color: 'var(--brand-warning-text)' } : undefined}
                   aria-hidden
                 />
                 {emailWasDelivered ? (
-                  <p className="text-sm text-gray-300 text-center leading-relaxed">
+                  <p className="text-sm brand-text text-center leading-relaxed">
                     We sent the dashboard report to{' '}
-                    <span className="text-white font-medium">{emailSentTo}</span>. Check your inbox (and spam).
+                    <span className="font-medium">{emailSentTo}</span>. Check your inbox (and spam).
                   </p>
                 ) : (
-                  <p className="text-sm text-amber-200/90 text-center leading-relaxed">
+                  <p className="text-sm text-center leading-relaxed" style={{ color: 'var(--brand-warning-text)' }}>
                     The app accepted your request, but the server did not send email:{' '}
-                    <code className="text-[11px] text-pink-300/90">RESEND_API_KEY</code> is not set (or mail failed). Add it in your API
+                    <code className="text-[11px]" style={{ color: 'var(--brand-primary)' }}>GOHIGHLEVEL_PIT</code> and{' '}
+                    <code className="text-[11px]" style={{ color: 'var(--brand-primary)' }}>GOHIGHLEVEL_LOCATION_ID</code> must be set (or LeadConnector rejected the send). Add them in your API
                     environment and redeploy; until then, reports are not emailed.
                   </p>
                 )}
                 <button
                   type="button"
                   onClick={closeEmailModal}
-                  className="w-full mt-6 py-2.5 rounded-xl bg-pink-600 hover:bg-pink-500 text-white text-sm font-semibold"
+                  className="w-full mt-6 py-2.5 rounded-xl text-sm font-semibold brand-on-primary"
+                  style={{ backgroundColor: 'var(--brand-primary)' }}
                 >
                   Done
                 </button>
@@ -1711,16 +1968,17 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
 
             {emailModalStep === 'scheduleSaved' && (
               <div className="py-2">
-                <CheckCircle className="w-14 h-14 mx-auto mb-4 text-emerald-400" aria-hidden />
-                <p className="text-sm text-gray-300 text-center leading-relaxed">
-                  Daily digest is enabled for{' '}
-                  <span className="text-white font-medium">{emailSentTo}</span> (UTC hour {digestHourUtc}). The server cron must be configured
+                <CheckCircle className="w-14 h-14 mx-auto mb-4 brand-profit" aria-hidden />
+                <p className="text-sm brand-text text-center leading-relaxed">
+                  {digestFrequency.charAt(0).toUpperCase() + digestFrequency.slice(1)} digest is enabled for{' '}
+                  <span className="font-medium">{emailSentTo}</span> (UTC hour {digestHourUtc}). The server cron must be configured
                   to actually send.
                 </p>
                 <button
                   type="button"
                   onClick={closeEmailModal}
-                  className="w-full mt-6 py-2.5 rounded-xl bg-pink-600 hover:bg-pink-500 text-white text-sm font-semibold"
+                  className="w-full mt-6 py-2.5 rounded-xl text-sm font-semibold brand-on-primary"
+                  style={{ backgroundColor: 'var(--brand-primary)' }}
                 >
                   Done
                 </button>
@@ -1729,64 +1987,124 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
 
             {emailModalStep === 'form' && (
               <>
-                <p className="text-sm text-gray-400 mb-4 leading-relaxed">
-                  Period: <span className="text-gray-200">{dateRange.startDate}</span> →{' '}
-                  <span className="text-gray-200">{dateRange.endDate}</span>
-                  <span className="text-gray-500"> ({timezone})</span>.
+                <p className="text-sm brand-muted mb-4 leading-relaxed">
+                  Period: <span className="brand-text">{dateRange.startDate}</span> →{' '}
+                  <span className="brand-text">{dateRange.endDate}</span>
+                  <span className="brand-muted"> ({timezone})</span>.
                 </p>
 
-                <p className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-2">Include in email</p>
-                <div className="rounded-xl border border-white/10 bg-black/30 divide-y divide-white/10 mb-4">
-                  <label className="flex items-center gap-3 px-3 py-3 cursor-pointer hover:bg-white/[0.04]">
+                <p className="text-xs font-medium brand-muted uppercase tracking-wide mb-2">Include in email</p>
+                <div className="rounded-xl brand-card divide-y mb-4" style={{ borderColor: 'var(--brand-card-border)' }}>
+                  <label className="flex items-center gap-3 px-3 py-3 cursor-pointer brand-row-hover">
                     <input
                       type="checkbox"
                       checked={emailIncludeOrder}
                       onChange={(e) => setEmailIncludeOrder(e.target.checked)}
                       disabled={emailBusy}
-                      className="rounded border-gray-600 text-pink-600 focus:ring-pink-500/40"
+                      className="rounded"
+                      style={{ accentColor: 'var(--brand-primary)' }}
                     />
                     <div>
-                      <div className="text-sm font-medium text-white">Order-based summary</div>
-                      <div className="text-xs text-gray-500">Paid orders &amp; GMV from synced orders (server-calculated)</div>
+                      <div className="text-sm font-medium brand-text">Order-based summary</div>
+                      <div className="text-xs brand-muted">Paid orders &amp; GMV from synced orders (server-calculated)</div>
                     </div>
                   </label>
-                  <label className="flex items-center gap-3 px-3 py-3 cursor-pointer hover:bg-white/[0.04]">
+                  <label className="flex items-center gap-3 px-3 py-3 cursor-pointer brand-row-hover">
                     <input
                       type="checkbox"
                       checked={emailIncludePl}
                       onChange={(e) => setEmailIncludePl(e.target.checked)}
                       disabled={emailBusy}
-                      className="rounded border-gray-600 text-pink-600 focus:ring-pink-500/40"
+                      className="rounded"
+                      style={{ accentColor: 'var(--brand-primary)' }}
                     />
                     <div>
-                      <div className="text-sm font-medium text-white">P&amp;L-style summary</div>
-                      <div className="text-xs text-gray-500">GMV, revenue, net sales, gross/net profit, ad spend — matches this dashboard view</div>
+                      <div className="text-sm font-medium brand-text">P&amp;L-style summary</div>
+                      <div className="text-xs brand-muted">GMV, revenue, gross/net profit, TikTok settlement reference, ad spend — matches this dashboard view</div>
                     </div>
                   </label>
                 </div>
 
-                <label className="block text-xs font-medium text-gray-500 uppercase tracking-wide mb-1">Recipient email</label>
+                <label className="block text-xs font-medium brand-muted uppercase tracking-wide mb-1">Recipient email</label>
                 <input
                   type="email"
+                  inputMode="email"
+                  autoComplete="off"
+                  spellCheck={false}
                   value={emailTo}
-                  onChange={(e) => setEmailTo(e.target.value)}
-                  className="w-full rounded-xl bg-black/40 border border-white/10 px-3 py-2.5 text-sm text-white mb-4 focus:ring-2 focus:ring-pink-500/40 focus:border-pink-500/40 outline-none"
-                  placeholder="you@company.com"
+                  onChange={(e) => {
+                    setEmailTo(e.target.value);
+                    if (emailErr) setEmailErr(null);
+                  }}
+                  className="w-full rounded-xl brand-card brand-text brand-input px-3 py-2.5 text-sm mb-4 outline-none brand-focus-ring"
+                  placeholder="recipient@example.com"
                   disabled={emailBusy}
+                  aria-invalid={!!emailErr}
+                  aria-describedby={emailErr ? 'email-report-recipient-error' : undefined}
                 />
-                {emailErr && <p className="text-sm text-red-400 mb-3">{emailErr}</p>}
+                {emailErr && (
+                  <p id="email-report-recipient-error" className="text-sm brand-loss mb-3" role="alert">
+                    {emailErr}
+                  </p>
+                )}
                 <div className="flex flex-col gap-2">
                   <button
                     type="button"
                     disabled={emailBusy || !emailTo.trim() || (!emailIncludeOrder && !emailIncludePl)}
                     onClick={() => void handleSendDashboardEmail()}
-                    className="w-full py-2.5 rounded-xl bg-pink-600 hover:bg-pink-500 text-white text-sm font-semibold disabled:opacity-40"
+                    className="w-full py-2.5 rounded-xl text-sm font-semibold disabled:opacity-40 brand-on-primary"
+                    style={{ backgroundColor: 'var(--brand-primary)' }}
                   >
                     {emailBusy ? 'Sending…' : 'Send email'}
                   </button>
-                  <div className="border-t border-white/10 pt-4 mt-1">
-                    <p className="text-xs text-gray-500 mb-2">Daily automated digest (previous shop day)</p>
-                    <label className="block text-xs font-medium text-gray-500 uppercase tracking-wide mb-1">
+                  <div className="border-t pt-4 mt-1" style={{ borderColor: 'var(--brand-card-border)' }}>
+                    <p className="text-xs brand-muted mb-2">Automated digest (previous shop day)</p>
+                    <label className="block text-xs font-medium brand-muted uppercase tracking-wide mb-1">
+                      Frequency
+                    </label>
+                    <select
+                      value={digestFrequency}
+                      onChange={(e) => setDigestFrequency(e.target.value as 'daily' | 'weekly' | 'monthly')}
+                      className="w-full rounded-xl brand-card brand-text px-3 py-2 text-sm mb-3 outline-none brand-focus-ring"
+                      disabled={emailBusy}
+                    >
+                      <option value="daily">Daily</option>
+                      <option value="weekly">Weekly</option>
+                      <option value="monthly">Monthly</option>
+                    </select>
+                    {digestFrequency === 'weekly' && (
+                      <>
+                        <label className="block text-xs font-medium brand-muted uppercase tracking-wide mb-1">
+                          Day of week (0=Sun ... 6=Sat)
+                        </label>
+                        <input
+                          type="number"
+                          min={0}
+                          max={6}
+                          value={digestDayOfWeek}
+                          onChange={(e) => setDigestDayOfWeek(Math.min(6, Math.max(0, parseInt(e.target.value, 10) || 0)))}
+                          className="w-full rounded-xl brand-card brand-text px-3 py-2 text-sm mb-3 outline-none brand-focus-ring"
+                          disabled={emailBusy}
+                        />
+                      </>
+                    )}
+                    {digestFrequency === 'monthly' && (
+                      <>
+                        <label className="block text-xs font-medium brand-muted uppercase tracking-wide mb-1">
+                          Day of month (1-31)
+                        </label>
+                        <input
+                          type="number"
+                          min={1}
+                          max={31}
+                          value={digestDayOfMonth}
+                          onChange={(e) => setDigestDayOfMonth(Math.min(31, Math.max(1, parseInt(e.target.value, 10) || 1)))}
+                          className="w-full rounded-xl brand-card brand-text px-3 py-2 text-sm mb-3 outline-none brand-focus-ring"
+                          disabled={emailBusy}
+                        />
+                      </>
+                    )}
+                    <label className="block text-xs font-medium brand-muted uppercase tracking-wide mb-1">
                       Send at (UTC hour 0–23)
                     </label>
                     <input
@@ -1795,21 +2113,21 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
                       max={23}
                       value={digestHourUtc}
                       onChange={(e) => setDigestHourUtc(Math.min(23, Math.max(0, parseInt(e.target.value, 10) || 0)))}
-                      className="w-full rounded-xl bg-black/40 border border-white/10 px-3 py-2 text-sm text-white mb-3 outline-none"
+                      className="w-full rounded-xl brand-card brand-text px-3 py-2 text-sm mb-3 outline-none brand-focus-ring"
                       disabled={emailBusy}
                     />
                     <button
                       type="button"
                       disabled={emailBusy || !emailTo.trim()}
                       onClick={() => void handleCreateDigestSchedule()}
-                      className="w-full py-2.5 rounded-xl bg-gray-800 border border-gray-600 hover:bg-gray-700 text-gray-100 text-sm font-medium disabled:opacity-40"
+                      className="w-full py-2.5 rounded-xl brand-card brand-text brand-card-hover text-sm font-medium disabled:opacity-40"
                     >
-                      Enable daily digest
+                      Enable digest schedule
                     </button>
-                    <p className="text-[11px] text-gray-600 mt-2">
-                      Vercel <strong className="text-gray-500">Hobby</strong> only allows <strong className="text-gray-500">once-per-day</strong>{' '}
-                      crons — digests run on that schedule (see <code className="text-gray-500">server/vercel.json</code>). Set{' '}
-                      <code className="text-gray-500">CRON_SECRET</code> in the project. The UTC hour field is optional metadata unless you use an
+                    <p className="text-[11px] brand-muted mt-2">
+                      Vercel <strong className="brand-muted">Hobby</strong> only allows <strong className="brand-muted">once-per-day</strong>{' '}
+                      crons — digests run on that schedule (see <code className="brand-muted">server/vercel.json</code>). Set{' '}
+                      <code className="brand-muted">CRON_SECRET</code> in the project. The UTC hour field is optional metadata unless you use an
                       external scheduler or Vercel Pro with a more frequent cron.
                     </p>
                   </div>
@@ -1837,23 +2155,24 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
           opacity: 0.4;
         }
         .card-drag-over {
-          border-color: rgb(236 72 153 / 0.7) !important;
-          box-shadow: 0 0 0 2px rgb(236 72 153 / 0.3), 0 0 20px rgb(236 72 153 / 0.1);
+          border-color: color-mix(in srgb, var(--brand-primary) 65%, var(--brand-card-border)) !important;
+          box-shadow: 0 0 0 2px color-mix(in srgb, var(--brand-primary) 35%, transparent),
+            0 0 20px color-mix(in srgb, var(--brand-primary) 12%, transparent);
         }
       `}</style>
 
       {/* ═══════════════════ DASHBOARD SECTIONS ═══════════════════ */}
       {/* ═══════════════════ CUSTOMIZATION TOOLBAR ═══════════════════ */}
       <div className="flex justify-end relative z-30">
-        <div className="flex items-center gap-2 bg-gray-900/50 border border-gray-800 rounded-xl p-2 backdrop-blur-sm">
+        <div className="flex items-center gap-2 brand-toolbar rounded-xl p-2 backdrop-blur-sm">
           {isEditMode && (
             <>
-              <div className="flex items-center gap-2 mr-2 border-r border-gray-700/50 pr-3">
-                <span className="text-xs text-gray-500 font-medium">Default View:</span>
+              <div className="flex items-center gap-2 mr-2 pr-3" style={{ borderRight: '1px solid var(--brand-card-border)' }}>
+                <span className="text-xs brand-muted font-medium">Default View:</span>
                 <select
                   value={defaultDatePreset}
                   onChange={(e) => setDefaultDatePreset(e.target.value)}
-                  className="bg-gray-800 text-gray-200 text-xs rounded-lg border border-gray-700 focus:ring-1 focus:ring-pink-500 focus:border-pink-500 py-1.5 pl-2 pr-8"
+                  className="brand-card brand-text text-xs rounded-lg border brand-focus-ring py-1.5 pl-2 pr-8"
                 >
                   {DATE_PRESETS.map(preset => (
                     <option key={preset.id} value={preset.id}>{preset.label}</option>
@@ -1862,9 +2181,9 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
               </div>
 
               {/* Default Load Days */}
-              <div className="flex items-center gap-2 mr-2 border-r border-gray-700/50 pr-3">
-                <Zap className="w-3.5 h-3.5 text-amber-400" />
-                <span className="text-xs text-gray-500 font-medium">Default Load:</span>
+              <div className="flex items-center gap-2 mr-2 pr-3" style={{ borderRight: '1px solid var(--brand-card-border)' }}>
+                <Zap className="w-3.5 h-3.5" style={{ color: 'var(--brand-warning-text)' }} />
+                <span className="text-xs brand-muted font-medium">Default Load:</span>
                 <select
                   value={defaultLoadDays}
                   onChange={(e) => {
@@ -1874,7 +2193,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
                     setTimeout(() => setLoadDaysToast(prev => prev ? { ...prev, visible: false } : null), 4000);
                     setTimeout(() => setLoadDaysToast(null), 4300);
                   }}
-                  className="bg-gray-800 text-gray-200 text-xs rounded-lg border border-gray-700 focus:ring-1 focus:ring-amber-500 focus:border-amber-500 py-1.5 pl-2 pr-8"
+                  className="brand-card brand-text text-xs rounded-lg border py-1.5 pl-2 pr-8 brand-focus-ring"
                 >
                   {LOAD_DAY_OPTIONS.map(opt => (
                     <option key={opt.value} value={opt.value}>
@@ -1885,7 +2204,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
               </div>
 
               {/* Toggles */}
-              <div className="flex items-center gap-3 mr-2 border-r border-gray-700/50 pr-3">
+              <div className="flex items-center gap-3 mr-2 pr-3" style={{ borderRight: '1px solid var(--brand-card-border)' }}>
                 <label className="flex items-center gap-2 cursor-pointer group" title="Aligns previous period with Seller Center (UTC-based) for accurate trends">
                   <div className="relative">
                     <input
@@ -1894,16 +2213,16 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
                       checked={useHybridTimezone}
                       onChange={(e) => setUseHybridTimezone(e.target.checked)}
                     />
-                    <div className={`w-8 h-4 rounded-full transition-colors ${useHybridTimezone ? 'bg-purple-600' : 'bg-gray-700'}`}></div>
-                    <div className={`absolute left-0.5 top-0.5 w-3 h-3 bg-white rounded-full transition-transform ${useHybridTimezone ? 'translate-x-4' : 'translate-x-0'}`}></div>
+                    <div className={`w-8 h-4 rounded-full transition-colors ${useHybridTimezone ? 'brand-secondary-card' : 'brand-card'}`}></div>
+                    <div className={`absolute left-0.5 top-0.5 w-3 h-3 rounded-full transition-transform ${useHybridTimezone ? 'translate-x-4' : 'translate-x-0'}`} style={{ backgroundColor: 'var(--brand-text)' }}></div>
                   </div>
-                  <span className="text-xs text-gray-400 group-hover:text-gray-300 transition-colors">Hybrid Trends</span>
+                  <span className="text-xs brand-muted transition-colors">Hybrid Trends</span>
                 </label>
               </div>
 
               <button
                 onClick={() => setSelectedMetricIds(DEFAULT_METRICS)}
-                className="text-xs text-gray-400 hover:text-pink-400 transition-colors px-3 py-1.5 rounded-lg hover:bg-gray-800"
+                className="text-xs brand-nav-idle transition-colors px-3 py-1.5 rounded-lg brand-card-hover"
               >
                 Reset
               </button>
@@ -1912,27 +2231,27 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
                 <button
                   onClick={() => setShowAddPanel(!showAddPanel)}
                   disabled={availableMetrics.length === 0}
-                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-gray-800 text-gray-200 hover:text-white hover:bg-gray-700 border border-gray-700 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg brand-card brand-text brand-card-hover transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
                 >
                   <Plus className="w-3.5 h-3.5" />
                   Add Metrics
                 </button>
                 {/* Add Metrics Dropdown */}
                 {showAddPanel && availableMetrics.length > 0 && (
-                  <div className="absolute right-0 top-full mt-2 w-64 bg-gray-900 border border-gray-700 rounded-xl shadow-2xl shadow-black/50 z-50 overflow-hidden max-h-80 overflow-y-auto">
-                    <div className="p-3 border-b border-gray-800">
-                      <p className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Available Metrics</p>
+                  <div className="absolute right-0 top-full mt-2 w-64 brand-card rounded-xl shadow-2xl shadow-black/50 z-50 overflow-hidden max-h-80 overflow-y-auto">
+                    <div className="p-3 border-b" style={{ borderColor: 'var(--brand-card-border)' }}>
+                      <p className="text-xs font-semibold brand-muted uppercase tracking-wider">Available Metrics</p>
                     </div>
                     <div className="p-2">
                       {availableMetrics.map(metric => (
                         <button
                           key={metric.id}
                           onClick={() => { addMetric(metric.id); if (availableMetrics.length <= 1) setShowAddPanel(false); }}
-                          className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-gray-300 hover:bg-gray-800 hover:text-white transition-colors text-left"
+                          className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm brand-text brand-card-hover transition-colors text-left"
                         >
-                          <div className={`w-2 h-2 rounded-full flex-shrink-0 ${metric.borderColor.replace('/30', '')}`} />
+                          <div className="w-2 h-2 rounded-full flex-shrink-0" style={{ backgroundColor: metric.accentColor }} />
                           <span>{metric.label}</span>
-                          <Plus className="w-3 h-3 ml-auto text-gray-500" />
+                          <Plus className="w-3 h-3 ml-auto brand-muted" />
                         </button>
                       ))}
                     </div>
@@ -1940,16 +2259,17 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
                 )}
               </div>
 
-              <div className="w-px h-5 bg-gray-700/50 mx-1"></div>
+              <div className="w-px h-5 mx-1" style={{ backgroundColor: 'var(--brand-card-border)' }}></div>
             </>
           )}
 
           <button
             onClick={() => { setIsEditMode(!isEditMode); setShowAddPanel(false); }}
             className={`flex items-center gap-2 px-4 py-1.5 text-sm font-medium rounded-lg transition-colors ${isEditMode
-              ? 'bg-pink-500 text-white shadow-lg shadow-pink-900/20'
-              : 'text-gray-300 hover:text-white hover:bg-gray-800'
+              ? 'brand-on-primary shadow-lg'
+              : 'brand-text brand-card-hover'
               }`}
+            style={isEditMode ? { backgroundColor: 'var(--brand-primary)' } : undefined}
           >
             <Settings2 className="w-4 h-4" />
             {isEditMode ? 'Done' : 'Customize'}
@@ -1970,16 +2290,17 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
                 onDragStart={isEditMode ? (e) => handleSectionDragStart(e, index) : undefined}
                 onDragOver={isEditMode ? (e) => handleSectionDragOver(e, index) : undefined}
                 onDragEnd={isEditMode ? handleSectionDragEnd : undefined}
-                className={`transition-all duration-300 ${isEditMode ? 'cursor-grab active:cursor-grabbing p-4 border border-dashed border-gray-700/50 rounded-2xl hover:bg-gray-800/20' : ''} ${isDragging ? 'opacity-40' : ''} ${isDragOver ? 'border-pink-500/50 bg-pink-500/5 ring-1 ring-pink-500/30' : ''}`}
+                className={`transition-all duration-300 ${isEditMode ? 'cursor-grab active:cursor-grabbing p-4 border border-dashed rounded-2xl brand-card-hover' : ''} ${isDragging ? 'opacity-40' : ''} ${isDragOver ? 'ring-1' : ''}`}
+                style={isEditMode ? { borderColor: 'var(--brand-card-border)' } : undefined}
               >
                 {/* ═══════════════════ CUSTOMIZABLE METRICS ═══════════════════ */}
                 <div>
                   {/* Section header */}
                   <div className="flex items-center justify-between mb-4">
                     <div className="flex items-center gap-2">
-                      {isEditMode && <div className="text-gray-500 mr-2">⣿</div>}
-                      <h3 className="text-lg font-semibold text-white">Key Metrics</h3>
-                      <span className="text-xs text-gray-500">({selectedMetricIds.length} of {metricRegistry.length})</span>
+                      {isEditMode && <div className="brand-muted mr-2">⣿</div>}
+                      <h3 className="text-lg font-semibold brand-text">Key Metrics</h3>
+                      <span className="text-xs brand-muted">({selectedMetricIds.length} of {metricRegistry.length})</span>
                     </div>
                     <div className="flex items-center gap-2" onMouseDown={e => e.stopPropagation()}>
 
@@ -1988,7 +2309,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
                   </div>
 
                   {isEditMode && (
-                    <p className="text-xs text-gray-500 mb-3 -mt-2 ml-1">Drag cards to reorder. Drag entire section to move up/down.</p>
+                    <p className="text-xs brand-muted mb-3 -mt-2 ml-1">Drag cards to reorder. Drag entire section to move up/down.</p>
                   )}
 
 
@@ -2008,8 +2329,8 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
                         return (
                           <div
                             key={metric.id}
-                            className={`relative bg-gray-800 border ${metric.borderColor} rounded-xl p-5 flex items-center justify-between select-none transition-all duration-150 ${isEditMode ? 'card-wiggle' : ''
-                              } ${isDragging ? 'card-dragging' : ''} ${isDragOver ? 'card-drag-over' : ''} ${!isEditMode && metric.onClick ? 'cursor-pointer hover:bg-gray-750 hover:border-purple-400/50' : ''}`}
+                            className={`relative rounded-xl p-5 flex items-center justify-between select-none transition-all duration-150 brand-card ${isEditMode ? 'card-wiggle' : ''
+                              } ${isDragging ? 'card-dragging' : ''} ${isDragOver ? 'card-drag-over' : ''} ${!isEditMode && metric.onClick ? 'cursor-pointer hover:opacity-[0.97]' : ''}`}
                             style={isEditMode ? { animationDelay: `${index * 50}ms` } : undefined}
                             draggable={isEditMode}
                             onClick={!isEditMode && metric.onClick ? metric.onClick : undefined}
@@ -2024,23 +2345,23 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
                             {isEditMode && (
                               <button
                                 onClick={(e) => { e.stopPropagation(); removeMetric(metric.id); }}
-                                className="absolute -top-2 -right-2 w-6 h-6 bg-gray-700 border border-gray-600 rounded-full flex items-center justify-center text-gray-400 hover:bg-red-500 hover:text-white transition-colors z-10 shadow-lg"
+                                className="absolute -top-2 -right-2 w-6 h-6 rounded-full flex items-center justify-center brand-muted transition-colors z-10 shadow-lg brand-card brand-card-hover"
                                 onMouseDown={(e) => e.stopPropagation()}
                               >
                                 <X className="w-3 h-3" />
                               </button>
                             )}
                             <div className="flex-1 min-w-0">
-                              <p className="text-gray-400 text-xs uppercase tracking-wider mb-1">{metric.label}</p>
-                              <p className="text-2xl font-bold text-white truncate">{metric.getValue()}</p>
+                              <p className="brand-muted text-xs uppercase tracking-wider mb-1">{metric.label}</p>
+                              <p className="text-2xl font-bold brand-text truncate">{metric.getValue()}</p>
                               {metric.subtitle && (
-                                <p className="text-gray-500 text-xs mt-1 truncate">{metric.subtitle}</p>
+                                <p className="brand-muted text-xs mt-1 truncate">{metric.subtitle}</p>
                               )}
                             </div>
                             {hasTrend && (
                               <div className={`flex items-center gap-1 px-3 py-1.5 rounded-full text-xs font-semibold flex-shrink-0 ml-3 ${metric.trendChange! >= 0
-                                ? 'bg-green-500/10 text-green-400'
-                                : 'bg-red-500/10 text-red-400'
+                                ? 'brand-state-success'
+                                : 'brand-state-danger'
                                 }`}>
                                 <TrendingUp className={`w-3 h-3 ${metric.trendChange! < 0 ? 'rotate-180' : ''}`} />
                                 {formatKeyMetricTrendPercent(metric.trendChange!)}%
@@ -2051,9 +2372,9 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
                       })}
                     </div>
                   ) : (
-                    <div className="bg-gray-800/50 rounded-xl border border-dashed border-gray-700 p-8 text-center">
-                      <Settings2 className="w-8 h-8 text-gray-600 mx-auto mb-2" />
-                      <p className="text-gray-500 text-sm">No metrics selected. Click <strong className="text-gray-400">Customize</strong> to add cards.</p>
+                    <div className="rounded-xl border border-dashed p-8 text-center brand-card border-opacity-60">
+                      <Settings2 className="w-8 h-8 opacity-60 brand-muted mx-auto mb-2" />
+                      <p className="brand-muted text-sm">No metrics selected. Click <strong className="brand-text">Customize</strong> to add cards.</p>
                     </div>
                   )}
                 </div>
@@ -2069,19 +2390,21 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
                 onDragStart={isEditMode ? (e) => handleSectionDragStart(e, index) : undefined}
                 onDragOver={isEditMode ? (e) => handleSectionDragOver(e, index) : undefined}
                 onDragEnd={isEditMode ? handleSectionDragEnd : undefined}
-                className={`transition-all duration-300 ${isEditMode ? 'cursor-grab active:cursor-grabbing p-4 border border-dashed border-gray-700/50 rounded-2xl hover:bg-gray-800/20' : ''} ${isDragging ? 'opacity-40' : ''} ${isDragOver ? 'border-pink-500/50 bg-pink-500/5 ring-1 ring-pink-500/30' : ''}`}
+                className={`transition-all duration-300 ${isEditMode ? 'cursor-grab active:cursor-grabbing p-4 border border-dashed rounded-2xl brand-card-hover' : ''} ${isDragging ? 'opacity-40' : ''} ${isDragOver ? 'ring-1' : ''}`}
+                style={isEditMode ? { borderColor: 'var(--brand-card-border)' } : undefined}
               >
                 {/* Performance Comparison Charts */}
                 <div className="w-full">
                   <div className="flex items-center gap-2 mb-4">
-                    {isEditMode && <div className="text-gray-500 mr-2">⣿</div>}
-                    <h3 className="text-lg font-semibold text-white">Performance Comparison</h3>
+                    {isEditMode && <div className="brand-muted mr-2">⣿</div>}
+                    <h3 className="text-lg font-semibold brand-text">Performance Comparison</h3>
                   </div>
                   <ComparisonCharts
                     orders={orders}
                     startDate={dateRange.startDate}
                     endDate={dateRange.endDate}
                     timezone={timezone}
+                    useHybridTimezone={useHybridTimezone}
                     includeCancelledInTotal={includeCancelledInTotal}
                     includeCancelledFinancials={includeCancelledFinancials}
                   />
@@ -2094,14 +2417,22 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
 
         {/* Affiliate Commission Card (Placed here as requested: 3rd section, before Quick Stats) */}
         <div className="w-full">
-          <AffiliateCommissionCard
-            autoCommission={autoAffiliateCommissionDetail.total}
-            autoOtherAffiliateCogs={autoAffiliateCommissionDetail.autoOtherAffiliateCogsCombined}
-            autoCommissionLines={autoAffiliateCommissionDetail.lines}
-            autoCommissionNetSigned={autoAffiliateCommissionDetail.netSigned}
-            manualRetainers={affiliateSettlements}
-            dateRangeLabel={dateRangeSubtitle}
-          />
+          {isRestricted('affiliate_commissions') ? (
+            <div className="brand-card rounded-xl p-6">
+              <p className="text-sm uppercase tracking-wide brand-muted mb-2">Affiliate Commissions</p>
+              <p className="text-2xl font-bold text-gray-400">Restricted</p>
+              <p className="text-sm text-gray-400 mt-1">Hidden by seller visibility policy</p>
+            </div>
+          ) : (
+            <AffiliateCommissionCard
+              autoCommission={autoAffiliateCommissionDetail.total}
+              autoOtherAffiliateCogs={autoAffiliateCommissionDetail.autoOtherAffiliateCogsCombined}
+              autoCommissionLines={autoAffiliateCommissionDetail.lines}
+              autoCommissionNetSigned={autoAffiliateCommissionDetail.netSigned}
+              manualRetainers={affiliateSettlementsInRange}
+              dateRangeLabel={dateRangeSubtitle}
+            />
+          )}
         </div>
       </div>
 
@@ -2110,42 +2441,42 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
 
       {/* ═══════════════════ QUICK STATS (FIXED) ═══════════════════ */}
       <div>
-        <h3 className="text-lg font-semibold text-white mb-4">Quick Stats</h3>
+        <h3 className="text-lg font-semibold brand-text mb-4">Quick Stats</h3>
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          <div className="bg-gray-800/50 border border-gray-700/50 rounded-xl p-4 flex items-center justify-between hover:bg-gray-800/70 transition-colors">
+          <div className="brand-card rounded-xl p-4 flex items-center justify-between hover:opacity-[0.98] transition-opacity">
             <div>
-              <p className="text-gray-500 text-xs font-medium uppercase tracking-wider">Orders Today</p>
-              <p className="text-xl font-bold text-white mt-1">{quickStats.ordersToday}</p>
+              <p className="brand-muted text-xs font-medium uppercase tracking-wider">Orders Today</p>
+              <p className="text-xl font-bold brand-text mt-1">{quickStats.ordersToday}</p>
             </div>
-            <div className="bg-indigo-500/10 p-2 rounded-lg border border-indigo-500/20">
-              <TrendingUp className="w-5 h-5 text-indigo-400" />
+            <div className="brand-state-info p-2 rounded-lg">
+              <TrendingUp className="w-5 h-5" style={{ color: 'var(--brand-info-text)' }} />
             </div>
           </div>
-          <div className="bg-gray-800/50 border border-gray-700/50 rounded-xl p-4 flex items-center justify-between hover:bg-gray-800/70 transition-colors">
+          <div className="brand-card rounded-xl p-4 flex items-center justify-between hover:opacity-[0.98] transition-opacity">
             <div>
-              <p className="text-gray-500 text-xs font-medium uppercase tracking-wider">Revenue Today</p>
-              <p className="text-xl font-bold text-white mt-1">{formatCurrency(quickStats.revenueToday)}</p>
+              <p className="brand-muted text-xs font-medium uppercase tracking-wider">Revenue Today</p>
+              <p className="text-xl font-bold brand-text mt-1">{formatCurrency(quickStats.revenueToday)}</p>
             </div>
-            <div className="bg-lime-500/10 p-2 rounded-lg border border-lime-500/20">
-              <TrendingUp className="w-5 h-5 text-lime-400" />
+            <div className="brand-state-success p-2 rounded-lg">
+              <TrendingUp className="w-5 h-5 brand-profit" />
             </div>
           </div>
-          <div className="bg-gray-800/50 border border-gray-700/50 rounded-xl p-4 flex items-center justify-between hover:bg-gray-800/70 transition-colors">
+          <div className="brand-card rounded-xl p-4 flex items-center justify-between hover:opacity-[0.98] transition-opacity">
             <div>
-              <p className="text-gray-500 text-xs font-medium uppercase tracking-wider">Pending Orders</p>
-              <p className="text-xl font-bold text-white mt-1">{quickStats.pendingOrders}</p>
+              <p className="brand-muted text-xs font-medium uppercase tracking-wider">Pending Orders</p>
+              <p className="text-xl font-bold brand-text mt-1">{quickStats.pendingOrders}</p>
             </div>
-            <div className="bg-yellow-500/10 p-2 rounded-lg border border-yellow-500/20">
-              <AlertCircle className="w-5 h-5 text-yellow-400" />
+            <div className="brand-state-warning p-2 rounded-lg">
+              <AlertCircle className="w-5 h-5" style={{ color: 'var(--brand-warning-text)' }} />
             </div>
           </div>
-          <div className="bg-gray-800/50 border border-gray-700/50 rounded-xl p-4 flex items-center justify-between hover:bg-gray-800/70 transition-colors">
+          <div className="brand-card rounded-xl p-4 flex items-center justify-between hover:opacity-[0.98] transition-opacity">
             <div>
-              <p className="text-gray-500 text-xs font-medium uppercase tracking-wider">Low Stock</p>
-              <p className="text-xl font-bold text-white mt-1">{quickStats.lowStockProducts}</p>
+              <p className="brand-muted text-xs font-medium uppercase tracking-wider">Low Stock</p>
+              <p className="text-xl font-bold brand-text mt-1">{quickStats.lowStockProducts}</p>
             </div>
-            <div className="bg-rose-500/10 p-2 rounded-lg border border-rose-500/20">
-              <AlertCircle className="w-5 h-5 text-rose-400" />
+            <div className="brand-state-danger p-2 rounded-lg">
+              <AlertCircle className="w-5 h-5" style={{ color: 'var(--brand-danger-text)' }} />
             </div>
           </div>
         </div>
@@ -2153,15 +2484,16 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
 
       {/* Danger Zone */}
       {canMutateShop && (
-        <div className="bg-red-900/10 border border-red-500/30 rounded-xl p-6">
-          <h3 className="text-lg font-semibold text-red-400 mb-2">Danger Zone</h3>
-          <p className="text-gray-400 text-sm mb-4">
+        <div className="brand-state-danger rounded-xl p-6">
+          <h3 className="text-lg font-semibold brand-loss mb-2">Danger Zone</h3>
+          <p className="brand-muted text-sm mb-4">
             Clear all shop data and start fresh. This will delete all orders, products, and financial data from the database.
           </p>
           <button
             onClick={() => setShowClearDataConfirm(true)}
             disabled={isClearing}
-            className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            className="flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed brand-on-primary"
+            style={{ backgroundColor: 'var(--brand-danger-text)' }}
           >
             <Trash2 className="w-4 h-4" />
             {isClearing ? 'Clearing...' : 'Clear All Shop Data'}
@@ -2172,38 +2504,39 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       {/* Confirmation Dialog */}
       {
         canMutateShop && showClearDataConfirm && (
-          <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
-            <div className="bg-gray-800 border border-red-500/30 rounded-2xl p-8 max-w-md w-full">
+          <div className="fixed inset-0 flex items-center justify-center z-50 p-4" style={{ backgroundColor: 'color-mix(in srgb, var(--brand-bg) 72%, black)' }}>
+            <div className="brand-card rounded-2xl p-8 max-w-md w-full">
               <div className="flex items-center gap-3 mb-4">
-                <div className="bg-red-500/10 p-3 rounded-full">
-                  <AlertCircle className="w-6 h-6 text-red-500" />
+                <div className="brand-state-danger p-3 rounded-full">
+                  <AlertCircle className="w-6 h-6 brand-loss" />
                 </div>
-                <h3 className="text-xl font-bold text-white">Clear All Shop Data?</h3>
+                <h3 className="text-xl font-bold brand-text">Clear All Shop Data?</h3>
               </div>
-              <p className="text-gray-300 mb-6">
+              <p className="brand-text mb-6">
                 This will permanently delete:
               </p>
-              <ul className="text-gray-400 space-y-2 mb-6 ml-4">
+              <ul className="brand-muted space-y-2 mb-6 ml-4">
                 <li>• All orders</li>
                 <li>• All products</li>
                 <li>• All financial settlements</li>
                 <li>• All performance data</li>
               </ul>
-              <p className="text-yellow-400 text-sm mb-6">
+              <p className="text-sm mb-6" style={{ color: 'var(--brand-warning-text)' }}>
                 ⚠️ This action cannot be undone! You will need to sync again to restore data from TikTok.
               </p>
               <div className="flex gap-3">
                 <button
                   onClick={() => setShowClearDataConfirm(false)}
                   disabled={isClearing}
-                  className="flex-1 px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg font-medium transition-colors disabled:opacity-50"
+                  className="flex-1 px-4 py-2 brand-card brand-text brand-card-hover rounded-lg font-medium transition-colors disabled:opacity-50"
                 >
                   Cancel
                 </button>
                 <button
                   onClick={handleClearShopData}
                   disabled={isClearing}
-                  className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                  className="flex-1 px-4 py-2 rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 brand-on-primary"
+                  style={{ backgroundColor: 'var(--brand-danger-text)' }}
                 >
                   {isClearing ? (
                     <>
@@ -2227,17 +2560,17 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       {/* Load Days Toast */}
       {loadDaysToast && (
         <div
-          className={`fixed bottom-6 right-6 z-50 flex items-center gap-3 rounded-xl bg-gray-900 px-4 py-3 shadow-xl border border-gray-700 transition-all duration-300 ${loadDaysToast.visible ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-2 pointer-events-none'
+          className={`fixed bottom-6 right-6 z-50 flex items-center gap-3 rounded-xl brand-card px-4 py-3 shadow-xl transition-all duration-300 ${loadDaysToast.visible ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-2 pointer-events-none'
             }`}
         >
-          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-amber-500/20">
-            <Zap className="h-4 w-4 text-amber-400" />
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full brand-state-warning">
+            <Zap className="h-4 w-4" style={{ color: 'var(--brand-warning-text)' }} />
           </div>
           <div className="flex flex-col">
-            <span className="text-sm font-semibold text-white">
+            <span className="text-sm font-semibold brand-text">
               {loadDaysToast.days === 1 ? '1 day' : `${loadDaysToast.days} days`} set as your default load
             </span>
-            <span className="text-xs text-gray-400">
+            <span className="text-xs brand-muted">
               On your next reload, {loadDaysToast.days === 1 ? '1 day' : `${loadDaysToast.days} days`} of data will be loaded initially
             </span>
           </div>

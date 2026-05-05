@@ -31,10 +31,17 @@ import {
     isTeamRpcMissingFromDb,
     manageTenantMember,
     tenantDirectoryForAdmin,
-    tenantSetMemberRole,
     updateCustomRole,
 } from '../../lib/tenantRolesRpc';
-import { inviteTeamMember, searchTeamProfiles, type TeamProfileRow } from '../../lib/teamApi';
+import {
+    inviteTeamMember,
+    searchTeamProfiles,
+    getMemberRoleAssignments,
+    getTenantMemberRoles,
+    syncMemberRoleAssignments,
+    type TeamProfileRow,
+} from '../../lib/teamApi';
+import { showAppToast } from '../../store/useAppToastStore';
 
 type RoleRow = {
     id: string;
@@ -104,8 +111,6 @@ export function RoleManagementView() {
     const [selectedRoleId, setSelectedRoleId] = useState<string | null>(null);
     const [memberSearch, setMemberSearch] = useState('');
     const [busy, setBusy] = useState<string | null>(null);
-    const [msg, setMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
-    const [inviteToast, setInviteToast] = useState<{ displayName: string } | null>(null);
     const [actionMenuOpen, setActionMenuOpen] = useState<string | null>(null); // membership_id
     const [confirmAction, setConfirmAction] = useState<{ userId: string; memberName: string; action: 'suspend' | 'reactivate' | 'remove' } | null>(null);
 
@@ -125,6 +130,8 @@ export function RoleManagementView() {
     const [assignShowAdvancedUuid, setAssignShowAdvancedUuid] = useState(false);
     const [assignLinkShopDashboard, setAssignLinkShopDashboard] = useState(true);
     const [assignAccountId, setAssignAccountId] = useState('');
+    const [multiRoleTarget, setMultiRoleTarget] = useState<DirectoryRow | null>(null);
+    const [multiRoleSelected, setMultiRoleSelected] = useState<Set<string>>(new Set());
 
     const openAssignModal = () => {
         setAssignOpen(true);
@@ -196,25 +203,38 @@ export function RoleManagementView() {
         return sellerParentAgencyId;
     }, [selectedTenantId, selectedTenant?.type, sellerParentAgencyId]);
 
+    const hasAgencyRole = React.useCallback(
+        (agencyTenantId: string | null, roleName: string) => {
+            if (!agencyTenantId) return false;
+            return memberships.some((m: any) => {
+                if (m.tenant_id !== agencyTenantId || m.status !== 'active' || m.tenants?.type !== 'agency') return false;
+                if (m.roles?.name === roleName) return true;
+                const linked = Array.isArray(m.membership_roles) ? m.membership_roles : [];
+                return linked.some((mr: any) => !mr?.revoked_at && mr?.roles?.name === roleName);
+            });
+        },
+        [memberships]
+    );
+
     const isAccountCoordinatorViewer = useMemo(() => {
         if (!relevantAgencyIdForTeamUi || canFullyManageTeamMembers) return false;
-        return memberships.some(
-            (m) =>
-                m.tenant_id === relevantAgencyIdForTeamUi &&
-                m.status === 'active' &&
-                m.roles?.name === 'Account Coordinator'
-        );
-    }, [relevantAgencyIdForTeamUi, canFullyManageTeamMembers, memberships]);
+        // AC-only viewers are read-only; AC+AM should inherit AM capabilities.
+        const hasAM = hasAgencyRole(relevantAgencyIdForTeamUi, 'Account Manager');
+        const hasAC = hasAgencyRole(relevantAgencyIdForTeamUi, 'Account Coordinator');
+        return hasAC && !hasAM;
+    }, [relevantAgencyIdForTeamUi, canFullyManageTeamMembers, hasAgencyRole]);
 
     const isAccountManagerViewer = useMemo(() => {
-        if (!relevantAgencyIdForTeamUi || canFullyManageTeamMembers || isAccountCoordinatorViewer) return false;
-        return memberships.some(
-            (m) =>
-                m.tenant_id === relevantAgencyIdForTeamUi &&
-                m.status === 'active' &&
-                m.roles?.name === 'Account Manager'
+        if (!relevantAgencyIdForTeamUi || canFullyManageTeamMembers) return false;
+        return hasAgencyRole(relevantAgencyIdForTeamUi, 'Account Manager');
+    }, [relevantAgencyIdForTeamUi, canFullyManageTeamMembers, hasAgencyRole]);
+    const isCombinedAmAcViewer = useMemo(() => {
+        if (!relevantAgencyIdForTeamUi || canFullyManageTeamMembers) return false;
+        return (
+            hasAgencyRole(relevantAgencyIdForTeamUi, 'Account Manager') &&
+            hasAgencyRole(relevantAgencyIdForTeamUi, 'Account Coordinator')
         );
-    }, [relevantAgencyIdForTeamUi, canFullyManageTeamMembers, isAccountCoordinatorViewer, memberships]);
+    }, [relevantAgencyIdForTeamUi, canFullyManageTeamMembers, hasAgencyRole]);
 
     const canEditMemberRole = (row: DirectoryRow) => {
         if (row.user_id === user?.id) return false;
@@ -284,10 +304,9 @@ export function RoleManagementView() {
         queryKey: ['tenant-roles-combined', selectedTenantId, scope, selectedTenant?.type],
         queryFn: async () => {
             if (!selectedTenantId) return [];
-            // Seller context: team directory may be parent-agency memberships; include agency system roles
-            // (e.g. Account Coordinator) as well as seller-scoped roles for assign/create flows.
-            const systemScopes =
-                selectedTenant?.type === 'seller' ? (['seller', 'agency'] as const) : ([scope] as const);
+            // Seller context must only expose seller-scoped roles.
+            // Agency roles (Agency Admin / AM / AC) belong to agency tenant context.
+            const systemScopes = [scope] as const;
             const [{ data: system, error: e1 }, { data: custom, error: e2 }] = await Promise.all([
                 supabase
                     .from('roles')
@@ -382,6 +401,23 @@ export function RoleManagementView() {
         enabled: !!selectedTenantId && activeTab === 'members',
     });
 
+    const { data: tenantMemberRoles = [] } = useQuery({
+        queryKey: ['tenant-member-roles-ui', selectedTenantId],
+        queryFn: async () => {
+            if (!selectedTenantId) return [];
+            return await getTenantMemberRoles(selectedTenantId);
+        },
+        enabled: !!selectedTenantId && activeTab === 'members',
+    });
+
+    const tenantMemberRolesMap = useMemo(() => {
+        const m = new Map<string, string[]>();
+        for (const row of tenantMemberRoles as Array<{ user_id: string; role_names: string[] }>) {
+            m.set(row.user_id, row.role_names || []);
+        }
+        return m;
+    }, [tenantMemberRoles]);
+
     const selectedRole = useMemo(
         () => roleRows.find((r) => r.id === selectedRoleId) ?? null,
         [roleRows, selectedRoleId]
@@ -429,15 +465,8 @@ export function RoleManagementView() {
     }, [directory, memberSearch]);
 
     const flash = (type: 'ok' | 'err', text: string) => {
-        setMsg({ type, text });
-        setTimeout(() => setMsg(null), 5000);
+        showAppToast(text, type === 'ok' ? 'ok' : 'err');
     };
-
-    React.useEffect(() => {
-        if (!inviteToast) return;
-        const t = window.setTimeout(() => setInviteToast(null), 6500);
-        return () => window.clearTimeout(t);
-    }, [inviteToast]);
 
     const invitedPersonLabel = (): string => {
         const email = assignInviteEmail.trim();
@@ -524,7 +553,10 @@ export function RoleManagementView() {
             const r = await inviteTeamMember(selectedTenantId, '', assignRoleId, uid);
             const dashErr = await maybeGrantShopDashboard(uid);
             if (r.invited) {
-                setInviteToast({ displayName: invitedPersonLabel() });
+                showAppToast(
+                    `Invitation sent. ${invitedPersonLabel()} will be assigned to this team as soon as they accept; access stays pending until then.`,
+                    'ok'
+                );
             }
             if (dashErr) {
                 flash('err', `Role assigned, but shop dashboard link failed: ${dashErr.message}`);
@@ -549,7 +581,10 @@ export function RoleManagementView() {
             const r = await inviteTeamMember(selectedTenantId, assignInviteEmail.trim(), assignRoleId);
             const dashErr = await maybeGrantShopDashboard(r.userId);
             if (r.invited) {
-                setInviteToast({ displayName: invitedPersonLabel() });
+                showAppToast(
+                    `Invitation sent. ${invitedPersonLabel()} will be assigned to this team as soon as they accept; access stays pending until then.`,
+                    'ok'
+                );
             }
             if (dashErr) {
                 flash('err', `Role assigned, but shop dashboard link failed: ${dashErr.message}`);
@@ -569,14 +604,59 @@ export function RoleManagementView() {
     const handleMemberRoleChange = async (userId: string, roleId: string) => {
         if (!selectedTenantId) return;
         setBusy(`m-${userId}`);
-        const { error } = await tenantSetMemberRole(selectedTenantId, userId, roleId);
-        setBusy(null);
-        if (error) {
-            flash('err', error.message);
+        try {
+            // Dropdown is "Primary role" UX; it should replace the member role set,
+            // not append. Use the multi-role sync endpoint with one selected role.
+            await syncMemberRoleAssignments(selectedTenantId, userId, [roleId]);
+            flash('ok', 'Role updated');
+            invalidateTenant();
+        } catch (e: any) {
+            flash('err', e.message || 'Failed to update role');
+        } finally {
+            setBusy(null);
+        }
+    };
+
+    const openMultiRoleModal = async (row: DirectoryRow) => {
+        if (!selectedTenantId) return;
+        setBusy(`mr-load-${row.user_id}`);
+        try {
+            const roles = await getMemberRoleAssignments(selectedTenantId, row.user_id);
+            const selected = new Set<string>(roles.map((r) => r.role_id));
+            if (selected.size === 0 && row.role_id) {
+                selected.add(row.role_id);
+            }
+            setMultiRoleSelected(selected);
+            setMultiRoleTarget(row);
+        } catch (e: any) {
+            flash('err', e.message || 'Failed to load member roles');
+        } finally {
+            setBusy(null);
+        }
+    };
+
+    const saveMultiRoles = async () => {
+        if (!selectedTenantId || !multiRoleTarget) return;
+        if (multiRoleSelected.size === 0) {
+            flash('err', 'At least one role must remain assigned.');
             return;
         }
-        flash('ok', 'Role updated');
-        invalidateTenant();
+        setBusy(`mr-save-${multiRoleTarget.user_id}`);
+        try {
+            await syncMemberRoleAssignments(
+                selectedTenantId,
+                multiRoleTarget.user_id,
+                Array.from(multiRoleSelected)
+            );
+            flash('ok', 'Member roles updated');
+            setMultiRoleTarget(null);
+            setMultiRoleSelected(new Set());
+            invalidateTenant();
+        } catch (e: any) {
+            flash('err', e.message || 'Failed to update roles');
+        } finally {
+            setBusy(null);
+        }
     };
 
     const handleMemberAction = async (action: 'suspend' | 'reactivate' | 'remove') => {
@@ -625,7 +705,7 @@ export function RoleManagementView() {
     }
 
     return (
-        <div className="h-full flex flex-col text-white animate-in fade-in duration-500 relative">
+        <div className="w-full min-w-0 h-full flex flex-col text-white animate-in fade-in duration-500 relative">
             <div className="absolute inset-x-0 top-0 h-64 bg-gradient-to-b from-fuchsia-500/10 via-pink-500/5 to-transparent -z-10 rounded-full blur-[100px] opacity-50 pointer-events-none" />
 
             <div className="flex-shrink-0 p-8 pb-0 relative z-10">
@@ -662,17 +742,6 @@ export function RoleManagementView() {
                         </select>
                     </div>
                 </div>
-
-                {msg && (
-                    <div
-                        className={`mb-4 text-sm px-4 py-2 rounded-xl border ${msg.type === 'ok'
-                                ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
-                                : 'bg-red-500/10 border-red-500/30 text-red-300'
-                            }`}
-                    >
-                        {msg.text}
-                    </div>
-                )}
 
                 <div className="flex space-x-2 border-b border-white/10 pb-4 relative z-10 w-full">
                     <button
@@ -738,8 +807,11 @@ export function RoleManagementView() {
                                     </p>
                                 ) : (
                                     <p>
-                                        <span className="font-bold text-violet-200">Limited management.</span> As an Account
-                                        Manager you can change roles and use actions only for{' '}
+                                        <span className="font-bold text-violet-200">
+                                            {isCombinedAmAcViewer ? 'Limited management (AC & AM).' : 'Limited management.'}
+                                        </span>{' '}
+                                        {isCombinedAmAcViewer ? 'As an AC & AM user' : 'As an Account Manager'} you can
+                                        change roles and use actions only for{' '}
                                         <span className="text-white font-semibold">Account Coordinators</span>. Everyone
                                         else is shown read-only.
                                     </p>
@@ -830,26 +902,63 @@ export function RoleManagementView() {
                                                             {row.role_name || roleRows.find((r) => r.id === row.role_id)?.name || '—'}
                                                         </span>
                                                     ) : (
-                                                        <div className="relative inline-block w-full max-w-[240px]">
-                                                            <select
-                                                                value={row.role_id}
-                                                                disabled={busy === `m-${row.user_id}`}
-                                                                onChange={(e) =>
-                                                                    handleMemberRoleChange(row.user_id, e.target.value)
-                                                                }
-                                                                className="w-full bg-gray-950/80 border border-white/10 rounded-xl px-4 py-2 text-xs font-bold text-white appearance-none cursor-pointer focus:outline-none focus:border-pink-500/50 hover:bg-white/5 transition-all shadow-sm"
-                                                                style={{ backgroundImage: `url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%239ca3af' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e")`, backgroundPosition: 'right 0.5rem center', backgroundRepeat: 'no-repeat', backgroundSize: '1.5em 1.5em', paddingRight: '2.5rem' }}
-                                                            >
-                                                                {(isAccountManagerViewer && !canFullyManageTeamMembers
-                                                                    ? roleRows.filter((r) => r.name === 'Account Coordinator')
-                                                                    : roleRows
-                                                                ).map((r) => (
-                                                                    <option key={r.id} value={r.id} className="bg-gray-900">
-                                                                        {r.name}
-                                                                        {r.type === 'custom' ? ' (custom)' : ''}
-                                                                    </option>
-                                                                ))}
-                                                            </select>
+                                                        <div className="space-y-2 max-w-[260px]">
+                                                            <div className="relative inline-block w-full">
+                                                                <select
+                                                                    value={row.role_id}
+                                                                    disabled={busy === `m-${row.user_id}`}
+                                                                    onChange={(e) =>
+                                                                        handleMemberRoleChange(row.user_id, e.target.value)
+                                                                    }
+                                                                    className="w-full bg-gray-950/80 border border-white/10 rounded-xl px-4 py-2 text-xs font-bold text-white appearance-none cursor-pointer focus:outline-none focus:border-pink-500/50 hover:bg-white/5 transition-all shadow-sm"
+                                                                    style={{ backgroundImage: `url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%239ca3af' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e")`, backgroundPosition: 'right 0.5rem center', backgroundRepeat: 'no-repeat', backgroundSize: '1.5em 1.5em', paddingRight: '2.5rem' }}
+                                                                >
+                                                                    {(() => {
+                                                                        const base =
+                                                                            isAccountManagerViewer && !canFullyManageTeamMembers
+                                                                                ? roleRows.filter((r) => r.name === 'Account Coordinator')
+                                                                                : roleRows;
+                                                                        // Ensure current value is always visible even when
+                                                                        // scope-filtered role lists don't include that role.
+                                                                        const hasCurrent = base.some((r) => r.id === row.role_id);
+                                                                        const merged = hasCurrent
+                                                                            ? base
+                                                                            : [{ id: row.role_id, name: row.role_name || 'Current role', type: 'system' as const }, ...base];
+                                                                        return merged.map((r) => (
+                                                                            <option key={r.id} value={r.id} className="bg-gray-900">
+                                                                                {r.name}
+                                                                                {r.type === 'custom' ? ' (custom)' : ''}
+                                                                            </option>
+                                                                        ));
+                                                                    })()}
+                                                                </select>
+                                                            </div>
+                                                            {!isAccountManagerViewer && !isAccountCoordinatorViewer && (
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={() => openMultiRoleModal(row)}
+                                                                    disabled={busy === `mr-load-${row.user_id}`}
+                                                                    className="text-[10px] uppercase tracking-wider font-bold px-2.5 py-1 rounded-lg border border-violet-500/30 text-violet-300 hover:bg-violet-500/10 disabled:opacity-50"
+                                                                >
+                                                                    {busy === `mr-load-${row.user_id}` ? 'Loading...' : 'Manage multi-role'}
+                                                                </button>
+                                                            )}
+                                                            {(() => {
+                                                                const roleNames = tenantMemberRolesMap.get(row.user_id) || [];
+                                                                if (roleNames.length <= 1) return null;
+                                                                return (
+                                                                    <div className="flex flex-wrap gap-1.5">
+                                                                        {roleNames.map((rn) => (
+                                                                            <span
+                                                                                key={`${row.user_id}:${rn}`}
+                                                                                className="inline-flex text-[10px] font-bold px-2 py-0.5 rounded-lg border bg-violet-500/15 text-violet-200 border-violet-500/30"
+                                                                            >
+                                                                                {rn}
+                                                                            </span>
+                                                                        ))}
+                                                                    </div>
+                                                                );
+                                                            })()}
                                                         </div>
                                                     )}
                                                 </td>
@@ -1102,6 +1211,76 @@ export function RoleManagementView() {
                     </div>
                 )}
             </div>
+
+            {multiRoleTarget && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+                    <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={() => setMultiRoleTarget(null)} />
+                    <div className="relative z-10 w-full max-w-lg rounded-3xl border border-white/10 bg-gray-900/95 shadow-2xl">
+                        <div className="flex items-center justify-between px-6 py-5 border-b border-white/10">
+                            <div>
+                                <h3 className="text-lg font-bold text-white">Assign Multiple Roles</h3>
+                                <p className="text-xs text-gray-400 mt-1">
+                                    {multiRoleTarget.full_name || multiRoleTarget.email || multiRoleTarget.user_id}
+                                </p>
+                            </div>
+                            <button
+                                type="button"
+                                onClick={() => setMultiRoleTarget(null)}
+                                className="p-2 rounded-lg text-gray-400 hover:text-white hover:bg-white/10"
+                            >
+                                <X size={16} />
+                            </button>
+                        </div>
+                        <div className="px-6 py-4 space-y-2 max-h-[50vh] overflow-y-auto">
+                            {(isAccountManagerViewer && !canFullyManageTeamMembers
+                                ? roleRows.filter((r) => r.name === 'Account Coordinator')
+                                : roleRows
+                            ).map((r) => (
+                                <label
+                                    key={r.id}
+                                    className="flex items-start gap-3 rounded-xl border border-white/10 bg-white/[0.02] px-3 py-2 cursor-pointer hover:bg-white/[0.05]"
+                                >
+                                    <input
+                                        type="checkbox"
+                                        checked={multiRoleSelected.has(r.id)}
+                                        onChange={(e) => {
+                                            const next = new Set(multiRoleSelected);
+                                            if (e.target.checked) next.add(r.id);
+                                            else next.delete(r.id);
+                                            setMultiRoleSelected(next);
+                                        }}
+                                        className="mt-1"
+                                    />
+                                    <div>
+                                        <p className="text-sm font-semibold text-white">
+                                            {r.name}
+                                            {r.type === 'custom' ? ' (custom)' : ''}
+                                        </p>
+                                        {r.description && <p className="text-xs text-gray-400">{r.description}</p>}
+                                    </div>
+                                </label>
+                            ))}
+                        </div>
+                        <div className="flex justify-end gap-3 px-6 py-4 border-t border-white/10">
+                            <button
+                                type="button"
+                                onClick={() => setMultiRoleTarget(null)}
+                                className="px-4 py-2 rounded-xl border border-white/10 text-gray-300 hover:bg-white/10 text-sm font-semibold"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                type="button"
+                                onClick={saveMultiRoles}
+                                disabled={busy === `mr-save-${multiRoleTarget.user_id}`}
+                                className="px-4 py-2 rounded-xl bg-violet-600 hover:bg-violet-500 text-white text-sm font-semibold disabled:opacity-50"
+                            >
+                                {busy === `mr-save-${multiRoleTarget.user_id}` ? 'Saving...' : 'Save Roles'}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
 
             {createOpen && (
                 <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
@@ -1414,31 +1593,6 @@ export function RoleManagementView() {
                 </div>
             )}
             {/* Confirmation Modal for Suspend/Reactivate/Remove */}
-            {inviteToast && (
-                <div
-                    role="status"
-                    aria-live="polite"
-                    className="fixed bottom-6 right-6 left-6 sm:left-auto z-[220] max-w-md mx-auto sm:mx-0 animate-in slide-in-from-bottom-4 fade-in duration-300 pointer-events-auto"
-                >
-                    <div className="rounded-2xl border border-pink-500/30 bg-gray-950/95 backdrop-blur-xl shadow-2xl shadow-black/60 p-5">
-                        <div className="flex gap-3">
-                            <div className="shrink-0 p-2.5 rounded-xl bg-pink-500/15 border border-pink-500/30">
-                                <UserPlus className="w-5 h-5 text-pink-400" strokeWidth={2.5} />
-                            </div>
-                            <div className="min-w-0 pt-0.5">
-                                <p className="text-sm font-bold text-white tracking-tight">Invitation sent</p>
-                                <p className="text-sm text-gray-300 mt-2 leading-relaxed">
-                                    <span className="text-pink-200 font-semibold">{inviteToast.displayName}</span>
-                                    {' '}
-                                    will be assigned to this team as soon as they accept. You can continue; their access
-                                    stays pending until then.
-                                </p>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            )}
-
             {confirmAction && (
                 <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 sm:p-6 bg-black/60 backdrop-blur-sm animate-in fade-in duration-200">
                     <div className="bg-gray-900 border border-white/10 rounded-3xl p-6 sm:p-8 max-w-md w-full shadow-2xl relative overflow-hidden slide-up">

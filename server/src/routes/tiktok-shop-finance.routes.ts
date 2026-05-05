@@ -24,6 +24,64 @@ router.use(
     }))
 );
 
+const ALLOWED_RESTRICTED_FIELDS = new Set([
+    'cogs',
+    'margin',
+    'custom_line_items',
+    'gross_profit',
+    'net_profit',
+    'platform_fees',
+    'affiliate_commissions',
+    'shipping_costs',
+    'agency_fees',
+    'ad_spend',
+]);
+
+function parseRestrictedFields(input: unknown): string[] {
+    if (!Array.isArray(input)) return [];
+    const filtered = input
+        .filter((v): v is string => typeof v === 'string')
+        .map((v) => v.trim())
+        .filter((v) => ALLOWED_RESTRICTED_FIELDS.has(v));
+    return Array.from(new Set(filtered));
+}
+
+function parseRestrictedPrincipals(input: unknown): string[] {
+    if (!Array.isArray(input)) return ['all_agency'];
+    const allowed = new Set([
+        'all_agency',
+        'all_seller',
+        'agency_admin',
+        'account_manager',
+        'account_coordinator',
+        'seller_admin',
+        'seller_user',
+    ]);
+    const out = input
+        .filter((v): v is string => typeof v === 'string')
+        .map((v) => v.trim())
+        .filter((v) => allowed.has(v));
+    return out.length > 0 ? out : ['all_agency'];
+}
+
+async function canManageFinancialRestrictions(userId: string, sellerTenantId: string): Promise<boolean> {
+    const { data: isSellerAdmin } = await supabase.rpc('user_is_seller_admin', {
+        p_seller_tenant_id: sellerTenantId,
+        p_user_id: userId,
+    });
+    if (isSellerAdmin === true) return true;
+
+    const { data: isSa } = await supabase.rpc('user_is_platform_super_admin', { p_user_id: userId });
+    if (isSa === true) return true;
+
+    const { data: profile } = await supabase
+        .from('profiles')
+        .select('role')
+        .eq('id', userId)
+        .maybeSingle();
+    return profile?.role === 'admin';
+}
+
 // Helper to handle API errors
 const handleApiError = (res: express.Response, error: any) => {
     console.error('API Error:', error);
@@ -381,14 +439,26 @@ router.get('/pl-data/:accountId', async (req, res) => {
 
         let filteredPayload = payload;
         if (userId) {
+            let fieldAccess = null as Awaited<ReturnType<typeof getFinancialFieldAccess>> | null;
             const { data: account } = await supabase
                 .from('accounts')
                 .select('tenant_id')
                 .eq('id', accountId)
                 .maybeSingle();
             if (account?.tenant_id) {
-                const fieldAccess = await getFinancialFieldAccess(userId, account.tenant_id);
+                fieldAccess = await getFinancialFieldAccess(userId, account.tenant_id);
                 filteredPayload = applyFinancialFieldFiltering(payload as Record<string, unknown>, fieldAccess);
+            }
+            if (fieldAccess) {
+                filteredPayload = {
+                    ...(filteredPayload as Record<string, unknown>),
+                    financial_visibility: {
+                        can_view_cogs: fieldAccess.canViewCogs,
+                        can_view_margin: fieldAccess.canViewMargin,
+                        can_view_custom_line_items: fieldAccess.canViewCustomLineItems,
+                        restricted_fields: fieldAccess.restrictedFields,
+                    },
+                };
             }
         }
 
@@ -396,6 +466,159 @@ router.get('/pl-data/:accountId', async (req, res) => {
             success: true,
             data: filteredPayload,
         });
+    } catch (error) {
+        handleApiError(res, error);
+    }
+});
+
+/**
+ * GET /api/tiktok-shop/finance/restrictions/:accountId
+ * Returns seller-level financial visibility restrictions for this seller account.
+ */
+router.get('/restrictions/:accountId', async (req, res) => {
+    try {
+        const { accountId } = req.params;
+        const userId = await resolveRequestUserId(req);
+        if (!userId) {
+            res.status(401).json({ success: false, error: 'Authorization required' });
+            return;
+        }
+
+        const { data: account, error: accErr } = await supabase
+            .from('accounts')
+            .select('tenant_id')
+            .eq('id', accountId)
+            .maybeSingle();
+        if (accErr || !account?.tenant_id) {
+            res.status(404).json({ success: false, error: 'Seller tenant not found for account' });
+            return;
+        }
+        const sellerTenantId = account.tenant_id as string;
+
+        const allowed = await canManageFinancialRestrictions(userId, sellerTenantId);
+        if (!allowed) {
+            res.status(403).json({ success: false, error: 'Access denied' });
+            return;
+        }
+
+        const { data: rule, error: ruleErr } = await supabase
+            .from('seller_financial_visibility_rules')
+            .select('id, seller_tenant_id, agency_tenant_id, restrict_cogs, restrict_margin, restrict_custom_line_items, restricted_principals, restricted_fields, updated_at, updated_by')
+            .eq('seller_tenant_id', sellerTenantId)
+            .is('agency_tenant_id', null)
+            .maybeSingle();
+        if (ruleErr) throw ruleErr;
+
+        res.json({
+            success: true,
+            data: rule || {
+                seller_tenant_id: sellerTenantId,
+                agency_tenant_id: null,
+                restrict_cogs: false,
+                restrict_margin: false,
+                restrict_custom_line_items: false,
+                restricted_principals: ['all_agency'],
+                restricted_fields: [],
+            },
+        });
+    } catch (error) {
+        handleApiError(res, error);
+    }
+});
+
+/**
+ * PUT /api/tiktok-shop/finance/restrictions/:accountId
+ * Upserts seller-level financial visibility restrictions (agency_tenant_id = null).
+ */
+router.put('/restrictions/:accountId', async (req, res) => {
+    try {
+        const { accountId } = req.params;
+        const userId = await resolveRequestUserId(req);
+        if (!userId) {
+            res.status(401).json({ success: false, error: 'Authorization required' });
+            return;
+        }
+
+        const { data: account, error: accErr } = await supabase
+            .from('accounts')
+            .select('tenant_id')
+            .eq('id', accountId)
+            .maybeSingle();
+        if (accErr || !account?.tenant_id) {
+            res.status(404).json({ success: false, error: 'Seller tenant not found for account' });
+            return;
+        }
+        const sellerTenantId = account.tenant_id as string;
+
+        const allowed = await canManageFinancialRestrictions(userId, sellerTenantId);
+        if (!allowed) {
+            res.status(403).json({ success: false, error: 'Access denied' });
+            return;
+        }
+
+        const b = req.body ?? {};
+        const restrictCogs = b.restrict_cogs === true;
+        const restrictMargin = b.restrict_margin === true;
+        const restrictCustomLineItems = b.restrict_custom_line_items === true;
+        const restrictedFields = parseRestrictedFields(b.restricted_fields);
+        const restrictedPrincipals = parseRestrictedPrincipals(b.restricted_principals);
+
+        const nowIso = new Date().toISOString();
+        const { data: existing, error: existingErr } = await supabase
+            .from('seller_financial_visibility_rules')
+            .select('id')
+            .eq('seller_tenant_id', sellerTenantId)
+            .is('agency_tenant_id', null)
+            .maybeSingle();
+        if (existingErr) throw existingErr;
+
+        let saved: any = null;
+        if (existing?.id) {
+            const { data: updated, error: updateErr } = await supabase
+                .from('seller_financial_visibility_rules')
+                .update({
+                    restrict_cogs: restrictCogs,
+                    restrict_margin: restrictMargin,
+                    restrict_custom_line_items: restrictCustomLineItems,
+                    restricted_principals: restrictedPrincipals,
+                    restricted_fields: restrictedFields,
+                    updated_by: userId,
+                    updated_at: nowIso,
+                })
+                .eq('id', existing.id)
+                .select('id, seller_tenant_id, agency_tenant_id, restrict_cogs, restrict_margin, restrict_custom_line_items, restricted_principals, restricted_fields, updated_at, updated_by')
+                .single();
+            if (updateErr) throw updateErr;
+            saved = updated;
+        } else {
+            const { data: inserted, error: insertErr } = await supabase
+                .from('seller_financial_visibility_rules')
+                .insert({
+                    seller_tenant_id: sellerTenantId,
+                    agency_tenant_id: null,
+                    restrict_cogs: restrictCogs,
+                    restrict_margin: restrictMargin,
+                    restrict_custom_line_items: restrictCustomLineItems,
+                    restricted_principals: restrictedPrincipals,
+                    restricted_fields: restrictedFields,
+                    updated_by: userId,
+                    updated_at: nowIso,
+                })
+                .select('id, seller_tenant_id, agency_tenant_id, restrict_cogs, restrict_margin, restrict_custom_line_items, restricted_principals, restricted_fields, updated_at, updated_by')
+                .single();
+            if (insertErr) throw insertErr;
+            saved = inserted;
+        }
+
+        // Keep this settings page as the single source of truth for seller-wide policy.
+        // Remove legacy agency-specific rows to avoid conflicting/stacked behavior.
+        await supabase
+            .from('seller_financial_visibility_rules')
+            .delete()
+            .eq('seller_tenant_id', sellerTenantId)
+            .not('agency_tenant_id', 'is', null);
+
+        res.json({ success: true, data: saved });
     } catch (error) {
         handleApiError(res, error);
     }

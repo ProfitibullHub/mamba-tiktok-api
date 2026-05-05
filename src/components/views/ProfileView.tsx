@@ -72,7 +72,7 @@ export function ProfileView() {
     };
 
     return (
-        <div className="max-w-4xl mx-auto space-y-8">
+        <div className="w-full max-w-none space-y-8">
             <div>
                 <h2 className="text-2xl font-bold text-white mb-2">Profile Settings</h2>
                 <p className="text-gray-400">Manage your account information and security.</p>
