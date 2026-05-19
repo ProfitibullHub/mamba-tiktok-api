@@ -1,18 +1,9 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { useState, useEffect, useCallback, useMemo, lazy, Suspense } from 'react';
 import { useParams, useLocation } from 'react-router-dom';
 import { Sidebar } from './Sidebar';
 import { NewOrdersToast } from './NewOrdersToast';
 import { NotificationToast } from './NotificationToast';
 import { OverviewView } from './views/OverviewView';
-import { ProfitLossView } from './views/ProfitLossView';
-import { OrdersView } from './views/OrdersView';
-import { ProductsView } from './views/ProductsView';
-import { FinanceDebugView } from './views/FinanceDebugView';
-import { DataAuditView } from './views/DataAuditView';
-import { MarketingDashboardView } from './views/MarketingDashboardView';
-import { NotificationsView } from './views/NotificationsView';
-import { ProfileView } from './views/ProfileView';
-import { FinancialRestrictionsView } from './views/FinancialRestrictionsView';
 import { type Account, supabase } from '../lib/supabase';
 import { matchesSlug } from '../utils/slugify';
 import { useAuth } from '../contexts/AuthContext';
@@ -23,7 +14,6 @@ import { useShopStore } from '../store/useShopStore';
 import { useNotificationStore } from '../store/useNotificationStore';
 import { useTikTokAdsStore } from '../store/useTikTokAdsStore';
 import { getTimezoneDisplay } from '../utils/timezoneMapping';
-import { getDateRangeFromPreset } from '../utils/dateUtils';
 import { AlertTriangle, Store } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import type { VisibleShop } from './views/HomeConsoleView';
@@ -33,6 +23,37 @@ import {
     SELLER_FACING_BRANDING_QK,
     useSellerBranding,
 } from '../contexts/SellerBrandingContext';
+import type { DateRange } from './DateRangePicker';
+import { clearShopTabMountBootstrapFingerprints } from '../utils/shopTabBootstrap';
+import {
+    useMergedShopEffectivePermissions,
+    computeShopTabAccess,
+    firstAccessibleShopTab,
+    shopTabIsAllowed,
+    effectiveHasTiktokShopData,
+    effectiveAllowsMarketingFinanceTab,
+} from '../hooks/useMyEffectivePermissions';
+
+/** Lazy tabs — smaller initial bundle for the default Overview route; chunks load on first visit. */
+const OrdersView = lazy(() => import('./views/OrdersView').then((m) => ({ default: m.OrdersView })));
+const ProductsView = lazy(() => import('./views/ProductsView').then((m) => ({ default: m.ProductsView })));
+const ProfitLossView = lazy(() => import('./views/ProfitLossView').then((m) => ({ default: m.ProfitLossView })));
+const FinanceDebugView = lazy(() => import('./views/FinanceDebugView').then((m) => ({ default: m.FinanceDebugView })));
+const DataAuditView = lazy(() => import('./views/DataAuditView').then((m) => ({ default: m.DataAuditView })));
+const MarketingDashboardView = lazy(() =>
+    import('./views/MarketingDashboardView').then((m) => ({ default: m.MarketingDashboardView })),
+);
+const NotificationsView = lazy(() => import('./views/NotificationsView').then((m) => ({ default: m.NotificationsView })));
+const ProfileView = lazy(() => import('./views/ProfileView').then((m) => ({ default: m.ProfileView })));
+const FinancialRestrictionsView = lazy(() =>
+    import('./views/FinancialRestrictionsView').then((m) => ({ default: m.FinancialRestrictionsView })),
+);
+
+/** Tabs that drive `fetchShopData` + the shared date-range UI. Other tabs only hide the sync progress bar; in-flight fetches keep running. */
+const SHOP_DATA_RANGE_TAB_IDS = new Set(['overview', 'profit-loss', 'orders']);
+
+/** Per-tab period memory while this shop SPA session is mounted (lost on refresh / navigate away from shop). */
+type ShopSessionRangeTab = 'overview' | 'orders' | 'profit-loss' | 'marketing';
 
 export function ShopPage() {
     const { shopSlug } = useParams<{ shopSlug: string }>();
@@ -54,7 +75,6 @@ export function ShopPage() {
 
     const navigationTarget = useNotificationStore((state) => state.navigationTarget);
     const setNavigationTarget = useNotificationStore((state) => state.setNavigationTarget);
-    const plPrefetchKeyRef = useRef<string | null>(null);
 
     useEffect(() => {
         if (navigationTarget) {
@@ -124,6 +144,7 @@ export function ShopPage() {
         }
     }, [shop?.timezone, timezoneOverride]);
 
+    // UX gate only — shop list and data are already scoped by RLS; API uses check_user_account_access.
     const {
         data: accessAllowed,
         isLoading: accessLoading,
@@ -172,8 +193,8 @@ export function ShopPage() {
     );
 
     const { isFetched: brandingPrefetchFetched } = useQuery({
-        queryKey: [SELLER_FACING_BRANDING_QK, brandingCacheKey],
-        queryFn: fetchBranding,
+        queryKey: [SELLER_FACING_BRANDING_QK, brandingCacheKey, shop?.account_id ?? ''],
+        queryFn: () => fetchBranding(undefined, shop?.account_id),
         enabled: brandingPrefetchEnabled,
         staleTime: 30 * 60 * 1000,
         gcTime: 60 * 60 * 1000,
@@ -200,17 +221,6 @@ export function ShopPage() {
             (tenantLoading || !brandingGateDone),
     );
 
-    const dashboardReady = Boolean(
-        shop &&
-            shop.account_id &&
-            accessAllowed === true &&
-            !accessLoading &&
-            !awaitingSlugResolution &&
-            !tenantLoading &&
-            brandingGateDone &&
-            !isTenantAccessLocked,
-    );
-
     const showUnifiedDashboardGate =
         awaitingSlugResolution || awaitingAccess || needsFullDashboardGate;
 
@@ -221,33 +231,6 @@ export function ShopPage() {
           : tenantLoading
             ? 'Loading workspace…'
             : 'Loading brand…';
-
-    // Warm the P&L default range as soon as the shop shell mounts (next macrotask) so refresh triggers prefetch immediately.
-    // Overview keeps its own 1-day date range; these shared store loads are filtered per view.
-    useEffect(() => {
-        if (!dashboardReady || !shop?.shop_id || !selectedAccount?.id) return;
-
-        const range = getDateRangeFromPreset('last30', shopTimezone);
-        const prefetchKey = `${selectedAccount.id}:${shop.shop_id}:${range.startDate}:${range.endDate}:${shopTimezone}`;
-        if (plPrefetchKeyRef.current === prefetchKey) return;
-        plPrefetchKeyRef.current = prefetchKey;
-
-        const timer = window.setTimeout(() => {
-            const store = useShopStore.getState();
-            void store.fetchShopData(
-                selectedAccount.id,
-                shop.shop_id,
-                { skipSyncCheck: true, timezone: shopTimezone },
-                range.startDate,
-                range.endDate,
-            );
-            void store.fetchPLData(selectedAccount.id, shop.shop_id, range.startDate, range.endDate, false, shopTimezone);
-            void store.fetchAffiliateSettlements(selectedAccount.id, shop.shop_id, range.startDate, range.endDate);
-            void store.fetchAgencyFees(selectedAccount.id, shop.shop_id, range.startDate, range.endDate);
-        }, 0);
-
-        return () => window.clearTimeout(timer);
-    }, [dashboardReady, selectedAccount?.id, shop?.shop_id, shopTimezone]);
 
     /** Persists via PATCH; updates React Query cache so refresh and navigation state both reflect the saved timezone. */
     const handleTimezoneChange = useCallback(
@@ -266,71 +249,10 @@ export function ShopPage() {
     // user's date range. Avoid a second no-date fetch here — it raced Overview and was skipped as "duplicate",
     // leaving the wrong range in the store.
 
-    // Notifications
-    const fetchNotifications = useNotificationStore((state) => state.fetchNotifications);
-    const subscribeToNotifications = useNotificationStore((state) => state.subscribeToNotifications);
-
-    useEffect(() => {
-        if (dashboardReady && shop?.shop_id) {
-            fetchNotifications([shop.shop_id]);
-            subscribeToNotifications([shop.shop_id]);
-        } else {
-            fetchNotifications([]);
-            subscribeToNotifications([]);
-        }
-    }, [dashboardReady, shop?.shop_id, fetchNotifications, subscribeToNotifications]);
-
-    // Marketing preload
-    useEffect(() => {
-        if (!dashboardReady || !shop?.account_id) return;
-        const accountId = shop.account_id;
-        const { checkConnection, loadMarketingFromDB, subscribeToMarketingUpdates } = useTikTokAdsStore.getState();
-
-        checkConnection(accountId).then((isConnected) => {
-            if (isConnected) {
-                loadMarketingFromDB(accountId).catch((e) => console.warn('[ShopPage] Marketing preload failed:', e));
-            }
-        });
-
-        const unsubscribe = subscribeToMarketingUpdates(accountId);
-        return unsubscribe;
-    }, [dashboardReady, shop?.account_id]);
-
-    // Realtime order subscription
-    useEffect(() => {
-        const internalShopId = dashboardReady ? shop?.id : undefined;
-        if (!internalShopId) return;
-
-        const channel = supabase
-            .channel(`shop-orders-realtime-${internalShopId}`)
-            .on('broadcast', { event: 'order_update' }, (payload) => {
-                useShopStore.getState().mergeRealtimeOrder(payload.payload);
-            })
-            .on(
-                'postgres_changes',
-                {
-                    event: '*',
-                    schema: 'public',
-                    table: 'shop_orders',
-                    filter: `shop_id=eq.${internalShopId}`,
-                },
-                (payload) => {
-                    if (payload.new && payload.eventType !== 'DELETE') {
-                        useShopStore.getState().mergeRealtimeOrder(payload.new);
-                    }
-                },
-            )
-            .subscribe();
-
-        return () => {
-            supabase.removeChannel(channel);
-        };
-    }, [dashboardReady, shop?.id]);
-
     if (!user?.id) {
         return (
             <div className="flex items-center justify-center h-screen bg-gray-900">
-                <div className="animate-spin rounded-full h-12 w-12 border-4 border-pink-500 border-t-transparent" />
+                <div className="animate-spin rounded-full h-12 w-12 border-4 border-mamba-green border-t-transparent" />
             </div>
         );
     }
@@ -356,7 +278,7 @@ export function ShopPage() {
                     </p>
                     <Link
                         to="/"
-                        className="inline-flex items-center gap-2 px-5 py-2.5 bg-pink-600 hover:bg-pink-500 text-white rounded-xl text-sm font-medium"
+                        className="inline-flex items-center gap-2 px-5 py-2.5 bg-mamba-green hover:bg-mamba-deep text-mamba-dark rounded-xl text-sm font-medium"
                     >
                         <Store className="w-4 h-4" />
                         Back to Console
@@ -385,7 +307,7 @@ export function ShopPage() {
                     </p>
                     <Link
                         to="/"
-                        className="inline-flex items-center gap-2 px-5 py-2.5 bg-pink-600 hover:bg-pink-500 text-white rounded-xl text-sm font-medium"
+                        className="inline-flex items-center gap-2 px-5 py-2.5 bg-mamba-green hover:bg-mamba-deep text-mamba-dark rounded-xl text-sm font-medium"
                     >
                         <Store className="w-4 h-4" />
                         Back to Console
@@ -399,10 +321,12 @@ export function ShopPage() {
         <SellerBrandingProvider
             enabled={canMountShop && sellerFacingBrandingEligible}
             brandingCacheKey={brandingCacheKey}
+            brandingAccountId={shop.account_id}
             documentTitle={shopDocumentTitle}
         >
             <ShopShell
                 shop={shop}
+                shopSlug={shopSlug}
                 activeTab={activeTab}
                 setActiveTab={setActiveTab}
                 shopTimezone={shopTimezone}
@@ -418,7 +342,7 @@ export function ShopPage() {
 function ShopDashboardGateSpinner({ label }: { label: string }) {
     return (
         <div className="flex flex-col items-center justify-center gap-4 h-screen bg-gray-900 px-6">
-            <div className="animate-spin rounded-full h-12 w-12 border-4 border-pink-500 border-t-transparent shrink-0" />
+            <div className="animate-spin rounded-full h-12 w-12 border-4 border-mamba-green border-t-transparent shrink-0" />
             <p className="text-sm text-gray-400 text-center max-w-xs">{label}</p>
         </div>
     );
@@ -427,6 +351,7 @@ function ShopDashboardGateSpinner({ label }: { label: string }) {
 /** Inner shell — runs inside SellerBrandingProvider so it can read brand CSS vars. */
 function ShopShell({
     shop,
+    shopSlug,
     activeTab,
     setActiveTab,
     shopTimezone,
@@ -436,6 +361,7 @@ function ShopShell({
     handleTimezoneChange,
 }: {
     shop: VisibleShop;
+    shopSlug: string | undefined;
     activeTab: string;
     setActiveTab: (tab: string) => void;
     shopTimezone: string;
@@ -445,10 +371,126 @@ function ShopShell({
     handleTimezoneChange: (tz: string) => void;
 }) {
     const { data: brand } = useSellerBranding();
-    const { isSellerAdminOn } = useTenantContext();
+    const { profile } = useAuth();
+    const { isPlatformSuperAdmin, isSellerAdminOn } = useTenantContext();
+    /** Platform Super Admins (and legacy JWT admins) are not on seller/agency tenants, so effective perms on the shop can be empty — do not lock the sidebar. */
+    const bypassShopTabCeiling =
+        isPlatformSuperAdmin || profile?.role?.toLowerCase() === 'admin';
+    const tenantId = selectedAccount?.tenant_id;
+    const accountId = shop.account_id;
+    const {
+        data: mergedCapPerms,
+        isLoading: mergedPermsLoading,
+    } = useMergedShopEffectivePermissions(tenantId, accountId, {
+        enabled: Boolean(tenantId || accountId),
+    });
+    /** Financial Restrictions tab: seller admins on this shop's tenant, or platform / legacy super-admins — not agency-side roles with users.manage. */
     const canConfigureFinancialRestrictions = Boolean(
-        selectedAccount?.tenant_id && isSellerAdminOn(selectedAccount.tenant_id)
+        bypassShopTabCeiling ||
+            Boolean(selectedAccount?.tenant_id && isSellerAdminOn(selectedAccount.tenant_id)),
     );
+    const tabAccess = useMemo(() => {
+        if (bypassShopTabCeiling) return null;
+        if (!tenantId && !accountId) return null;
+        if (mergedPermsLoading) return null;
+        return computeShopTabAccess(mergedCapPerms ?? new Set());
+    }, [bypassShopTabCeiling, tenantId, accountId, mergedPermsLoading, mergedCapPerms]);
+
+    useEffect(() => {
+        if (!tabAccess) return;
+        if (!shopTabIsAllowed(activeTab, tabAccess, canConfigureFinancialRestrictions)) {
+            setActiveTab(firstAccessibleShopTab(tabAccess, canConfigureFinancialRestrictions));
+        }
+    }, [activeTab, tabAccess, canConfigureFinancialRestrictions, setActiveTab]);
+
+    const operationalShop = Boolean(
+        bypassShopTabCeiling ||
+            ((tenantId || accountId) && mergedCapPerms && effectiveHasTiktokShopData(mergedCapPerms)),
+    );
+    const canPreloadMarketing = Boolean(
+        bypassShopTabCeiling ||
+            ((tenantId || accountId) && mergedCapPerms && effectiveAllowsMarketingFinanceTab(mergedCapPerms)),
+    );
+
+    const fetchNotifications = useNotificationStore((state) => state.fetchNotifications);
+    const subscribeToNotifications = useNotificationStore((state) => state.subscribeToNotifications);
+
+    useEffect(() => {
+        if (shop?.shop_id) {
+            fetchNotifications([shop.shop_id]);
+            subscribeToNotifications([shop.shop_id]);
+        } else {
+            fetchNotifications([]);
+            subscribeToNotifications([]);
+        }
+    }, [shop?.shop_id, fetchNotifications, subscribeToNotifications]);
+
+    useEffect(() => {
+        if (!shop?.account_id || !canPreloadMarketing) return undefined;
+        const accountId = shop.account_id;
+        const { checkConnection, loadMarketingFromDB, subscribeToMarketingUpdates } = useTikTokAdsStore.getState();
+        let cancelled = false;
+        void checkConnection(accountId).then((isConnected) => {
+            if (cancelled || !isConnected) return;
+            loadMarketingFromDB(accountId).catch((e) => console.warn('[ShopPage] Marketing preload failed:', e));
+        });
+        const unsubscribe = subscribeToMarketingUpdates(accountId);
+        return () => {
+            cancelled = true;
+            unsubscribe();
+        };
+    }, [shop?.account_id, canPreloadMarketing]);
+
+    useEffect(() => {
+        if (!shop?.id || !operationalShop) return undefined;
+        const internalShopId = shop.id;
+        const channel = supabase
+            .channel(`shop-orders-realtime-${internalShopId}`)
+            .on('broadcast', { event: 'order_update' }, (payload) => {
+                useShopStore.getState().mergeRealtimeOrder(payload.payload);
+            })
+            .on(
+                'postgres_changes',
+                {
+                    event: '*',
+                    schema: 'public',
+                    table: 'shop_orders',
+                    filter: `shop_id=eq.${internalShopId}`,
+                },
+                (payload) => {
+                    if (payload.new && payload.eventType !== 'DELETE') {
+                        useShopStore.getState().mergeRealtimeOrder(payload.new);
+                    }
+                },
+            )
+            .subscribe();
+
+        return () => {
+            supabase.removeChannel(channel);
+        };
+    }, [shop?.id, operationalShop]);
+
+    const [sessionRangeByTab, setSessionRangeByTab] = useState<Partial<Record<ShopSessionRangeTab, DateRange>>>({});
+
+    useEffect(() => {
+        setSessionRangeByTab({});
+        clearShopTabMountBootstrapFingerprints();
+    }, [shop.shop_id]);
+
+    useEffect(() => {
+        if (!SHOP_DATA_RANGE_TAB_IDS.has(activeTab)) {
+            useShopStore.getState().releaseShopDataFetchForAuxiliaryTab();
+        }
+    }, [activeTab]);
+
+    if ((tenantId || accountId) && mergedPermsLoading && !bypassShopTabCeiling) {
+        return (
+            <div className="flex flex-col items-center justify-center gap-4 h-screen brand-bg px-6">
+                <div className="animate-spin rounded-full h-12 w-12 border-4 border-mamba-green border-t-transparent shrink-0" />
+                <p className="text-sm text-gray-400 text-center max-w-xs">Loading access…</p>
+            </div>
+        );
+    }
 
     /** Same row layout as ConsolePage: without `flex`, sidebar + main stack as blocks and the area beside the sidebar shows the page background (white). */
     return (
@@ -458,7 +500,14 @@ function ShopShell({
                 activeTab={activeTab}
                 onTabChange={setActiveTab}
                 shopName={shop.shop_name}
+                shopTabAccess={tabAccess}
                 canConfigureFinancialRestrictions={canConfigureFinancialRestrictions}
+                bugReportContext={{
+                    accountId: selectedAccount?.id,
+                    shopId: shop.shop_id,
+                    shopName: shop.shop_name,
+                }}
+                supportReturnPath={shopSlug ? `/shop/${shopSlug}` : '/'}
             />
 
             <main className="flex-1 min-h-0 min-w-0 w-full overflow-y-auto brand-bg">
@@ -475,6 +524,13 @@ function ShopShell({
                         </div>
                     </div>
 
+                    <Suspense
+                        fallback={
+                            <div className="flex min-h-[40vh] items-center justify-center" role="status" aria-label="Loading tab">
+                                <div className="h-10 w-10 animate-spin rounded-full border-2 border-mamba-green border-t-transparent" />
+                            </div>
+                        }
+                    >
                     {(() => {
                         switch (activeTab) {
                             case 'overview':
@@ -485,6 +541,10 @@ function ShopShell({
                                         timezone={shopTimezone}
                                         onTimezoneChange={handleTimezoneChange}
                                         onTabChange={setActiveTab}
+                                        sessionDateRange={sessionRangeByTab.overview}
+                                        onSessionDateRangeChange={(r) =>
+                                            setSessionRangeByTab((prev) => ({ ...prev, overview: r }))
+                                        }
                                     />
                                 );
                             case 'orders':
@@ -495,38 +555,55 @@ function ShopShell({
                                         timezone={shopTimezone}
                                         preSelectedOrderId={targetOrderId}
                                         onClearSelection={() => setTargetOrderId(undefined)}
+                                        sessionDateRange={sessionRangeByTab.orders}
+                                        onSessionDateRangeChange={(r) =>
+                                            setSessionRangeByTab((prev) => ({ ...prev, orders: r }))
+                                        }
                                     />
                                 );
                             case 'products':
                                 return <ProductsView account={selectedAccount!} shopId={shop.shop_id} />;
                             case 'profit-loss':
-                                return <ProfitLossView account={selectedAccount!} shopId={shop.shop_id} timezone={shopTimezone} />;
+                                return (
+                                    <ProfitLossView
+                                        account={selectedAccount!}
+                                        shopId={shop.shop_id}
+                                        timezone={shopTimezone}
+                                        sessionDateRange={sessionRangeByTab['profit-loss']}
+                                        onSessionDateRangeChange={(r) =>
+                                            setSessionRangeByTab((prev) => ({ ...prev, 'profit-loss': r }))
+                                        }
+                                    />
+                                );
                             case 'financial-restrictions':
-                                return <FinancialRestrictionsView account={selectedAccount!} />;
+                                return <FinancialRestrictionsView account={selectedAccount!} shopId={shop.shop_id} />;
                             case 'data-audit':
                                 return <DataAuditView account={selectedAccount!} shopId={shop.shop_id} timezone={shopTimezone} />;
                             case 'finance-debug':
                                 return <FinanceDebugView account={selectedAccount!} shopId={shop.shop_id} timezone={shopTimezone} />;
                             case 'marketing':
-                                return <MarketingDashboardView account={selectedAccount!} shopId={shop.shop_id} timezone={shopTimezone} />;
+                                return (
+                                    <MarketingDashboardView
+                                        account={selectedAccount!}
+                                        shopId={shop.shop_id}
+                                        timezone={shopTimezone}
+                                        sessionDateRange={sessionRangeByTab.marketing}
+                                        onSessionDateRangeChange={(r) =>
+                                            setSessionRangeByTab((prev) => ({ ...prev, marketing: r }))
+                                        }
+                                    />
+                                );
                             case 'notifications':
                                 return <NotificationsView />;
                             case 'profile':
                                 return <ProfileView />;
                             default:
-                                return (
-                                    <OverviewView
-                                        account={selectedAccount!}
-                                        shopId={shop.shop_id}
-                                        timezone={shopTimezone}
-                                        onTimezoneChange={handleTimezoneChange}
-                                        onTabChange={setActiveTab}
-                                    />
-                                );
+                                return null;
                         }
                     })()}
+                    </Suspense>
 
-                    <NewOrdersToast />
+                    {operationalShop && <NewOrdersToast />}
                     <NotificationToast />
                 </div>
             </main>

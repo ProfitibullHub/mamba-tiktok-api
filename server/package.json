@@ -10,7 +10,9 @@
         "start": "node dist/index.js",
         "typecheck": "tsc --noEmit",
         "seed:test-role-users": "tsx scripts/seed-role-test-users.ts",
-        "test:ingestion": "node --import tsx --test src/tests/ingestion-queue.test.ts"
+        "test:ingestion": "node --import tsx --test src/tests/ingestion-queue.test.ts",
+        "test": "node --import tsx --test src/tests/rbac-prd-alignment.test.ts src/tests/custom-roles-authorization.test.ts src/tests/custom-roles-migration.test.ts src/tests/ingestion-queue.test.ts src/tests/tenant-prd-alignment.test.ts src/tests/http-health.integration.test.ts src/tests/agency-task-coordinator-scope.test.ts src/tests/agency-tasks-prd-compliance.test.ts",
+        "test:tasks-http": "RUN_TASK_HTTP_E2E=1 node --import tsx --test src/tests/agency-tasks-http.integration.test.ts"
     },
     "keywords": [
         "tiktok",
@@ -46,6 +48,8 @@
         "@types/compression": "^1.8.1",
         "@types/multer": "^2.1.0",
         "@types/pdfkit": "^0.17.3",
-        "tsx": "^4.7.0"
+        "tsx": "^4.7.0",
+        "supertest": "^7.0.0",
+        "@types/supertest": "^6.0.2"
     }
 }

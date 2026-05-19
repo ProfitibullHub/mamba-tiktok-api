@@ -69,7 +69,7 @@ export function AdsDataReviewView() {
                                 className="w-full flex items-center justify-between p-4 hover:bg-gray-750 transition-colors"
                             >
                                 <div className="flex items-center gap-3">
-                                    <div className={`p-2 rounded-lg ${isEmpty ? 'bg-gray-700 text-gray-400' : 'bg-pink-500/10 text-pink-400'}`}>
+                                    <div className={`p-2 rounded-lg ${isEmpty ? 'bg-gray-700 text-gray-400' : 'bg-mamba-green/10 text-mamba-neon'}`}>
                                         <section.icon className="w-5 h-5" />
                                     </div>
                                     <div className="text-left">

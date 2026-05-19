@@ -2,10 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { MAMBA_REPO_ROOT } from './repo-root.js';
 
 test('RBAC v2 migration includes multi-role, entitlements, and financial restriction controls', () => {
     const sql = readFileSync(
-        resolve(process.cwd(), 'supabase/migrations/20260417100000_rbac_v2_full_alignment.sql'),
+        resolve(MAMBA_REPO_ROOT, 'supabase/migrations/20260417100000_rbac_v2_full_alignment.sql'),
         'utf8'
     );
 

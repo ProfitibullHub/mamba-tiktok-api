@@ -2,26 +2,29 @@ import {
     ArrowLeft,
     BarChart3,
     Bell,
+    Bug,
     Building2,
     Calculator,
     Database,
     Globe,
     LayoutDashboard,
     LogOut,
+    MessageSquare,
     Package,
     Search,
     Shield,
     ShoppingBag,
-    Store,
     TrendingUp,
     Users,
     Activity,
     Palette,
+    Kanban,
 } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { useTenantContext, primaryRoleBadgeClassName } from '../contexts/TenantContext';
 import { useSellerBranding } from '../contexts/SellerBrandingContext';
+import { MAMBA_SNAKE_HEAD_SRC } from '../lib/brandAssets';
 
 function legacyRoleBadgeClass(legacy: string | undefined): string {
     if (legacy === 'admin') return 'bg-amber-500/20 text-amber-400';
@@ -29,13 +32,22 @@ function legacyRoleBadgeClass(legacy: string | undefined): string {
 }
 import { useNotificationStore } from '../store/useNotificationStore';
 import { useConsoleNotificationStore } from '../store/useConsoleNotificationStore';
-
+import type { ShopTabAccess } from '../hooks/useMyEffectivePermissions';
+import { shopTabIsAllowed } from '../hooks/useMyEffectivePermissions';
 interface SidebarProps {
     mode: 'console' | 'shop';
     activeTab: string;
     onTabChange: (tab: string) => void;
     shopName?: string;
+    /** When set (shop mode), nav entries respect this access matrix. */
+    shopTabAccess?: ShopTabAccess | null;
     canConfigureFinancialRestrictions?: boolean;
+    /** Passed to the bug report form for server-side metadata (shop console). */
+    bugReportContext?: { accountId?: string; shopId?: string; shopName?: string };
+    /** Where "Back" from /support should return (console `/` or e.g. `/shop/acme`). */
+    supportReturnPath?: string;
+    /** When true with agency access, console shows Kanban Team tasks navigation. */
+    showTeamTasksBoard?: boolean;
 }
 
 export function Sidebar({
@@ -43,7 +55,11 @@ export function Sidebar({
     activeTab,
     onTabChange,
     shopName,
+    shopTabAccess = null,
     canConfigureFinancialRestrictions = false,
+    bugReportContext,
+    supportReturnPath = '/',
+    showTeamTasksBoard = false,
 }: SidebarProps) {
     const { profile, signOut } = useAuth();
     const { hasAgencyAccess, manageableAdminTenants, isPlatformSuperAdmin, primaryRoleBadge, loading: tenantLoading } = useTenantContext();
@@ -78,42 +94,41 @@ export function Sidebar({
                 <div className="flex items-center gap-3">
                     {shellBrandingPending ? (
                         <div className="flex items-center gap-3 min-w-0 flex-1">
-                            <div className="w-10 h-10 rounded-xl bg-gray-800/80 border border-white/5 shrink-0 animate-pulse" />
+                            <div className="w-12 h-12 rounded-xl bg-gray-800/80 border border-white/5 shrink-0 animate-pulse" />
                             <div className="space-y-2 min-w-0 flex-1">
                                 <div className="h-6 w-28 max-w-full bg-gray-800/80 rounded-lg animate-pulse" />
                                 <div className="h-3 w-36 bg-gray-800/60 rounded animate-pulse" />
                             </div>
                         </div>
-                    ) : (
+                    ) : mode === 'shop' || consoleUsesAgencyBrand ? (
                         <>
-                            {mode === 'shop' || consoleUsesAgencyBrand ? (
-                                sellerBrand.data.logoSignedUrl ? (
-                                    <div className="w-10 h-10 rounded-xl border border-white/10 bg-gray-950 shrink-0 overflow-hidden flex items-center justify-center">
-                                        <img
-                                            src={sellerBrand.data.logoSignedUrl}
-                                            alt=""
-                                            className="max-w-full max-h-full object-contain p-1"
-                                        />
-                                    </div>
-                                ) : (
-                                    <div
-                                        className="p-2 rounded-xl shadow-inner"
-                                        style={{
-                                            background: `linear-gradient(135deg, var(--brand-primary), var(--brand-secondary))`,
-                                        }}
-                                    >
-                                        <Store className="w-6 h-6 brand-on-primary" />
-                                    </div>
-                                )
+                            {sellerBrand.data.logoSignedUrl ? (
+                                <img
+                                    src={sellerBrand.data.logoSignedUrl}
+                                    alt=""
+                                    className="h-12 w-12 shrink-0 object-contain"
+                                />
                             ) : (
-                                <div className="bg-gradient-to-r from-pink-500 to-red-500 p-2 rounded-xl">
-                                    <Store className="w-6 h-6 text-white" />
-                                </div>
+                                <img
+                                    src={MAMBA_SNAKE_HEAD_SRC}
+                                    alt=""
+                                    className="h-12 w-12 shrink-0 object-contain"
+                                />
                             )}
                             <div>
-                                <h1 className="text-xl font-bold brand-text">
-                                    {mode === 'shop' || consoleUsesAgencyBrand ? sellerBrand.data.displayName : 'Mamba'}
-                                </h1>
+                                <h1 className="text-xl font-bold brand-text">{sellerBrand.data.displayName}</h1>
+                                <p className="text-xs brand-muted">TikTok Shop Dashboard</p>
+                            </div>
+                        </>
+                    ) : (
+                        <>
+                            <img
+                                src={MAMBA_SNAKE_HEAD_SRC}
+                                alt=""
+                                className="h-12 w-12 shrink-0 object-contain"
+                            />
+                            <div>
+                                <h1 className="text-xl font-bold brand-text">Mamba</h1>
                                 <p className="text-xs brand-muted">TikTok Shop Dashboard</p>
                             </div>
                         </>
@@ -128,6 +143,7 @@ export function Sidebar({
                         onTabChange={onTabChange}
                         shopName={shopName}
                         unreadCount={unreadCountShop}
+                        tabAccess={shopTabAccess}
                         canConfigureFinancialRestrictions={canConfigureFinancialRestrictions}
                     />
                 )}
@@ -138,6 +154,7 @@ export function Sidebar({
                         hasAgencyAccess={hasAgencyAccess}
                         canManageTeamRoles={manageableAdminTenants.length > 0 || isAdminUser}
                         isAdmin={isAdminUser}
+                        showTeamTasksBoard={showTeamTasksBoard}
                         useBrandAccent={
                             consoleUsesAgencyBrand &&
                             (mode === 'console' ? true : !sellerBrand.shellPending)
@@ -145,6 +162,27 @@ export function Sidebar({
                     />
                 )}
             </nav>
+
+            <div className="px-4 pb-2 shrink-0 space-y-2">
+                <Link
+                    to="/messages"
+                    state={{ messagingReturnPath: supportReturnPath }}
+                    className="w-full flex items-center justify-center gap-2 px-3 py-2.5 rounded-lg text-xs font-medium border brand-nav-idle hover:bg-white/5 transition-all"
+                    style={{ borderColor: 'var(--brand-sidebar-border)' }}
+                >
+                    <MessageSquare className="w-4 h-4 shrink-0" style={{ color: 'var(--brand-primary)' }} />
+                    Messages
+                </Link>
+                <Link
+                    to="/support"
+                    state={{ bugReportContext, supportReturnPath }}
+                    className="w-full flex items-center justify-center gap-2 px-3 py-2.5 rounded-lg text-xs font-medium border brand-nav-idle hover:bg-white/5 transition-all"
+                    style={{ borderColor: 'var(--brand-sidebar-border)' }}
+                >
+                    <Bug className="w-4 h-4 shrink-0" style={{ color: 'var(--brand-primary)' }} />
+                    Report a bug
+                </Link>
+            </div>
 
             {/* User footer */}
             <div className="p-4 border-t" style={{ borderColor: 'var(--brand-sidebar-border)' }}>
@@ -184,6 +222,7 @@ function ConsoleNav({
     hasAgencyAccess,
     canManageTeamRoles,
     isAdmin,
+    showTeamTasksBoard = false,
     useBrandAccent,
 }: {
     activeTab: string;
@@ -191,6 +230,7 @@ function ConsoleNav({
     hasAgencyAccess: boolean;
     canManageTeamRoles: boolean;
     isAdmin: boolean;
+    showTeamTasksBoard?: boolean;
     useBrandAccent: boolean;
 }) {
     const unreadCount = useConsoleNotificationStore((state) => state.unreadCount);
@@ -203,6 +243,7 @@ function ConsoleNav({
 
     const orgItems = [
         ...(hasAgencyAccess ? [{ id: 'agency-console', label: 'Agency console', icon: Building2 }] : []),
+        ...(hasAgencyAccess && showTeamTasksBoard ? [{ id: 'tasks', label: 'Team tasks', icon: Kanban }] : []),
         ...(hasAgencyAccess ? [{ id: 'agency-branding', label: 'Seller branding', icon: Palette }] : []),
         ...(canManageTeamRoles ? [{ id: 'team-roles', label: 'Team & roles', icon: Users }] : []),
         { id: 'my-access', label: 'My access & roles', icon: Shield },
@@ -274,12 +315,14 @@ function ShopNav({
     onTabChange,
     shopName,
     unreadCount,
+    tabAccess,
     canConfigureFinancialRestrictions,
 }: {
     activeTab: string;
     onTabChange: (tab: string) => void;
     shopName?: string;
     unreadCount: number;
+    tabAccess: ShopTabAccess | null;
     canConfigureFinancialRestrictions: boolean;
 }) {
     const shopItems = [
@@ -296,6 +339,11 @@ function ShopNav({
         { id: 'finance-debug', label: 'Finance Debug', icon: Search },
         { id: 'profile', label: 'Profile', icon: Users },
     ];
+
+    const visibleItems =
+        tabAccess === null
+            ? shopItems
+            : shopItems.filter((item) => shopTabIsAllowed(item.id, tabAccess, canConfigureFinancialRestrictions));
 
     return (
         <>
@@ -315,13 +363,14 @@ function ShopNav({
             )}
 
             <div className="space-y-1">
-                {shopItems.map((item) => {
+                {visibleItems.map((item) => {
                     const isActive = activeTab === item.id;
                     return (
                         <button
                             key={item.id}
                             onClick={() => onTabChange(item.id)}
-                            className={`w-full flex items-center justify-between px-4 py-3 rounded-lg font-medium transition-all border border-transparent ${
+                            type="button"
+                            className={`w-full flex items-center justify-between gap-2 px-4 py-3 rounded-lg font-medium transition-all border border-transparent text-left ${
                                 isActive ? '' : 'brand-nav-idle hover:bg-white/5'
                             }`}
                             style={
@@ -334,9 +383,9 @@ function ShopNav({
                                     : undefined
                             }
                         >
-                            <div className="flex items-center gap-3">
-                                <item.icon className="w-5 h-5" />
-                                <span>{item.label}</span>
+                            <div className="flex min-w-0 flex-1 items-center gap-3">
+                                <item.icon className="h-5 w-5 shrink-0" />
+                                <span className="min-w-0 leading-snug">{item.label}</span>
                             </div>
                             {item.id === 'notifications' && unreadCount > 0 && (
                                 <span
@@ -378,8 +427,8 @@ function NavButton({
     const Icon = item.icon;
     const activeClass =
         variant === 'violet'
-            ? 'bg-gradient-to-r from-violet-500/20 to-fuchsia-500/20 text-violet-300 border border-violet-500/30'
-            : 'bg-gradient-to-r from-pink-500/20 to-red-500/20 text-pink-400 border border-pink-500/30';
+            ? 'bg-gradient-to-r from-violet-500/20 to-mamba-green/20 text-violet-300 border border-violet-500/30'
+            : 'bg-gradient-to-r from-mamba-green/20 to-mamba-deep/20 text-mamba-neon border border-mamba-green/30';
 
     const brandActiveStyle =
         useBrandAccent && isActive
@@ -398,14 +447,15 @@ function NavButton({
 
     return (
         <button
+            type="button"
             onClick={onClick}
             disabled={disabled}
-            className={`w-full flex items-center justify-between px-4 py-3 rounded-lg font-medium transition-all disabled:opacity-45 disabled:cursor-not-allowed ${borderClass} ${rowClass}`.trim()}
+            className={`w-full flex items-center justify-between gap-2 px-4 py-3 rounded-lg font-medium transition-all text-left disabled:opacity-45 disabled:cursor-not-allowed ${borderClass} ${rowClass}`.trim()}
             style={brandActiveStyle}
         >
-            <div className="flex items-center gap-3">
-                <Icon className="w-5 h-5" />
-                <span>{item.label}</span>
+            <div className="flex min-w-0 flex-1 items-center gap-3">
+                <Icon className="h-5 w-5 shrink-0" />
+                <span className="min-w-0 leading-snug">{item.label}</span>
             </div>
             {!!badge && badge > 0 && (
                 <span
@@ -414,7 +464,7 @@ function NavButton({
                             ? 'brand-on-primary border border-white/10'
                             : variant === 'violet'
                               ? 'bg-violet-500/20 text-violet-300 border border-violet-500/30'
-                              : 'bg-pink-500 text-white'
+                              : 'bg-mamba-green text-mamba-dark'
                     }`}
                     style={useBrandAccent ? { backgroundColor: 'var(--brand-primary)' } : undefined}
                 >

@@ -31,6 +31,41 @@ export type SellerBrandingDocumentTitle =
     /** Home console: title shows agency display name for seller-tenant JWTs. */
     | { kind: 'console' };
 
+type FaviconLinkSnapshot = { href: string; type: string | null; sizes: string | null };
+
+/** Initial HTML favicon links — restored when leaving branded shells or when no agency logo. */
+let faviconBaselineSnapshot: FaviconLinkSnapshot[] | null = null;
+
+function captureFaviconBaselineOnce() {
+    if (faviconBaselineSnapshot !== null) return;
+    faviconBaselineSnapshot = Array.from(document.querySelectorAll<HTMLLinkElement>('link[rel="icon"]')).map((el) => ({
+        href: el.getAttribute('href') || '',
+        type: el.getAttribute('type'),
+        sizes: el.getAttribute('sizes'),
+    }));
+}
+
+function restoreFaviconBaseline() {
+    if (!faviconBaselineSnapshot) return;
+    const nodes = document.querySelectorAll<HTMLLinkElement>('link[rel="icon"]');
+    nodes.forEach((el, i) => {
+        const snap = faviconBaselineSnapshot![i];
+        if (!snap) return;
+        el.setAttribute('href', snap.href);
+        if (snap.type) el.setAttribute('type', snap.type);
+        else el.removeAttribute('type');
+        if (snap.sizes) el.setAttribute('sizes', snap.sizes);
+        else el.removeAttribute('sizes');
+    });
+}
+
+function applyAgencyLogoFavicon(logoSignedUrl: string) {
+    document.querySelectorAll<HTMLLinkElement>('link[rel="icon"]').forEach((el) => {
+        el.setAttribute('href', logoSignedUrl);
+        el.removeAttribute('type');
+    });
+}
+
 function brandingToCssVars(b: BrandingResolved): CSSProperties {
     return {
         '--brand-primary': b.primaryColor,
@@ -102,20 +137,23 @@ export const SELLER_FACING_BRANDING_QK = 'seller-facing-branding';
 export function SellerBrandingProvider({
     enabled,
     brandingCacheKey,
+    /** Shop console: pass account UUID so finance-only custom roles can load agency branding. */
+    brandingAccountId,
     documentTitle,
     children,
 }: {
     /** When false, skips GET /api/branding and shows platform defaults immediately (no shell spinner). */
     enabled: boolean;
     brandingCacheKey: string;
+    brandingAccountId?: string | null;
     documentTitle: SellerBrandingDocumentTitle | null;
     children: ReactNode;
 }) {
     const savedTitleRef = useRef<string | null>(null);
 
     const { data, isLoading, error, isFetching } = useQuery({
-        queryKey: [SELLER_FACING_BRANDING_QK, brandingCacheKey],
-        queryFn: () => fetchBranding(),
+        queryKey: [SELLER_FACING_BRANDING_QK, brandingCacheKey, brandingAccountId ?? ''],
+        queryFn: () => fetchBranding(undefined, brandingAccountId || undefined),
         enabled: enabled && Boolean(brandingCacheKey),
         staleTime: 30 * 60 * 1000,
         gcTime: 60 * 60 * 1000,
@@ -166,11 +204,34 @@ export function SellerBrandingProvider({
         };
     }, [enabled, titleKind, shopNameForTitle, resolved.displayName, isLoading, data]);
 
+    /** Browser tab icon: agency upload when JWT is agency or seller-under-agency and logo exists. */
+    useEffect(() => {
+        captureFaviconBaselineOnce();
+
+        if (!enabled || shellPending) {
+            restoreFaviconBaseline();
+            return;
+        }
+
+        const logo = resolved.logoSignedUrl;
+        if (logo) {
+            applyAgencyLogoFavicon(logo);
+        } else {
+            restoreFaviconBaseline();
+        }
+    }, [enabled, shellPending, resolved.logoSignedUrl]);
+
+    useEffect(() => {
+        return () => {
+            restoreFaviconBaseline();
+        };
+    }, []);
+
     return (
         <SellerBrandingContext.Provider value={value}>
             <div className="contents" style={value.cssVariables}>
                 {shellPending ? (
-                    <div className="min-h-screen w-full flex flex-col items-center justify-center bg-[#111827]">
+                    <div className="min-h-screen w-full flex flex-col items-center justify-center bg-mamba-dark">
                         <div className="w-8 h-8 rounded-full border-2 border-white/10 border-t-white/60 animate-spin" />
                     </div>
                 ) : (

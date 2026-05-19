@@ -8,11 +8,19 @@ import { useShopStore } from '../store/useShopStore';
 export interface DateRange {
   startDate: string;
   endDate: string;
+  /**
+   * Overview: set when the user applies a multi-day range via the picker's **Apply** (custom)
+   * so we also load the prior comparison window for charts. Preset quick-picks omit this.
+   */
+  includePreviousPeriodForCharts?: boolean;
 }
+
+/** Preset = quick-select buttons; custom = explicit Apply on typed/picked dates (Overview uses this to gate comparison-period fetch). */
+export type DateRangeChangeMeta = { source: 'preset' | 'custom' };
 
 interface DateRangePickerProps {
   value: DateRange;
-  onChange: (range: DateRange) => void;
+  onChange: (range: DateRange, meta?: DateRangeChangeMeta) => void;
   timezone?: string;
   /** Shorter control for dense toolbars (single-row headers). */
   compact?: boolean;
@@ -172,7 +180,7 @@ export function DateRangePicker({ value, onChange, timezone = 'America/Los_Angel
 
   const handlePresetClick = (preset: typeof presets[0]) => {
     const range = preset.getValue();
-    onChange(range);
+    onChange(range, { source: 'preset' });
     setIsOpen(false);
   };
 
@@ -192,7 +200,7 @@ export function DateRangePicker({ value, onChange, timezone = 'America/Los_Angel
   };
 
   const handleApplyCustomRange = () => {
-    onChange(tempRange);
+    onChange(tempRange, { source: 'custom' });
     setIsOpen(false);
   };
 
@@ -238,13 +246,13 @@ export function DateRangePicker({ value, onChange, timezone = 'America/Los_Angel
       <button
         onClick={() => setIsOpen(!isOpen)}
         type="button"
-        className={`flex items-center bg-gray-800 border border-gray-700 rounded-lg hover:border-pink-500/50 hover:bg-gray-700 transition-all duration-200 text-white group shrink-0 ${isLoading || isQueued ? 'opacity-90 cursor-wait' : ''} ${
+        className={`flex items-center bg-gray-800 border border-gray-700 rounded-lg hover:border-mamba-green/50 hover:bg-gray-700 transition-all duration-200 text-white group shrink-0 ${isLoading || isQueued ? 'opacity-90 cursor-wait' : ''} ${
           compact
             ? 'h-9 gap-2 px-2.5 sm:px-3'
             : 'gap-3 px-4 py-2.5'
         }`}
       >
-        <Calendar className={`${compact ? 'w-3.5 h-3.5' : 'w-4 h-4'} ${isLoading ? 'text-pink-400/50' : isQueued ? 'text-amber-400/90' : 'text-pink-400 group-hover:text-pink-300'} transition-colors shrink-0`} />
+        <Calendar className={`${compact ? 'w-3.5 h-3.5' : 'w-4 h-4'} ${isLoading ? 'text-mamba-neon/50' : isQueued ? 'text-amber-400/90' : 'text-mamba-neon group-hover:text-mamba-neon'} transition-colors shrink-0`} />
         <span className={`font-medium text-gray-100 whitespace-nowrap ${compact ? 'text-xs sm:text-sm max-w-[9rem] sm:max-w-none truncate sm:truncate-none' : 'text-sm'}`}>
           {getButtonLabel()}
         </span>
@@ -256,12 +264,12 @@ export function DateRangePicker({ value, onChange, timezone = 'America/Los_Angel
 
         {/* Active load */}
         {isLoading && (
-          <div className="pointer-events-none absolute inset-0 bg-gray-900/80 backdrop-blur-[1px] rounded-lg flex items-center justify-center gap-2 z-10 border border-pink-500/20">
-            <svg className="animate-spin h-4 w-4 text-pink-500 shrink-0" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+          <div className="pointer-events-none absolute inset-0 bg-gray-900/80 backdrop-blur-[1px] rounded-lg flex items-center justify-center gap-2 z-10 border border-mamba-green/20">
+            <svg className="animate-spin h-4 w-4 text-mamba-green shrink-0" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
               <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
               <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
             </svg>
-            <span className="text-xs font-semibold text-pink-400 animate-pulse">Loading…</span>
+            <span className="text-xs font-semibold text-mamba-neon animate-pulse">Loading…</span>
           </div>
         )}
         {/* Queued behind an in-flight fetch (same shop) */}
@@ -269,7 +277,7 @@ export function DateRangePicker({ value, onChange, timezone = 'America/Los_Angel
           <div className="pointer-events-none absolute inset-0 bg-gray-900/75 backdrop-blur-[1px] rounded-lg flex items-center justify-center gap-2 z-10 border border-amber-500/35 px-2">
             <Clock className="w-4 h-4 text-amber-400 shrink-0" strokeWidth={2.25} />
             <span className="text-[11px] sm:text-xs font-semibold text-amber-200/95 text-center leading-tight">
-              In queue — starts when the current load finishes
+              In queue
             </span>
           </div>
         )}
@@ -294,7 +302,7 @@ export function DateRangePicker({ value, onChange, timezone = 'America/Los_Angel
             <div className="p-5 border-b border-gray-800">
               <div className="flex items-center justify-between mb-4">
                 <h3 className="text-sm font-semibold text-white flex items-center gap-2">
-                  <Calendar className="w-4 h-4 text-pink-400" />
+                  <Calendar className="w-4 h-4 text-mamba-neon" />
                   Quick Select
                 </h3>
               </div>
@@ -304,7 +312,7 @@ export function DateRangePicker({ value, onChange, timezone = 'America/Los_Angel
                     key={preset.label}
                     type="button"
                     onClick={() => handlePresetClick(preset)}
-                    className="px-4 py-2.5 text-sm font-medium text-gray-300 bg-gray-800 hover:bg-pink-500/10 rounded-lg transition-all duration-200 text-left border border-gray-700 hover:border-pink-500/50 hover:text-pink-300"
+                    className="px-4 py-2.5 text-sm font-medium text-gray-300 bg-gray-800 hover:bg-mamba-green/10 rounded-lg transition-all duration-200 text-left border border-gray-700 hover:border-mamba-green/50 hover:text-mamba-neon"
                   >
                     {preset.label}
                   </button>
@@ -328,8 +336,8 @@ export function DateRangePicker({ value, onChange, timezone = 'America/Los_Angel
                     max={tempRange.endDate}
                     placeholder="YYYY-MM-DD"
                     className="w-full px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm font-medium
-                    focus:outline-none focus:ring-2 focus:ring-pink-500/50 focus:border-pink-500/50
-                    hover:border-pink-500/30 transition-all duration-200
+                    focus:outline-none focus:ring-2 focus:ring-mamba-green/50 focus:border-mamba-green/50
+                    hover:border-mamba-green/30 transition-all duration-200
                     [color-scheme:dark]
                     placeholder:text-gray-500"
                   />
@@ -347,8 +355,8 @@ export function DateRangePicker({ value, onChange, timezone = 'America/Los_Angel
                     max={maxDate}
                     placeholder="YYYY-MM-DD"
                     className="w-full px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm font-medium
-                    focus:outline-none focus:ring-2 focus:ring-pink-500/50 focus:border-pink-500/50
-                    hover:border-pink-500/30 transition-all duration-200
+                    focus:outline-none focus:ring-2 focus:ring-mamba-green/50 focus:border-mamba-green/50
+                    hover:border-mamba-green/30 transition-all duration-200
                     [color-scheme:dark]
                     placeholder:text-gray-500"
                   />
@@ -358,9 +366,9 @@ export function DateRangePicker({ value, onChange, timezone = 'America/Los_Angel
                 <button
                   type="button"
                   onClick={handleApplyCustomRange}
-                  className="w-full px-4 py-3 mt-2 bg-gradient-to-r from-pink-600 to-pink-500 hover:from-pink-500 hover:to-pink-400
+                  className="w-full px-4 py-3 mt-2 bg-gradient-to-r from-mamba-green to-mamba-green hover:from-mamba-green hover:to-mamba-neon
                   text-white text-sm font-semibold rounded-lg transition-all duration-200
-                  hover:shadow-lg hover:shadow-pink-500/25 active:scale-[0.98]"
+                  hover:shadow-lg hover:shadow-mamba-green/25 active:scale-[0.98]"
                 >
                   Apply Range
                 </button>

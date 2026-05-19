@@ -1,5 +1,10 @@
+/**
+ * Account access enforcement for Express routes (authoritative for /api/*).
+ * Frontend `user_can_access_account` is UX-only; see src/lib/accessControl.ts.
+ */
 import type { NextFunction, Request, Response } from 'express';
 import { supabase } from '../config/supabase.js';
+import { resolveUserIdFromBearerToken } from '../lib/jwt-session.js';
 import { statusDisablesTenantAccess } from '../services/tenant-lifecycle.service.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -17,8 +22,35 @@ export async function userIsPlatformSuperAdmin(userId: string): Promise<boolean>
         supabase.rpc('user_is_platform_super_admin', { p_user_id: userId }),
         supabase.from('profiles').select('role').eq('id', userId).maybeSingle(),
     ]);
-    if (saErr || profileErr) return false;
-    return isSa === true || profile?.role === 'admin';
+
+    // Legacy platform operators often use profiles.role = 'admin'. Check this even when the RPC
+    // fails: user_is_platform_super_admin was historically granted only to `authenticated`, so
+    // service_role calls from the API server could error while membership is still valid.
+    if (!profileErr && profile?.role === 'admin') return true;
+    if (profileErr) {
+        console.warn('[account-access] profile role lookup failed', profileErr.message);
+    }
+
+    if (!saErr && isSa === true) return true;
+    if (saErr) {
+        console.warn('[account-access] user_is_platform_super_admin RPC failed', saErr.message);
+    }
+
+    const { data: membership, error: memErr } = await supabase
+        .from('tenant_memberships')
+        .select('id, roles!inner(name), tenants!inner(type)')
+        .eq('user_id', userId)
+        .eq('status', 'active')
+        .eq('roles.name', 'Super Admin')
+        .eq('tenants.type', 'platform')
+        .limit(1)
+        .maybeSingle();
+
+    if (memErr) {
+        console.warn('[account-access] Super Admin membership lookup failed', memErr.message);
+        return false;
+    }
+    return Boolean(membership);
 }
 
 export async function resolveRequestUserId(req: Request): Promise<string | null> {
@@ -26,19 +58,7 @@ export async function resolveRequestUserId(req: Request): Promise<string | null>
     if (!auth?.startsWith('Bearer ')) return null;
     const token = auth.slice(7).trim();
     if (!token) return null;
-
-    let lastError: { message?: string } | null = null;
-    for (let attempt = 0; attempt < 2; attempt++) {
-        const { data, error } = await supabase.auth.getUser(token);
-        if (data?.user?.id) return data.user.id;
-        lastError = error;
-        if (error && !error.message?.includes('fetch failed')) break;
-        if (attempt === 0) console.log('[resolveRequestUserId] Retrying getUser after transient error...');
-    }
-    if (lastError?.message) {
-        console.warn('[resolveRequestUserId] getUser failed:', lastError.message);
-    }
-    return null;
+    return resolveUserIdFromBearerToken(token);
 }
 
 function uniqueIds(values: unknown): string[] {
@@ -102,6 +122,7 @@ function accountAccessUsesWriteCheck(method: string): boolean {
 
 /**
  * POST /api/tiktok-shop/sync/:accountId and POST /api/tiktok-ads/sync/:accountId pull data from TikTok into our DB.
+ * POST .../sync/run-worker (after enqueue) uses the same read-level visibility as enqueue so Seller Users can sync from the UI.
  * Seller User is allowed to sync (read-level visibility) but not other writes — use the read access path for these routes only.
  */
 function isShopOrAdsSyncPostRequest(req: Pick<Request, 'method' | 'baseUrl' | 'path'>): boolean {
@@ -110,6 +131,16 @@ function isShopOrAdsSyncPostRequest(req: Pick<Request, 'method' | 'baseUrl' | 'p
     const m = path.match(/\/sync\/([^/?#]+)$/);
     if (!m) return false;
     return UUID_RE.test(m[1]);
+}
+
+/**
+ * POST .../sync/run-worker — kicks the ingestion worker after enqueue (same callers as POST .../sync/:accountId).
+ * Must use read-level account access like enqueue sync so Seller Users can sync from the UI.
+ */
+export function isInteractiveIngestionWorkerPostRequest(req: Pick<Request, 'method' | 'baseUrl' | 'path'>): boolean {
+    if (req.method.toUpperCase() !== 'POST') return false;
+    const path = `${req.baseUrl || ''}${req.path || ''}`;
+    return /\/sync\/run-worker$/i.test(path);
 }
 
 /**
@@ -159,7 +190,10 @@ export async function userCanAccessAccount(
     }
 
     const m = method.toUpperCase();
-    if (accountAccessUsesWriteCheck(m) && !(req && isShopOrAdsSyncPostRequest(req))) {
+    if (
+        accountAccessUsesWriteCheck(m) &&
+        !(req && (isShopOrAdsSyncPostRequest(req) || isInteractiveIngestionWorkerPostRequest(req)))
+    ) {
         return userCanWriteShopAccount(userId, accountId);
     }
     const { data, error } = await supabase.rpc('check_user_account_access', {

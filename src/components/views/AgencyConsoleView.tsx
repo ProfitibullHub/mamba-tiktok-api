@@ -36,6 +36,14 @@ import {
 import { patchAgencyTenantAsAdmin } from '../../lib/adminTenantsApi';
 import { showAppToast } from '../../store/useAppToastStore';
 
+/** Match system and custom AM/AC-style role titles (e.g. "Test Account Manager"). */
+function roleLabelLooksLikeAccountManager(roleName: string | null | undefined): boolean {
+    return (roleName || '').toLowerCase().includes('account manager');
+}
+function roleLabelLooksLikeAccountCoordinator(roleName: string | null | undefined): boolean {
+    return (roleName || '').toLowerCase().includes('account coordinator');
+}
+
 type ChildTenant = {
     id: string;
     name: string;
@@ -46,7 +54,8 @@ type ChildTenant = {
 };
 
 export function AgencyConsoleView() {
-    const { agencyMemberships, isAgencyAdminOn, isAccountManagerOn, memberships } = useTenantContext();
+    const { agencyMemberships, isAgencyAdminOn, isAccountManagerOn, memberships, isPlatformSuperAdmin } =
+        useTenantContext();
     const { user } = useAuth();
     const queryClient = useQueryClient();
     const [selectedAgencyId, setSelectedAgencyId] = useState<string | null>(
@@ -83,8 +92,33 @@ export function AgencyConsoleView() {
         () => agencyMemberships.find((m) => m.tenant_id === selectedAgencyId),
         [agencyMemberships, selectedAgencyId]
     );
-    const canAdmin = selectedAgencyId ? isAgencyAdminOn(selectedAgencyId) : false;
+
+    const { data: myAgencyPermActions = [] } = useQuery({
+        queryKey: ['my-agency-effective-perms', selectedAgencyId, user?.id],
+        queryFn: async () => {
+            if (!selectedAgencyId || !user?.id) return [];
+            const { data, error } = await supabase.rpc('get_my_effective_permissions_on_tenant', {
+                p_tenant_id: selectedAgencyId,
+            });
+            if (error) throw error;
+            return (data || [])
+                .map((row: { action?: string }) => row.action)
+                .filter((a: string | undefined): a is string => typeof a === 'string');
+        },
+        enabled: !!selectedAgencyId && !!user?.id,
+    });
+
+    const canAdmin = selectedAgencyId
+        ? isAgencyAdminOn(selectedAgencyId) ||
+          myAgencyPermActions.includes('agency.sellers.link') ||
+          myAgencyPermActions.includes('billing.manage')
+        : false;
     const canManageStaff = canAdmin || (selectedAgencyId ? isAccountManagerOn(selectedAgencyId) : false);
+
+    const canLinkSellers =
+        canAdmin || isPlatformSuperAdmin || myAgencyPermActions.includes('agency.sellers.link');
+    /** Full linked-seller directory (admin UI) — not the AM/AC assigned-only slice */
+    const canSeeAllLinkedSellers = canAdmin || canLinkSellers || isPlatformSuperAdmin;
     const hasCoordinatorRoleOnSelectedAgency =
         !!selectedAgencyId &&
         memberships.some((m: any) => {
@@ -93,10 +127,14 @@ export function AgencyConsoleView() {
             const linked = Array.isArray(m.membership_roles) ? m.membership_roles : [];
             return linked.some((mr: any) => !mr?.revoked_at && mr?.roles?.name === 'Account Coordinator');
         });
-    /** AC may list agency team (RPC returns names); only AA/AM may add staff / assign sellers. */
+    /** Team directory RPC returns names under profiles RLS — any staff who needs the console should use it. */
     const canLoadTeamDirectoryRpc =
-        canManageStaff ||
-        hasCoordinatorRoleOnSelectedAgency;
+        canManageStaff || hasCoordinatorRoleOnSelectedAgency || canLinkSellers;
+
+    const canViewAgencyAssignmentMatrix =
+        !!selectedAgencyId &&
+        !!user?.id &&
+        agencyMemberships.some((m) => m.tenant_id === selectedAgencyId && m.status === 'active');
 
     const { data: agencyDetail, isLoading: loadingAgencyDetail } = useQuery({
         queryKey: ['agency-console-tenant', selectedAgencyId],
@@ -110,10 +148,10 @@ export function AgencyConsoleView() {
     });
 
     const { data: linkedSellers = [], isLoading: loadingSellers } = useQuery({
-        queryKey: ['agency-sellers', selectedAgencyId, canAdmin, user?.id],
+        queryKey: ['agency-sellers', selectedAgencyId, canSeeAllLinkedSellers, user?.id],
         queryFn: async () => {
             if (!selectedAgencyId) return [];
-            if (canAdmin) {
+            if (canSeeAllLinkedSellers) {
                 const { data: activeRows, error: activeErr } = await supabase
                     .from('tenants')
                     .select('id, name, type, status, parent_tenant_id, link_status')
@@ -173,6 +211,7 @@ export function AgencyConsoleView() {
                     .select('id,name,type,scope,tenant_id')
                     .eq('tenant_id', selectedAgencyId)
                     .eq('type', 'custom')
+                    .is('deleted_at', null)
                     .order('name'),
             ]);
             if (e1) throw e1;
@@ -220,10 +259,10 @@ export function AgencyConsoleView() {
             cancelled = true;
             clearTimeout(t);
         };
-    }, [staffSearchQuery, selectedAgencyId, canAdmin]);
+    }, [staffSearchQuery, selectedAgencyId, canManageStaff]);
 
     useEffect(() => {
-        if (!selectedAgencyId || !canAdmin) {
+        if (!selectedAgencyId || !canLinkSellers) {
             setSellerLookupResults([]);
             return;
         }
@@ -248,7 +287,7 @@ export function AgencyConsoleView() {
             cancelled = true;
             clearTimeout(t);
         };
-    }, [sellerLookupQuery, selectedAgencyId, canAdmin]);
+    }, [sellerLookupQuery, selectedAgencyId, canLinkSellers]);
 
     const { data: agencyTeam = [], isLoading: loadingTeam } = useQuery({
         queryKey: ['agency-team', selectedAgencyId, canLoadTeamDirectoryRpc],
@@ -292,10 +331,10 @@ export function AgencyConsoleView() {
     });
 
     const { data: sellerAssignments = [], isLoading: loadingAssignments } = useQuery({
-        queryKey: ['agency-seller-assignments', selectedAgencyId],
+        queryKey: ['agency-seller-assignments', selectedAgencyId, canViewAgencyAssignmentMatrix],
         queryFn: async () => {
             if (!selectedAgencyId) return [];
-            if (canAdmin) {
+            if (canViewAgencyAssignmentMatrix) {
                 return await getAgencySellerAssignments(selectedAgencyId);
             }
             const { data, error } = await supabase
@@ -334,7 +373,9 @@ export function AgencyConsoleView() {
 
     // Staff members that can be assigned a seller (AM or AC)
     const assignableStaff = useMemo(() => {
-        return agencyTeam.filter((u: any) => u.role_name === 'Account Manager' || u.role_name === 'Account Coordinator');
+        return agencyTeam.filter(
+            (u: any) => roleLabelLooksLikeAccountManager(u.role_name) || roleLabelLooksLikeAccountCoordinator(u.role_name)
+        );
     }, [agencyTeam]);
 
     const sellerAssignmentsBySeller = useMemo(() => {
@@ -366,8 +407,8 @@ export function AgencyConsoleView() {
 
         for (const seller of linkedSellers) {
             const assignees = sellerAssignmentsBySeller.get(seller.id) || [];
-            const hasAM = assignees.some((a: any) => a.role_name === 'Account Manager');
-            const hasAC = assignees.some((a: any) => a.role_name === 'Account Coordinator');
+            const hasAM = assignees.some((a: any) => roleLabelLooksLikeAccountManager(a.role_name));
+            const hasAC = assignees.some((a: any) => roleLabelLooksLikeAccountCoordinator(a.role_name));
 
             if (!hasAM && !hasAC) {
                 unassigned.push(seller);
@@ -392,7 +433,7 @@ export function AgencyConsoleView() {
 
 
     const handleLinkSeller = async () => {
-        if (!selectedAgencyId || !sellerTenantToLink.trim()) return;
+        if (!selectedAgencyId || !sellerTenantToLink.trim() || !canLinkSellers) return;
         setBusy('link');
         try {
             let result: { token: string; notifiedSellerAdmins: number; alreadyLinked: boolean } | null = null;
@@ -528,7 +569,7 @@ export function AgencyConsoleView() {
     };
 
     const handleUnlinkSeller = async (sellerTenantId: string) => {
-        if (!selectedAgencyId || !canAdmin) return;
+        if (!selectedAgencyId || !canLinkSellers) return;
         setBusy(`unlink-${sellerTenantId}`);
         try {
             await unlinkAgencySeller(selectedAgencyId, sellerTenantId);
@@ -560,7 +601,7 @@ export function AgencyConsoleView() {
 
     return (
         <div className="w-full max-w-none space-y-10 animate-in fade-in duration-500 pb-12 relative">
-            <div className="absolute inset-x-0 top-0 h-64 bg-gradient-to-b from-violet-500/10 via-fuchsia-500/5 to-transparent -z-10 rounded-full blur-[100px] opacity-60 pointer-events-none" />
+            <div className="absolute inset-x-0 top-0 h-64 bg-gradient-to-b from-violet-500/10 via-mamba-green/5 to-transparent -z-10 rounded-full blur-[100px] opacity-60 pointer-events-none" />
 
             <div className="relative z-10">
                 <h1 className="text-4xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-white via-violet-100 to-white flex items-center gap-4">
@@ -735,12 +776,12 @@ export function AgencyConsoleView() {
                     <section className="grid lg:grid-cols-2 gap-6">
                         {/* Linked Sellers Section */}
                         <div className="bg-white/[0.02] border border-white/10 rounded-3xl p-6 backdrop-blur-sm flex flex-col relative overflow-hidden">
-                            <div className="absolute inset-0 bg-gradient-to-br from-fuchsia-500/5 to-transparent pointer-events-none" />
+                            <div className="absolute inset-0 bg-gradient-to-br from-mamba-green/5 to-transparent pointer-events-none" />
                             <div className="relative flex flex-col h-full">
                                 <div className="flex items-center justify-between mb-4">
                                     <div className="flex items-center gap-3 text-white font-bold text-lg">
-                                        <div className="p-2 bg-fuchsia-500/20 rounded-xl">
-                                            <Link2 className="w-5 h-5 text-fuchsia-400" />
+                                        <div className="p-2 bg-mamba-green/20 rounded-xl">
+                                            <Link2 className="w-5 h-5 text-mamba-neon" />
                                         </div>
                                         Linked Sellers
                                     </div>
@@ -750,14 +791,14 @@ export function AgencyConsoleView() {
                                             value={sellerSearchQuery}
                                             onChange={(e) => setSellerSearchQuery(e.target.value)}
                                             placeholder="Filter sellers..."
-                                            className="w-full pl-9 pr-4 py-2 bg-gray-950/50 border border-white/10 rounded-lg text-sm text-white placeholder-gray-500 focus:border-fuchsia-500/50 focus:outline-none"
+                                            className="w-full pl-9 pr-4 py-2 bg-gray-950/50 border border-white/10 rounded-lg text-sm text-white placeholder-gray-500 focus:border-mamba-green/50 focus:outline-none"
                                         />
                                     </div>
                                 </div>
                                 <p className="text-[12px] text-gray-400 leading-relaxed mb-4">
                                     Agency Admin sees all linked sellers. Account Managers and Coordinators only see sellers assigned to them.
                                 </p>
-                                {canAdmin && (
+                                {(canAdmin || canLinkSellers || canManageStaff || hasCoordinatorRoleOnSelectedAgency) && (
                                     <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
                                         <div className="rounded-xl border border-violet-500/30 bg-violet-500/10 px-3 py-2">
                                             <p className="text-[10px] uppercase tracking-wider text-violet-300 font-bold">AM Assigned</p>
@@ -774,7 +815,7 @@ export function AgencyConsoleView() {
                                     </div>
                                 )}
                                 
-                                {canAdmin ? (
+                                {canLinkSellers ? (
                                     <div className="mb-4 shrink-0 space-y-2">
                                         <div className="relative">
                                             <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" />
@@ -787,7 +828,7 @@ export function AgencyConsoleView() {
                                                     setSellerTenantToLink(next);
                                                 }}
                                                 placeholder="Search seller name or seller tenant UUID..."
-                                                className="w-full pl-9 pr-4 py-2.5 bg-gray-950/50 border border-white/10 rounded-lg text-sm text-white placeholder-gray-500 focus:border-fuchsia-500/50 focus:outline-none"
+                                                className="w-full pl-9 pr-4 py-2.5 bg-gray-950/50 border border-white/10 rounded-lg text-sm text-white placeholder-gray-500 focus:border-mamba-green/50 focus:outline-none"
                                             />
                                         </div>
                                         {sellerLookupLoading && (
@@ -853,13 +894,13 @@ export function AgencyConsoleView() {
                                                 value={sellerTenantToLink}
                                                 onChange={(e) => setSellerTenantToLink(e.target.value)}
                                                 placeholder="Selected seller UUID"
-                                                className="flex-1 px-3 py-2 bg-gray-950/50 border border-white/10 rounded-lg text-sm text-white placeholder-gray-500 focus:border-fuchsia-500/50 focus:outline-none"
+                                                className="flex-1 px-3 py-2 bg-gray-950/50 border border-white/10 rounded-lg text-sm text-white placeholder-gray-500 focus:border-mamba-green/50 focus:outline-none"
                                             />
                                             <button
                                                 type="button"
                                                 disabled={busy === 'link' || !sellerTenantToLink.trim()}
                                                 onClick={handleLinkSeller}
-                                                className="px-4 py-2 rounded-lg font-bold bg-fuchsia-600 hover:bg-fuchsia-500 text-white text-sm disabled:opacity-50 transition-colors"
+                                                className="px-4 py-2 rounded-lg font-bold bg-mamba-deep hover:bg-mamba-green text-mamba-dark text-sm disabled:opacity-50 transition-colors"
                                             >
                                                 Link
                                             </button>
@@ -869,7 +910,10 @@ export function AgencyConsoleView() {
                                         </p>
                                     </div>
                                 ) : (
-                                    <p className="text-amber-400/90 text-sm mb-4 bg-amber-500/10 p-2 rounded-lg border border-amber-500/20 shrink-0">Only Agency Admins can link sellers.</p>
+                                    <p className="text-amber-400/90 text-sm mb-4 bg-amber-500/10 p-2 rounded-lg border border-amber-500/20 shrink-0">
+                                        Linking requires Agency Admin or the “Link or unlink seller tenants” permission on
+                                        your role.
+                                    </p>
                                 )}
 
                                 <div className="h-[600px] overflow-y-auto border border-white/5 rounded-xl bg-gray-950/30 scrollbar-thin scrollbar-thumb-gray-700">
@@ -923,15 +967,20 @@ export function AgencyConsoleView() {
                                                                             <span
                                                                                 key={`${s.id}:${a.user_id}`}
                                                                                 className={`inline-flex items-center text-[10px] px-2 py-1 rounded-md font-bold border ${
-                                                                                    a.role_name === 'Account Manager'
+                                                                                    roleLabelLooksLikeAccountManager(a.role_name)
                                                                                         ? 'bg-violet-500/20 text-violet-200 border-violet-500/30'
-                                                                                        : a.role_name === 'Account Coordinator'
+                                                                                        : roleLabelLooksLikeAccountCoordinator(a.role_name)
                                                                                             ? 'bg-cyan-500/20 text-cyan-200 border-cyan-500/30'
                                                                                             : 'bg-gray-500/20 text-gray-200 border-gray-500/30'
                                                                                 }`}
                                                                                 title={a.email || a.user_id}
                                                                             >
-                                                                                {a.role_name === 'Account Manager' ? 'AM' : a.role_name === 'Account Coordinator' ? 'AC' : 'Staff'}:
+                                                                                {roleLabelLooksLikeAccountManager(a.role_name)
+                                                                                    ? 'AM'
+                                                                                    : roleLabelLooksLikeAccountCoordinator(a.role_name)
+                                                                                      ? 'AC'
+                                                                                      : 'Staff'}
+                                                                                :
                                                                                 {' '}
                                                                                 {(a.full_name || a.email || a.user_id).toString().slice(0, 18)}
                                                                                 {canManageStaff && (
@@ -958,7 +1007,7 @@ export function AgencyConsoleView() {
                                                         </td>
                                                         <td className="px-4 py-3 text-right">
                                                             <div className="flex items-center justify-end gap-3">
-                                                                {canAdmin && (
+                                                                {canLinkSellers && (
                                                                     <button
                                                                         type="button"
                                                                         disabled={busy === `unlink-${s.id}`}

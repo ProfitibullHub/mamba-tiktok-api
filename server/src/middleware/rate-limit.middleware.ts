@@ -95,3 +95,12 @@ export const adminLimiter = rateLimit({
     legacyHeaders: false,
     handler: rateLimitHandler,
 });
+
+/** 20 req / 15 min — support / bug report proxy to third-party ticketing */
+export const supportLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 20,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    handler: rateLimitHandler,
+});

@@ -16,8 +16,8 @@ export type ResolvedTenantBranding = {
 const DEFAULT_BRANDING: ResolvedTenantBranding = {
     agencyTenantId: null,
     displayName: 'Mamba',
-    primaryColor: '#ec4899',
-    secondaryColor: '#6366f1',
+    primaryColor: '#28D99E',
+    secondaryColor: '#1FA97C',
     emailSenderName: null,
     emailSenderAddress: null,
     logoSignedUrl: null,

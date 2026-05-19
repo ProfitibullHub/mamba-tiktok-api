@@ -54,6 +54,10 @@ type HomeConsoleViewProps = {
     onNavigate: (tab: string) => void;
     memberships: MembershipRow[];
     onAddShop: () => void;
+    /** False for Seller User and other roles without tiktok.auth — hides Connect new shop. */
+    canConnectShop?: boolean;
+    connectShopError?: string | null;
+    connectShopBusy?: boolean;
 };
 
 export function HomeConsoleView({
@@ -62,6 +66,9 @@ export function HomeConsoleView({
     onNavigate,
     memberships,
     onAddShop,
+    canConnectShop = false,
+    connectShopError = null,
+    connectShopBusy = false,
 }: HomeConsoleViewProps) {
     const navigate = useNavigate();
 
@@ -139,12 +146,21 @@ export function HomeConsoleView({
     });
 
     const { data: rawShops = [], isLoading: loadingShops } = useQuery({
-        queryKey: ['all-visible-shops'],
+        queryKey: ['all-visible-shops', isUnrestrictedViewer, [...allowedTenantIds].sort().join(',')],
         queryFn: async () => {
-            const { data, error } = await supabase
+            if (!isUnrestrictedViewer && allowedTenantIds.size === 0) return [];
+
+            let query = supabase
                 .from('tiktok_shops')
                 .select('id, shop_id, shop_name, region, timezone, seller_type, account_id, accounts!inner(id, name, tenant_id, tenants(id, name, type, status))')
                 .order('shop_name');
+
+            // Defense in depth: RLS must scope rows; also restrict request to known tenant ids.
+            if (!isUnrestrictedViewer) {
+                query = query.in('accounts.tenant_id', [...allowedTenantIds]);
+            }
+
+            const { data, error } = await query;
             if (error) throw error;
             return (data || []).map((row: any) => ({
                 id: row.id,
@@ -331,11 +347,11 @@ export function HomeConsoleView({
 
     return (
         <div className="w-full min-w-0 max-w-none space-y-10 animate-in fade-in duration-500 pb-12 relative">
-            <div className="absolute inset-x-0 top-0 h-64 bg-gradient-to-b from-pink-500/5 via-violet-500/5 to-transparent -z-10 rounded-full blur-[100px] opacity-60 pointer-events-none" />
+            <div className="absolute inset-x-0 top-0 h-64 bg-gradient-to-b from-mamba-green/5 via-violet-500/5 to-transparent -z-10 rounded-full blur-[100px] opacity-60 pointer-events-none" />
 
             {/* Header */}
             <div className="relative z-10">
-                <h1 className="text-4xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-white via-pink-100 to-white flex items-center gap-4">
+                <h1 className="text-4xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-white via-mamba-text to-white flex items-center gap-4">
                     <div
                         className="p-2.5 rounded-2xl backdrop-blur-xl"
                         style={agencyConsoleBranding
@@ -383,16 +399,16 @@ export function HomeConsoleView({
                         <button
                             type="button"
                             onClick={() => onNavigate('agency-branding')}
-                            className="group relative text-left rounded-3xl border border-white/10 bg-white/[0.02] hover:bg-pink-500/[0.04] hover:border-pink-500/30 p-6 transition-all duration-300 hover:shadow-2xl hover:shadow-pink-500/10 hover:-translate-y-1 overflow-hidden"
+                            className="group relative text-left rounded-3xl border border-white/10 bg-white/[0.02] hover:bg-mamba-green/[0.04] hover:border-mamba-green/30 p-6 transition-all duration-300 hover:shadow-2xl hover:shadow-mamba-green/10 hover:-translate-y-1 overflow-hidden"
                         >
-                            <div className="absolute inset-0 bg-gradient-to-br from-pink-500/10 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300" />
+                            <div className="absolute inset-0 bg-gradient-to-br from-mamba-green/10 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300" />
                             <div className="relative">
-                                <div className="p-3 bg-pink-500/10 rounded-2xl w-fit mb-5 border border-pink-500/20 group-hover:scale-110 transition-transform duration-300">
-                                    <Palette className="w-7 h-7 text-pink-400" />
+                                <div className="p-3 bg-mamba-green/10 rounded-2xl w-fit mb-5 border border-mamba-green/20 group-hover:scale-110 transition-transform duration-300">
+                                    <Palette className="w-7 h-7 text-mamba-neon" />
                                 </div>
                                 <div className="brand-text text-lg font-bold tracking-tight mb-1 flex items-center justify-between">
                                     Seller branding
-                                    <ArrowRight className="w-4 h-4 text-pink-400 opacity-0 -translate-x-2 group-hover:opacity-100 group-hover:translate-x-0 transition-all duration-300" />
+                                    <ArrowRight className="w-4 h-4 text-mamba-neon opacity-0 -translate-x-2 group-hover:opacity-100 group-hover:translate-x-0 transition-all duration-300" />
                                 </div>
                                 <p className="text-sm brand-muted opacity-90 leading-relaxed font-medium">
                                     White-label display name and colors for linked sellers (agency-level).
@@ -453,11 +469,11 @@ export function HomeConsoleView({
                                     {m.tenants?.type === 'agency' ? (
                                         <Building2 className="w-4 h-4 text-violet-400 shrink-0" />
                                     ) : (
-                                        <Store className="w-4 h-4 text-pink-400 shrink-0" />
+                                        <Store className="w-4 h-4 text-mamba-neon shrink-0" />
                                     )}
                                     <span className="brand-text font-medium truncate">{m.tenants?.name ?? 'Tenant'}</span>
                                 </div>
-                                <span className="text-pink-300/90 text-xs font-medium shrink-0">{m.roles?.name}</span>
+                                <span className="text-mamba-neon/90 text-xs font-medium shrink-0">{m.roles?.name}</span>
                             </li>
                         ))}
                     </ul>
@@ -469,7 +485,7 @@ export function HomeConsoleView({
                 <div className="flex flex-wrap items-center justify-between gap-4 mb-5">
                     <div>
                         <h2 className="text-xl font-semibold brand-text flex items-center gap-2">
-                            <Store className="w-6 h-6 text-pink-400" />
+                            <Store className="w-6 h-6 text-mamba-neon" />
                             {isUnrestrictedViewer ? 'All platform shops' : 'Shops you can access'}
                         </h2>
                         <p className="text-sm brand-muted mt-1">
@@ -480,23 +496,31 @@ export function HomeConsoleView({
                                     : 'TikTok shops you have dashboard access to.'}
                         </p>
                     </div>
-                    <button
-                        type="button"
-                        onClick={onAddShop}
-                        className={`flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium transition-colors ${
-                            agencyConsoleBranding ? 'brand-on-primary' : 'text-white'
-                        }`}
-                        style={agencyConsoleBranding
-                            ? { backgroundColor: brand.primaryColor }
-                            : { backgroundColor: '#db2777' }
-                        }
-                        onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.opacity = '0.85'; }}
-                        onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.opacity = '1'; }}
-                    >
-                        <Store className="w-4 h-4" />
-                        Connect new shop
-                    </button>
+                    {canConnectShop && (
+                        <button
+                            type="button"
+                            onClick={onAddShop}
+                            disabled={connectShopBusy}
+                            className={`flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium transition-colors disabled:opacity-60 ${
+                                agencyConsoleBranding ? 'brand-on-primary' : 'text-white'
+                            }`}
+                            style={agencyConsoleBranding
+                                ? { backgroundColor: brand.primaryColor }
+                                : { backgroundColor: '#db2777' }
+                            }
+                            onMouseEnter={(e) => { if (!connectShopBusy) (e.currentTarget as HTMLElement).style.opacity = '0.85'; }}
+                            onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.opacity = '1'; }}
+                        >
+                            <Store className="w-4 h-4" />
+                            {connectShopBusy ? 'Connecting…' : 'Connect new shop'}
+                        </button>
+                    )}
                 </div>
+                {connectShopError && (
+                    <p className="text-sm text-red-400 mb-4" role="alert">
+                        {connectShopError}
+                    </p>
+                )}
 
                 {/* Search bar (visible when there are multiple shops) */}
                 {allShops.length > 3 && (
@@ -507,7 +531,7 @@ export function HomeConsoleView({
                             value={searchQuery}
                             onChange={(e) => setSearchQuery(e.target.value)}
                             placeholder="Search shops by name, account, organization, or region..."
-                            className="w-full bg-gray-800/60 border border-gray-700 rounded-xl py-2.5 pl-10 pr-4 text-sm brand-text brand-input focus:outline-none focus:border-pink-500/50"
+                            className="w-full bg-gray-800/60 border border-gray-700 rounded-xl py-2.5 pl-10 pr-4 text-sm brand-text brand-input focus:outline-none focus:border-mamba-green/50"
                         />
                         {searchQuery && (
                             <span className="absolute right-3.5 top-1/2 -translate-y-1/2 text-xs brand-muted">
@@ -648,7 +672,7 @@ export function HomeConsoleView({
                                         {tenantType === 'agency' ? (
                                             <Building2 className="w-4 h-4 text-violet-400" />
                                         ) : (
-                                            <Store className="w-4 h-4 text-pink-400" />
+                                            <Store className="w-4 h-4 text-mamba-neon" />
                                         )}
                                         <h3 className="text-sm font-semibold brand-muted uppercase tracking-wide">
                                             {tenantName}

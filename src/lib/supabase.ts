@@ -13,8 +13,13 @@ export interface Profile {
   id: string;
   email: string;
   full_name: string;
+  /**
+   * Legacy account-type flag — NOT tenant RBAC (Seller Admin, Agency Admin, etc.).
+   * Almost all seller/agency users are `client`; use `tenant_memberships` + `roles` for permissions.
+   * `admin` = legacy platform operator (prefer Super Admin membership). See `profileApi.ts`.
+   */
   role: 'admin' | 'client' | 'moderator' | 'accountant';
-  /** Set after first product tenant (seller/agency) membership; null until onboarding. */
+  /** Home tenant for JWT context; set after seller/agency onboarding. Null until then. */
   tenant_id?: string | null;
   created_at: string;
   updated_at: string;

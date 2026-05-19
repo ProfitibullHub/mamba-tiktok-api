@@ -51,11 +51,11 @@ export function AffiliateCommissionCard({
             <div className={`relative w-full h-full min-h-[11rem] transition-all duration-500 transform preserve-3d ${isFlipped ? 'rotate-y-180' : ''}`}>
 
                 {/* Front Side */}
-                <div className="absolute inset-0 backface-hidden bg-gradient-to-br from-pink-500/10 to-rose-500/10 border border-pink-500/30 rounded-xl p-5 flex flex-col justify-between hover:border-pink-500/50 transition-colors">
+                <div className="absolute inset-0 backface-hidden bg-gradient-to-br from-mamba-green/10 to-mamba-deep/10 border border-mamba-green/30 rounded-xl p-5 flex flex-col justify-between hover:border-mamba-green/50 transition-colors">
                     <div className="flex items-start justify-between">
                         <div className="flex items-center gap-3">
-                            <div className="p-2 bg-pink-500/20 rounded-lg">
-                                <Users className="w-5 h-5 text-pink-400" />
+                            <div className="p-2 bg-mamba-green/20 rounded-lg">
+                                <Users className="w-5 h-5 text-mamba-neon" />
                             </div>
                             <div>
                                 <h3 className="text-gray-400 text-sm font-medium">Affiliate Commissions</h3>
@@ -63,11 +63,11 @@ export function AffiliateCommissionCard({
                                 <p className="text-[10px] text-gray-600 mt-0.5">Click card for auto commission lines</p>
                             </div>
                         </div>
-                        <RotateCw className="w-4 h-4 text-pink-500/40 opacity-0 group-hover:opacity-100 transition-opacity" />
+                        <RotateCw className="w-4 h-4 text-mamba-green/40 opacity-0 group-hover:opacity-100 transition-opacity" />
                     </div>
 
                     <div>
-                        <p className="text-2xl font-bold text-pink-400">{formatCurrencyVal(totalCommission)}</p>
+                        <p className="text-2xl font-bold text-mamba-neon">{formatCurrencyVal(totalCommission)}</p>
                         <div className="flex flex-col gap-0.5 mt-1 text-xs text-gray-500">
                             <span>Est. commission (TikTok): {formatCurrencyVal(autoCommission)}</span>
                             {autoOtherAffiliateCogs > 0 && (
@@ -110,8 +110,8 @@ export function AffiliateCommissionCard({
                             <span className="text-gray-200 font-medium tabular-nums">{formatSignedCurrency(autoCommissionNetSigned)}</span>
                         </div>
                         <div className="flex justify-between items-center text-sm">
-                            <span className="text-pink-400/90 font-medium">TikTok Est. commission (abs)</span>
-                            <span className="text-pink-300 font-semibold tabular-nums">{formatCurrencyVal(autoCommission)}</span>
+                            <span className="text-mamba-neon/90 font-medium">TikTok Est. commission (abs)</span>
+                            <span className="text-mamba-neon font-semibold tabular-nums">{formatCurrencyVal(autoCommission)}</span>
                         </div>
 
                         {manualRetainers.length > 0 && (
@@ -121,7 +121,7 @@ export function AffiliateCommissionCard({
                                 {manualRetainers.map((r) => (
                                     <div key={r.id} className="flex justify-between items-center text-xs">
                                         <span className="text-gray-500 truncate max-w-[55%]">{r.affiliate_name}</span>
-                                        <span className="text-pink-300 tabular-nums shrink-0">{formatCurrencyVal(Number(r.amount))}</span>
+                                        <span className="text-mamba-neon tabular-nums shrink-0">{formatCurrencyVal(Number(r.amount))}</span>
                                     </div>
                                 ))}
                             </>

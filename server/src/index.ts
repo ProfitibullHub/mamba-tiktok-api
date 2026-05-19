@@ -67,12 +67,19 @@ import tiktokAdsRoutes from './routes/tiktok-ads.routes.js';
 import tiktokDebugRoutes from './routes/tiktok-debug.routes.js';
 import tiktokWebhookRoutes from './routes/tiktok-webhook.routes.js';
 import observabilityRoutes from './routes/observability.routes.js';
+import supportRoutes from './routes/support.routes.js';
+import messagingRoutes from './routes/messaging.routes.js';
+import tasksRoutes from './routes/tasks.routes.js';
 import { pollAllAdvertisers } from './services/ads-polling.service.js';
 import { requestIdMiddleware } from './middleware/request-id.middleware.js';
-import { globalLimiter, authLimiter, adminLimiter, syncTriggerLimiter } from './middleware/rate-limit.middleware.js';
+import { globalLimiter, authLimiter, adminLimiter, syncTriggerLimiter, supportLimiter } from './middleware/rate-limit.middleware.js';
 import { logSystemEvent } from './services/system-logger.js';
 
 const app = express();
+/** Vercel / other reverse proxies set X-Forwarded-For; required for accurate req.ip and express-rate-limit. */
+if (process.env.VERCEL === '1' || process.env.TRUST_PROXY === '1' || process.env.TRUST_PROXY === 'true') {
+    app.set('trust proxy', 1);
+}
 const PORT = process.env.PORT || 3001;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
 const FRONTEND_URLS = (process.env.FRONTEND_URLS || '')
@@ -148,8 +155,15 @@ app.get('/health', (_req, res) => {
 });
 
 // ── Body parsers ──────────────────────────────────────────────────────────────
-// Raw body FIRST for webhook HMAC validation, then JSON for everything else
+// Raw body FIRST for webhook HMAC validation; larger JSON only for bug reports (image base64)
 app.use('/api/tiktok-shop/webhook', express.raw({ type: 'application/json' }), tiktokWebhookRoutes);
+
+const supportApiRouter = express.Router();
+supportApiRouter.use(express.json({ limit: '4.5mb' }));
+supportApiRouter.use(supportLimiter);
+supportApiRouter.use(supportRoutes);
+app.use('/api/support', supportApiRouter);
+
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 
@@ -183,6 +197,8 @@ app.use('/api/branding', adminLimiter, brandingRoutes);
 app.use('/api/reports', reportsRoutes);
 app.use('/api/billing', billingRoutes);
 app.use('/api/observability', observabilityRoutes);
+app.use('/api/messaging', adminLimiter, messagingRoutes);
+app.use('/api/tasks', adminLimiter, tasksRoutes);
 
 // Debug (audit data view) — admin-limited
 app.use('/api/tiktok-shop/debug', adminLimiter, tiktokDebugRoutes);
@@ -213,6 +229,8 @@ app.use((req, res) => {
             '/api/reports',
             '/api/billing',
             '/api/observability',
+            '/api/support',
+            '/api/messaging',
         ],
     });
 });

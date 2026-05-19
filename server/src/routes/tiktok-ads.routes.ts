@@ -29,6 +29,7 @@ import {
 } from '../services/ingestion-queue.service.js';
 import { ingestionLogger } from '../services/ingestion-logger.js';
 import { auditLog } from '../services/audit-logger.js';
+import { sanitizeAdsSyncResultForAudit, tenantIdForAccount } from '../lib/ingestion-audit-helpers.js';
 import { runTikTokAdsFullSync, AdsSyncAdvertiserNotFoundError } from '../services/tiktok-ads-sync.service.js';
 import { ACTION_TIKTOK_AUTH, FEATURE_TIKTOK_ADS } from '../constants/tiktok-entitlements.js';
 
@@ -538,12 +539,14 @@ router.post('/sync/:accountId', async (req, res) => {
             deduped,
         });
 
+        const adsEnqueueTenantId = await tenantIdForAccount(accountId);
         await auditLog(req, {
             action: 'tiktok.ads.sync_enqueued',
             resourceType: 'ingestion_job',
             resourceId: job.id,
             accountId,
-            metadata: { stream: 'ads', deduped },
+            tenantId: adsEnqueueTenantId ?? undefined,
+            metadata: { stream: 'ads', deduped, syncType: 'full' },
         });
 
         res.status(202).json({
@@ -582,22 +585,47 @@ router.get('/sync/job/:jobId', requireIngestionJobReadAccess(), async (req, res)
     }
 });
 
-router.post('/sync/run-worker', async (req, res) => {
+/** Vercel Cron uses GET; interactive sync uses POST after enqueue. */
+const handleAdsSyncRunWorker = async (req: express.Request, res: express.Response) => {
     const authHeader = req.headers.authorization;
     const cronAuthorized = !!process.env.CRON_SECRET && authHeader === `Bearer ${process.env.CRON_SECRET}`;
     const superAdminAuthorized = await isPlatformSuperAdminRequest(req);
+
+    const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    let claimOpts: { accountId?: string; preferredJobId?: string } | undefined;
+
     if (!cronAuthorized && !superAdminAuthorized) {
-        return res.status(401).json({ success: false, error: 'Unauthorized (cron secret or platform super admin required)' });
+        const raw = req.query.accountId;
+        const interactiveAccountId = typeof raw === 'string' ? raw.trim() : '';
+        if (!uuidRe.test(interactiveAccountId)) {
+            return res.status(401).json({
+                success: false,
+                error:
+                    'Unauthorized: interactive worker requires a valid session JWT plus ?accountId=<your-account-uuid>. Cron uses Bearer CRON_SECRET without account scope.',
+            });
+        }
+        const rawJobId = req.query.jobId;
+        const interactiveJobId = typeof rawJobId === 'string' ? rawJobId.trim() : '';
+        claimOpts = {
+            accountId: interactiveAccountId,
+            ...(uuidRe.test(interactiveJobId) ? { preferredJobId: interactiveJobId } : {}),
+        };
     }
 
     const workerId = `ads-worker-${Date.now()}`;
+    const workerTrigger: 'cron' | 'super_admin' | 'account_scoped' = cronAuthorized
+        ? 'cron'
+        : superAdminAuthorized
+          ? 'super_admin'
+          : 'account_scoped';
     const limit = Math.max(1, Math.min(10, Number(req.query.limit) || 3));
     const results: Array<{ jobId: string; status: string; error?: string }> = [];
     try {
-        const claimedJobs = await claimIngestionJobs(workerId, 'ads', limit);
+        const claimedJobs = await claimIngestionJobs(workerId, 'ads', limit, claimOpts);
         const jobResults = await Promise.all(
             claimedJobs.map(async (job) => {
                 try {
+                    const jobTenantId = await tenantIdForAccount(job.account_id);
                     ingestionLogger.info({
                         event: 'job_started',
                         stream: 'ads',
@@ -612,7 +640,14 @@ router.post('/sync/run-worker', async (req, res) => {
                         resourceType: 'ingestion_job',
                         resourceId: job.id,
                         accountId: job.account_id,
-                        metadata: { stream: 'ads', workerId, attempt: job.attempt_count },
+                        tenantId: jobTenantId ?? undefined,
+                        metadata: {
+                            stream: 'ads',
+                            workerId,
+                            worker_trigger: workerTrigger,
+                            attempt: job.attempt_count,
+                            sync_type: job.sync_type,
+                        },
                     });
                     const payload = job.payload as IngestionJobPayload;
                     const result = await runTikTokAdsFullSync({
@@ -634,13 +669,20 @@ router.post('/sync/run-worker', async (req, res) => {
                         resourceType: 'ingestion_job',
                         resourceId: job.id,
                         accountId: job.account_id,
-                        metadata: { stream: 'ads', summary: result.summary },
+                        tenantId: jobTenantId ?? undefined,
+                        metadata: {
+                            stream: 'ads',
+                            worker_trigger: workerTrigger,
+                            sync_type: job.sync_type,
+                        },
+                        afterState: sanitizeAdsSyncResultForAudit(result),
                     });
                     return { jobId: job.id, status: 'succeeded' as const };
                 } catch (error: any) {
                     const forceDl = error instanceof AdsSyncAdvertiserNotFoundError;
                     const willDeadLetter = forceDl || (job as IngestionJobRow).attempt_count >= (job as IngestionJobRow).max_attempts;
                     await markIngestionJobFailed(job as IngestionJobRow, error, { forceDeadLetter: forceDl });
+                    const failTenantId = await tenantIdForAccount(job.account_id);
                     ingestionLogger.error({
                         event: 'job_failed',
                         stream: 'ads',
@@ -656,7 +698,15 @@ router.post('/sync/run-worker', async (req, res) => {
                         resourceType: 'ingestion_job',
                         resourceId: job.id,
                         accountId: job.account_id,
-                        metadata: { stream: 'ads', error: error.message, willRetry: !willDeadLetter },
+                        tenantId: failTenantId ?? undefined,
+                        metadata: {
+                            stream: 'ads',
+                            worker_trigger: workerTrigger,
+                            sync_type: job.sync_type,
+                            error: error.message,
+                            willRetry: !willDeadLetter,
+                            advertiser_not_found: forceDl,
+                        },
                     });
                     return { jobId: job.id, status: 'failed' as const, error: error.message };
                 }
@@ -692,7 +742,10 @@ router.post('/sync/run-worker', async (req, res) => {
     } catch (error: any) {
         return res.status(500).json({ success: false, error: error.message, workerId, results });
     }
-});
+};
+
+router.get('/sync/run-worker', handleAdsSyncRunWorker);
+router.post('/sync/run-worker', handleAdsSyncRunWorker);
 
 /**
  * GET /api/tiktok-ads/marketing-data/:accountId
@@ -714,7 +767,6 @@ router.get('/marketing-data/:accountId', async (req, res) => {
             .maybeSingle();
 
         if (advError || !advertiser) {
-            console.warn(`[Marketing Data] No active advertiser found for account ${accountId}`);
             return res.json({ success: true, data: { spendDaily: [], campaignMetrics: [], advertiser: null } });
         }
 
@@ -743,8 +795,6 @@ router.get('/marketing-data/:accountId', async (req, res) => {
 
         const spendDaily = spendResult.data || [];
         const campaignMetrics = metricsResult.data || [];
-
-        console.log(`[Marketing Data] Loaded ${spendDaily.length} spend rows, ${campaignMetrics.length} campaign metric rows for account ${accountId}`);
 
         res.json({
             success: true,
@@ -793,7 +843,7 @@ router.post('/poll-all', async (req, res) => {
         const authHeader = req.headers.authorization || '';
         const token = authHeader.replace(/^Bearer\s+/i, '').trim();
         if (token !== cronSecret) {
-            console.warn('[Ads Poll] Unauthorized poll-all request — invalid CRON_SECRET');
+            console.error('[Ads Poll] Unauthorized poll-all request — invalid CRON_SECRET');
             return res.status(401).json({ success: false, error: 'Unauthorized' });
         }
     }
@@ -801,7 +851,6 @@ router.post('/poll-all', async (req, res) => {
     const range = (req.query.range as PollRange) === '7d' ? '7d' : 'today';
 
     try {
-        console.log(`[Ads Poll] /poll-all triggered — range=${range}`);
         const summary = await pollAllAdvertisers(range);
         return res.json({ success: true, ...summary });
     } catch (err: any) {
@@ -2218,17 +2267,14 @@ router.get('/gmv-max/sessions/:accountId', async (req, res) => {
             .limit(100);
 
         let campaignIds = (campaigns || []).map((c: any) => c.campaign_id);
-        console.log(`[GMV Max Sessions] Found ${campaignIds.length} campaign IDs in DB for advertiser ${advertiser.id}`);
 
         // Safety net: if DB has no campaigns (sync not run yet), fetch live from TikTok API
         if (campaignIds.length === 0) {
-            console.log(`[GMV Max Sessions] DB empty — fetching campaign IDs live from TikTok API...`);
             try {
                 const liveCampaigns = await tiktokBusinessApi.getCampaigns(advertiser.access_token, advertiser.advertiser_id, { page_size: 100 });
                 campaignIds = (liveCampaigns.list || []).map((c: any) => c.campaign_id);
-                console.log(`[GMV Max Sessions] Live fetch returned ${campaignIds.length} campaigns`);
             } catch (e: any) {
-                console.warn(`[GMV Max Sessions] Live campaign fetch failed:`, e.message);
+                console.error(`[GMV Max Sessions] Live campaign fetch failed:`, e.message);
             }
         }
 

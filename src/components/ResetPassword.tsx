@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { supabase } from '../lib/supabase';
-import { Video, Eye, EyeOff, CheckCircle, AlertCircle } from 'lucide-react';
+import { Eye, EyeOff, CheckCircle, AlertCircle } from 'lucide-react';
+import { MAMBA_FULL_LOGO_SRC } from '../lib/brandAssets';
 
 type Props = {
     mode: 'reset' | 'invite';
@@ -53,9 +54,11 @@ export function ResetPassword({ mode, onComplete }: Props) {
             <div className="w-full max-w-md">
                 <div className="bg-gray-800 rounded-2xl shadow-2xl p-8 border border-gray-700">
                     <div className="flex justify-center mb-8">
-                        <div className="bg-gradient-to-r from-pink-500 to-red-500 p-4 rounded-2xl">
-                            <Video className="w-10 h-10 text-white" />
-                        </div>
+                        <img
+                            src={MAMBA_FULL_LOGO_SRC}
+                            alt="Mamba"
+                            className="h-20 w-auto max-w-[min(100%,320px)] object-contain"
+                        />
                     </div>
 
                     <h1 className="text-2xl font-bold text-center text-white mb-2">{title}</h1>
@@ -80,7 +83,7 @@ export function ResetPassword({ mode, onComplete }: Props) {
                                         onChange={(e) => setPassword(e.target.value)}
                                         required
                                         minLength={6}
-                                        className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-pink-500 focus:border-transparent transition-all pr-12"
+                                        className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-mamba-green focus:border-transparent transition-all pr-12"
                                         placeholder="At least 6 characters"
                                     />
                                     <button
@@ -102,7 +105,7 @@ export function ResetPassword({ mode, onComplete }: Props) {
                                     value={confirmPassword}
                                     onChange={(e) => setConfirmPassword(e.target.value)}
                                     required
-                                    className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-pink-500 focus:border-transparent transition-all"
+                                    className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-mamba-green focus:border-transparent transition-all"
                                     placeholder="Re-enter your password"
                                 />
                             </div>
@@ -117,7 +120,7 @@ export function ResetPassword({ mode, onComplete }: Props) {
                             <button
                                 type="submit"
                                 disabled={loading}
-                                className="w-full bg-gradient-to-r from-pink-500 to-red-500 text-white py-3 rounded-lg font-semibold hover:from-pink-600 hover:to-red-600 focus:outline-none focus:ring-2 focus:ring-pink-500 focus:ring-offset-2 focus:ring-offset-gray-800 disabled:opacity-50 disabled:cursor-not-allowed transition-all transform hover:scale-[1.02]"
+                                className="w-full bg-gradient-to-r from-mamba-green to-mamba-deep text-mamba-dark py-3 rounded-lg font-semibold hover:from-mamba-neon hover:to-mamba-deep focus:outline-none focus:ring-2 focus:ring-mamba-green focus:ring-offset-2 focus:ring-offset-gray-800 disabled:opacity-50 disabled:cursor-not-allowed transition-all transform hover:scale-[1.02]"
                             >
                                 {loading ? 'Saving...' : 'Set password'}
                             </button>

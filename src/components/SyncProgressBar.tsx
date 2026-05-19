@@ -16,15 +16,24 @@ export function SyncProgressBar() {
 
     if (!showProgress) return null;
 
-    // Extract days count from the loading message (e.g. "Loading 3 days of data..." or "Loading 1 day of data...")
+    const rangeDaySubtitle = (() => {
+        const loadDaysTotal = syncProgress.rangeDaysTotal;
+        const loadDaysDone = syncProgress.rangeDaysLoaded ?? 0;
+        if (loadDaysTotal != null && loadDaysTotal > 0 && syncProgress.currentStep === 'orders') {
+            return `${Math.min(loadDaysDone, loadDaysTotal)}/${loadDaysTotal} days`;
+        }
+        return null;
+    })();
+
+    // Legacy copy from enqueue path: "Loading N days of data..."
     const daysMatch = syncProgress.message?.match(/Loading (\d+) days? of data/);
-    const loadingDays = daysMatch ? parseInt(daysMatch[1], 10) : null;
+    const loadingDaysFromMessage = daysMatch ? parseInt(daysMatch[1], 10) : null;
 
     const getStepIcon = (step: string, isComplete: boolean, isCurrent: boolean) => {
         const iconClass = isComplete
             ? 'text-green-400'
             : isCurrent
-                ? 'text-pink-400 animate-pulse'
+                ? 'text-mamba-neon animate-pulse'
                 : 'text-gray-500';
 
         const icons: Record<string, React.ReactNode> = {
@@ -43,7 +52,7 @@ export function SyncProgressBar() {
                     {/* Header */}
                     <div className="flex items-center gap-3 mb-4">
                         {syncProgress.currentStep !== 'complete' ? (
-                            <Loader2 className="w-5 h-5 text-pink-400 animate-spin" />
+                            <Loader2 className="w-5 h-5 text-mamba-neon animate-spin" />
                         ) : (
                             <CheckCircle2 className="w-5 h-5 text-green-400" />
                         )}
@@ -51,10 +60,13 @@ export function SyncProgressBar() {
                             <span className="text-white font-medium">
                                 {syncProgress.isFirstSync ? 'First Time Sync' : 'Loading Data'}
                             </span>
-                            {loadingDays && syncProgress.currentStep !== 'complete' && (
+                            {loadingDaysFromMessage && syncProgress.currentStep !== 'complete' && (
                                 <span className="text-xs text-gray-400">
-                                    {loadingDays === 1 ? '1 day' : `${loadingDays} days`}
+                                    {loadingDaysFromMessage === 1 ? '1 day' : `${loadingDaysFromMessage} days`}
                                 </span>
+                            )}
+                            {!loadingDaysFromMessage && rangeDaySubtitle && syncProgress.currentStep === 'orders' && (
+                                <span className="text-xs text-gray-400">{rangeDaySubtitle}</span>
                             )}
                         </div>
 
@@ -74,7 +86,7 @@ export function SyncProgressBar() {
                     {/* Progress Steps */}
                     <div className="flex items-center justify-between gap-2">
                         {/* Orders */}
-                        <div className={`flex flex-col items-center gap-1 flex-1 p-2 rounded-lg ${syncProgress.currentStep === 'orders' ? 'bg-pink-500/10' :
+                        <div className={`flex flex-col items-center gap-1 flex-1 p-2 rounded-lg ${syncProgress.currentStep === 'orders' ? 'bg-mamba-green/10' :
                             syncProgress.ordersComplete ? 'bg-green-500/10' : 'bg-gray-800'
                             }`}>
                             {getStepIcon('orders', syncProgress.ordersComplete, syncProgress.currentStep === 'orders')}
@@ -88,7 +100,7 @@ export function SyncProgressBar() {
                         <div className={`h-0.5 w-4 ${syncProgress.ordersComplete ? 'bg-green-500' : 'bg-gray-700'}`} />
 
                         {/* Products */}
-                        <div className={`flex flex-col items-center gap-1 flex-1 p-2 rounded-lg ${syncProgress.currentStep === 'products' ? 'bg-pink-500/10' :
+                        <div className={`flex flex-col items-center gap-1 flex-1 p-2 rounded-lg ${syncProgress.currentStep === 'products' ? 'bg-mamba-green/10' :
                             syncProgress.productsComplete ? 'bg-green-500/10' : 'bg-gray-800'
                             }`}>
                             {getStepIcon('products', syncProgress.productsComplete, syncProgress.currentStep === 'products')}
@@ -102,7 +114,7 @@ export function SyncProgressBar() {
                         <div className={`h-0.5 w-4 ${syncProgress.productsComplete ? 'bg-green-500' : 'bg-gray-700'}`} />
 
                         {/* Settlements */}
-                        <div className={`flex flex-col items-center gap-1 flex-1 p-2 rounded-lg ${syncProgress.currentStep === 'settlements' ? 'bg-pink-500/10' :
+                        <div className={`flex flex-col items-center gap-1 flex-1 p-2 rounded-lg ${syncProgress.currentStep === 'settlements' ? 'bg-mamba-green/10' :
                             syncProgress.settlementsComplete ? 'bg-green-500/10' : 'bg-gray-800'
                             }`}>
                             {getStepIcon('settlements', syncProgress.settlementsComplete, syncProgress.currentStep === 'settlements')}

@@ -1,0 +1,38 @@
+Custom roles enforcement matrix (action -> primary enforcement layer). Class: eff = effective permission / GUM (get_user_effective_permissions_on_tenant); name = system role name in SQL/UI; ent = plan entitlement (tenant_feature_allowed), often combined with eff.
+
+Core catalog (from migrations)
+- users.manage — eff: authorize / Node RPCs using user_can_manage_tenant_members; name: legacy AA/SA/AM checks in some SQL; Tenant UI: role management surfaces.
+- billing.view / billing.manage — eff: authorize on billing routes if present; ent: may pair with plan keys.
+- tiktok.auth — eff: tiktok-shop-auth.routes requireAuthorization.
+- financials.view / financials.restricted — eff: authorize; alias for view_pnl in permissionSatisfied (Node).
+- tasks.manage — eff: authorize where wired.
+- messages.send / messages.view — eff: messaging.routes requireAuthorization.
+- agency.sellers.link — eff: authorize + SQL (user_is_agency_admin extended); AgencyConsoleView also checks action.
+- agency.assignments.manage — eff: team/agency RPCs.
+- dashboard.export_email — eff: user_has_permission_for_account (SQL; service); Node email export uses tiktok shop / view_pnl path — dual gate documented.
+- view_brand_settings / edit_brand_settings — eff: branding.routes authorize; AgencyBrandingView uses eff for edit.
+- tiktok.shop.data / tiktok.ads.data / view_pnl — eff + ent: tiktok-entitlement-param; view_pnl aliases financials.* in permissionSatisfied.
+- export_pnl / schedule_export / view_cogs / view_margin / view_custom_line_items / manage_roles / assign_roles — eff: reports + finance + role RPCs; manage_roles aliases roles.manage / assign_roles in Node permissionSatisfied.
+- roles.manage — eff; treated as synonymous with manage_roles/assign_roles in Node permissionSatisfied.
+
+SQL SECURITY DEFINER (post 20260514120000)
+- user_has_permission_for_account — eff on seller tenant, parent agency, assignment agency + account_is_visible_to_user.
+- user_is_seller_admin — name Seller Admin OR eff users.manage on seller.
+- user_is_agency_admin — name Agency Admin OR eff (agency.sellers.link | billing.manage) on agency.
+- user_is_agency_admin_of_seller_parent — parent agency user_is_agency_admin.
+- user_can_manage_tenant_members — platform bypass; agency: user_is_agency_admin OR eff users.manage; seller: user_is_seller_admin OR user_is_agency_admin_of_seller_parent.
+
+Node references (grep requireAuthorization / authorize)
+- messaging.routes — messages.view, messages.send
+- branding.routes — view_brand_settings, edit_brand_settings
+- tiktok-shop-auth — tiktok.auth
+- tiktok-entitlement-param — tiktok.shop.data, view_pnl (+ feature keys)
+- tiktok-shop-finance — view_pnl
+- tiktok-shop-finance restrictions — user_is_seller_admin RPC (now eff-aware)
+- reports.routes — schedule_export; email uses report-type split (orders → tiktok.shop.data, P&L-only → view_pnl / financials aliases)
+- ingestion-job-access — authorize
+
+UI files using effective permissions (get_my_effective_permissions_on_tenant or useMyEffectivePermissions)
+- AgencyBrandingView, AgencyConsoleView (agency.* link), ShopPage / OverviewView / FinancialRestrictionsView (hook), TenantContext (manageable tenants by role-management actions).
+
+Repeat verification: run scripts/dump-permissions-catalog.mjs against staging; run server tests.

@@ -25,6 +25,7 @@ import {
 } from 'lucide-react';
 import { useTikTokAdsStore, CampaignAsset, AdGroupAsset, AdAsset } from '../../store/useTikTokAdsStore';
 import { DateRangePicker, DateRange } from '../DateRangePicker';
+import { MeasuredChartHost } from '../MeasuredChartHost';
 import { Account } from '../../lib/supabase';
 import { useShopAccessFlags } from '../../hooks/useShopMutationAccess';
 import { formatShopDateISO } from '../../utils/dateUtils';
@@ -35,16 +36,27 @@ import {
     YAxis,
     CartesianGrid,
     Tooltip as RechartsTooltip,
-    ResponsiveContainer
 } from 'recharts';
 
 interface MarketingDashboardViewProps {
     account: Account;
     shopId?: string;
     timezone?: string;
+    sessionDateRange?: DateRange;
+    onSessionDateRangeChange?: (range: DateRange) => void;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function defaultMarketingDateRange(timezone: string): DateRange {
+    const end = new Date();
+    const start = new Date();
+    start.setDate(end.getDate() - 90);
+    return {
+        startDate: formatShopDateISO(start, timezone),
+        endDate: formatShopDateISO(end, timezone),
+    };
+}
 
 const fmt = (n: number, decimals = 2) =>
     n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M`
@@ -196,7 +208,13 @@ function AdRow({ ad }: { ad: AdAsset }) {
 
 // ─── Main Component ──────────────────────────────────────────────────────────
 
-export function MarketingDashboardView({ account, shopId: _shopId, timezone: shopTimezone = 'America/Los_Angeles' }: MarketingDashboardViewProps) {
+export function MarketingDashboardView({
+    account,
+    shopId: _shopId,
+    timezone: shopTimezone = 'America/Los_Angeles',
+    sessionDateRange,
+    onSessionDateRangeChange,
+}: MarketingDashboardViewProps) {
     const accountId = account.id;
     const { canMutateShop, canSyncShop } = useShopAccessFlags(account);
 
@@ -232,16 +250,17 @@ export function MarketingDashboardView({ account, shopId: _shopId, timezone: sho
         loadMarketingFromDB
     } = useTikTokAdsStore();
 
-    const [dateRange, setDateRange] = useState<DateRange>(() => {
-        const end = new Date();
-        const start = new Date();
-        start.setDate(end.getDate() - 90); // Default to 90 days inclusive
+    const [dateRange, setDateRange] = useState<DateRange>(
+        () => sessionDateRange ?? defaultMarketingDateRange(shopTimezone),
+    );
 
-        return {
-            startDate: formatShopDateISO(start, shopTimezone),
-            endDate: formatShopDateISO(end, shopTimezone),
-        };
-    });
+    const onMarketingDateRangeChange = useCallback(
+        (range: DateRange) => {
+            setDateRange(range);
+            onSessionDateRangeChange?.(range);
+        },
+        [onSessionDateRangeChange],
+    );
 
     // Audience now uses the 90-day window (matches backend default)
     const AUDIENCE_END = formatShopDateISO(new Date(), shopTimezone);
@@ -560,8 +579,8 @@ export function MarketingDashboardView({ account, shopId: _shopId, timezone: sho
         return (
             <div className="p-6 max-w-4xl mx-auto">
                 <div className="bg-gray-800/60 border border-gray-700/50 rounded-2xl p-10 text-center">
-                    <div className="w-16 h-16 bg-gradient-to-br from-pink-500 to-red-500 rounded-2xl flex items-center justify-center mx-auto mb-6">
-                        <Megaphone size={28} className="text-white" />
+                    <div className="w-16 h-16 bg-gradient-to-br from-mamba-neon to-mamba-deep rounded-2xl flex items-center justify-center mx-auto mb-6">
+                        <Megaphone size={28} className="text-mamba-dark" />
                     </div>
                     <h2 className="text-2xl font-bold text-white mb-3">Connect TikTok Ads</h2>
                     <p className="text-gray-400 mb-6 max-w-md mx-auto">
@@ -572,7 +591,7 @@ export function MarketingDashboardView({ account, shopId: _shopId, timezone: sho
                         onClick={() => canMutateShop && connectTikTokAds(accountId)}
                         disabled={!canMutateShop}
                         title={!canMutateShop ? 'Read-only for your role' : undefined}
-                        className="px-6 py-3 bg-gradient-to-r from-pink-600 to-red-600 hover:from-pink-500 hover:to-red-500 text-white font-semibold rounded-xl transition-all duration-200 flex items-center gap-2 mx-auto disabled:opacity-40 disabled:pointer-events-none"
+                        className="px-6 py-3 bg-gradient-to-r from-mamba-green to-mamba-deep hover:from-mamba-neon hover:to-mamba-deep text-mamba-dark font-semibold rounded-xl transition-all duration-200 flex items-center gap-2 mx-auto disabled:opacity-40 disabled:pointer-events-none"
                     >
                         <Link2 size={18} />
                         Connect Account
@@ -654,7 +673,8 @@ export function MarketingDashboardView({ account, shopId: _shopId, timezone: sho
                 <div className="flex items-center gap-3">
                     <DateRangePicker
                         value={dateRange}
-                        onChange={(range: DateRange) => setDateRange(range)}
+                        timezone={shopTimezone}
+                        onChange={(range: DateRange) => onMarketingDateRangeChange(range)}
                     />
                     <button
                         type="button"
@@ -859,9 +879,11 @@ export function MarketingDashboardView({ account, shopId: _shopId, timezone: sho
                         {dailyChartData.length === 0 ? (
                             <p className="text-gray-500 text-sm py-8 text-center">No spend data in this range</p>
                         ) : (
-                            <div className="w-full h-64">
-                                <ResponsiveContainer width="100%" height="100%">
+                            <MeasuredChartHost heightPx={256}>
+                                {(size) => (
                                     <AreaChart
+                                        width={size.width}
+                                        height={size.height}
                                         data={dailyChartData.map(d => ({ date: d.date, spend: d.value }))}
                                         margin={{ top: 10, right: 20, left: 0, bottom: 0 }}
                                     >
@@ -898,8 +920,8 @@ export function MarketingDashboardView({ account, shopId: _shopId, timezone: sho
                                             name="Spend"
                                         />
                                     </AreaChart>
-                                </ResponsiveContainer>
-                            </div>
+                                )}
+                            </MeasuredChartHost>
                         )}
                     </div>
 
@@ -919,7 +941,7 @@ export function MarketingDashboardView({ account, shopId: _shopId, timezone: sho
                                 label="Clicks"
                                 value={fmtInt(kpis.clicks)}
                                 icon={MousePointerClick}
-                                color="bg-pink-500/20"
+                                color="bg-mamba-green/20"
                                 subtitle={`CTR: ${fmtPct(kpis.ctr)}`}
                             />
                         )}
@@ -940,11 +962,11 @@ export function MarketingDashboardView({ account, shopId: _shopId, timezone: sho
                         {eng && (eng.likes > 0 || eng.comments > 0 || eng.shares > 0 || eng.follows > 0 || eng.profile_visits > 0) && (
                             <div className="bg-gray-800/60 border border-gray-700/50 rounded-xl p-5">
                                 <h3 className="text-white font-semibold mb-3 flex items-center gap-2">
-                                    <Heart size={16} className="text-pink-400" />
+                                    <Heart size={16} className="text-mamba-neon" />
                                     Engagement
                                 </h3>
                                 <div className="divide-y divide-gray-700/50">
-                                    <EngagementRow label="Likes" value={eng.likes} icon={Heart} color="bg-pink-500/20" />
+                                    <EngagementRow label="Likes" value={eng.likes} icon={Heart} color="bg-mamba-green/20" />
                                     <EngagementRow label="Comments" value={eng.comments} icon={MessageCircle} color="bg-blue-500/20" />
                                     <EngagementRow label="Shares" value={eng.shares} icon={Share2} color="bg-green-500/20" />
                                     <EngagementRow label="Follows" value={eng.follows} icon={UserPlus} color="bg-purple-500/20" />
@@ -1047,7 +1069,7 @@ export function MarketingDashboardView({ account, shopId: _shopId, timezone: sho
                 <div className="bg-gray-800/60 border border-gray-700/50 rounded-xl overflow-hidden">
                     <div className="px-5 py-4 border-b border-gray-700/50 flex items-center justify-between">
                         <h3 className="text-white font-semibold flex items-center gap-2">
-                            <Megaphone size={16} className="text-pink-400" />
+                            <Megaphone size={16} className="text-mamba-neon" />
                             Campaign Performance
                         </h3>
                         {assets && (
@@ -1116,7 +1138,7 @@ export function MarketingDashboardView({ account, shopId: _shopId, timezone: sho
                             {audienceData.gender.length > 0 && (
                                 <div className="bg-gray-800/60 border border-gray-700/50 rounded-xl p-5">
                                     <h3 className="text-white font-semibold mb-4 flex items-center gap-2">
-                                        <Users size={16} className="text-pink-400" />
+                                        <Users size={16} className="text-mamba-neon" />
                                         Gender Distribution
                                     </h3>
                                     <div className="space-y-3">
@@ -1129,7 +1151,7 @@ export function MarketingDashboardView({ account, shopId: _shopId, timezone: sho
                                                 <div key={i} className="flex items-center gap-3">
                                                     <span className="text-gray-300 text-sm w-24">{genderLabel}</span>
                                                     <div className="flex-1 bg-gray-700/50 rounded-full h-2">
-                                                        <div className="h-2 rounded-full bg-pink-500/70" style={{ width: `${pct}%` }} />
+                                                        <div className="h-2 rounded-full bg-mamba-green/70" style={{ width: `${pct}%` }} />
                                                     </div>
                                                     <span className="text-gray-400 text-xs w-12 text-right">{pct.toFixed(1)}%</span>
                                                 </div>

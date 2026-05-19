@@ -712,13 +712,10 @@ class TikTokBusinessAPIService {
             'engaged_view'
         ];
 
-        console.log(`[Consolidated Overview] advertiser_id=${advertiserId} date=${effectiveStart} to ${endDate}`);
-
         // Fetch via /report/integrated/get/ at AUCTION_ADVERTISER level (chunked to 30-day windows).
         // This returns both standard AUCTION and GMV Max advertiser-level data in one shot.
         const combinedRows: any[] = [];
         const chunks = this._chunkDateRange(effectiveStart, endDate, 30);
-        console.log(`[Consolidated Overview] Fetching ${chunks.length} chunk(s) via integrated report...`);
 
         for (const chunk of chunks) {
             try {
@@ -732,12 +729,9 @@ class TikTokBusinessAPIService {
                     end_date: chunk.end
                 });
                 const rows = r?.list || [];
-                console.log(`[Consolidated Overview] Chunk ${chunk.start}\u2192${chunk.end}: ${rows.length} rows`);
                 combinedRows.push(...rows.map((row: any) => ({ ...row, is_gmv_max: false })));
             } catch (e: any) {
-                // Log the full error — a 40002 usually means an invalid metric name.
-                // If ALL chunks fail here, a metric in the list above is invalid for this endpoint.
-                console.warn(`[Consolidated Overview] Chunk ${chunk.start}→${chunk.end} failed: ${e.message}`);
+                // If ALL chunks fail here, a metric in the list above may be invalid for this endpoint.
                 logSystemEvent({
                     level: 'error',
                     scope: 'ads',
@@ -754,8 +748,6 @@ class TikTokBusinessAPIService {
                 });
             }
         }
-
-        console.log(`[Consolidated Overview] Total rows fetched: ${combinedRows.length}`);
 
         const finalSource = combinedRows.length > 0 ? 'auction' : 'none';
 
@@ -803,10 +795,9 @@ class TikTokBusinessAPIService {
                 { advertiser_id: advertiserId }
             );
             const stores = response.data?.list || response.data?.stores || [];
-            console.log(`[GMV Max Stores] Found ${stores.length} store(s) for advertiser ${advertiserId}`);
             return stores;
         } catch (e: any) {
-            console.warn('[GMV Max Stores] Failed:', e.message);
+            console.error('[GMV Max Stores] Failed:', e.message);
             return [];
         }
     }
@@ -824,7 +815,6 @@ class TikTokBusinessAPIService {
         storeIds: string[] = []
     ): Promise<any> {
         const chunks = this._chunkDateRange(startDate, endDate, 30);
-        console.log(`[GMV Report] advertiser_id=${advertiserId} storeIds=${JSON.stringify(storeIds)} date=${startDate} to ${endDate} (${chunks.length} chunk(s))`);
 
         // ── Primary path: dedicated /gmv_max/report/get/ endpoint ──────────────
         // Requires store_ids. We request a richer metric set so that GMV Max
@@ -881,10 +871,6 @@ class TikTokBusinessAPIService {
 
                     if (json.code === 0) {
                         const rows = json.data?.list || [];
-                        console.log(`[GMV Report] /gmv_max/report/get/ chunk ${chunk.start}→${chunk.end}: ${rows.length} rows`);
-                        if (rows.length > 0) {
-                            console.log(`[GMV Report] First row RAW metric keys:`, Object.keys(rows[0].metrics || {}));
-                        }
                         // Normalize metric names and log key business fields for inspection
                         const normalizedRows = rows.map((row: any) => {
                             const rawMetrics = row.metrics || {};
@@ -901,7 +887,6 @@ class TikTokBusinessAPIService {
                         });
                         allRows.push(...normalizedRows);
                     } else {
-                        console.warn(`[GMV Report] /gmv_max/report/get/ error code ${json.code}: ${json.message}`);
                         logSystemEvent({
                             level: 'error',
                             scope: 'ads',
@@ -918,7 +903,6 @@ class TikTokBusinessAPIService {
                         });
                     }
                 } catch (e: any) {
-                    console.warn(`[GMV Report] /gmv_max/report/get/ chunk ${chunk.start}→${chunk.end} failed:`, e.message);
                     logSystemEvent({
                         level: 'error',
                         scope: 'ads',
@@ -936,11 +920,9 @@ class TikTokBusinessAPIService {
             }
 
             if (allRows.length > 0) {
-                console.log(`[GMV Report] Using dedicated GMV Max endpoint — ${allRows.length} rows total`);
                 return { list: allRows, _source: 'gmv_max_dedicated' };
 
             }
-            console.warn(`[GMV Report] /gmv_max/report/get/ returned 0 rows — falling back to integrated endpoint`);
 
         }
 
@@ -948,7 +930,6 @@ class TikTokBusinessAPIService {
         // Used when storeIds is empty or GMV Max endpoint returns nothing.
         // Returns standard metrics including complete_payment + value_per_complete_payment
         // from which GMV can be estimated.
-        console.log(`[GMV Report] Using integrated fallback for advertiser ${advertiserId}`);
         const fallbackMetrics = [
             'spend', 'complete_payment', 'cost_per_complete_payment',
             'complete_payment_rate', 'value_per_complete_payment',
@@ -969,10 +950,8 @@ class TikTokBusinessAPIService {
                     end_date: chunk.end
                 });
                 const rows = r.list || [];
-                console.log(`[GMV Report] Integrated chunk ${chunk.start}→${chunk.end}: ${rows.length} rows`);
                 allRows.push(...rows);
             } catch (e: any) {
-                console.warn(`[GMV Report] Integrated chunk ${chunk.start}→${chunk.end} failed:`, e.message);
                 logSystemEvent({
                     level: 'error',
                     scope: 'ads',
@@ -1002,7 +981,6 @@ class TikTokBusinessAPIService {
         campaignIds: string[] = []
     ): Promise<any> {
         if (campaignIds.length === 0) {
-            console.log('[GMV Max Sessions] No campaign IDs provided — skipping.');
             return [];
         }
 
@@ -1019,7 +997,7 @@ class TikTokBusinessAPIService {
                 return sessions;
             } catch (e: any) {
                 if (!e.message?.includes('campaign_id')) {
-                    console.warn(`[GMV Max Sessions] campaign ${campaignId}:`, e.message);
+                    console.error(`[GMV Max Sessions] campaign ${campaignId}:`, e.message);
                 }
                 return [];
             }
@@ -1043,7 +1021,6 @@ class TikTokBusinessAPIService {
         // TikTok AUDIENCE reports are capped at 30 days per request.
         // Chunk the requested date range into \u2264 30-day segments and aggregate.
         const chunks = this._chunkDateRange(startDate, endDate, 30);
-        console.log(`[Audience] Fetching ${chunks.length} chunk(s) from ${startDate} to ${endDate}...`);
 
         const metrics = ['spend', 'impressions', 'clicks', 'ctr', 'cpc', 'cpm'];
         const results: any = { age: [], gender: [], country: [] };
@@ -1094,7 +1071,7 @@ class TikTokBusinessAPIService {
                     end_date: chunk.end
                 });
                 if (ageResp.list?.length) results.age = mergeRows(results.age, ageResp.list, 'age');
-            } catch (e: any) { console.warn(`[Audience] Age chunk ${chunk.start} failed:`, e.message); }
+            } catch (e: any) { console.error(`[Audience] Age chunk ${chunk.start} failed:`, e.message); }
 
             // Gender
             try {
@@ -1108,7 +1085,7 @@ class TikTokBusinessAPIService {
                     end_date: chunk.end
                 });
                 if (genderResp.list?.length) results.gender = mergeRows(results.gender, genderResp.list, 'gender');
-            } catch (e: any) { console.warn(`[Audience] Gender chunk ${chunk.start} failed:`, e.message); }
+            } catch (e: any) { console.error(`[Audience] Gender chunk ${chunk.start} failed:`, e.message); }
 
             // Country
             try {
@@ -1122,7 +1099,7 @@ class TikTokBusinessAPIService {
                     end_date: chunk.end
                 });
                 if (countryResp.list?.length) results.country = mergeRows(results.country, countryResp.list, 'country_code');
-            } catch (e: any) { console.warn(`[Audience] Country chunk ${chunk.start} failed:`, e.message); }
+            } catch (e: any) { console.error(`[Audience] Country chunk ${chunk.start} failed:`, e.message); }
         }
 
         return results;

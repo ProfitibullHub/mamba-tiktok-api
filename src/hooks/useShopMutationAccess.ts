@@ -13,8 +13,11 @@ export type ShopAccessFlags = {
 };
 
 /**
- * Read vs write access for the current shop account (RPC-backed).
+ * Read vs write access for the current shop account (RPC-backed UX flags).
  * Seller User: canSyncShop true, canMutateShop false.
+ *
+ * These RPCs gate buttons and layout only — see `src/lib/accessControl.ts`.
+ * API routes and RLS enforce access regardless of what the UI shows.
  */
 export function useShopAccessFlags(account: Pick<Account, 'id'> | null | undefined): ShopAccessFlags {
     const { profile, user } = useAuth();

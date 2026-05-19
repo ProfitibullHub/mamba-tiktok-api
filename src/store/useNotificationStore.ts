@@ -146,7 +146,7 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
                 try {
                   new Notification(`Mamba: ${newNotif.title}`, {
                     body: newNotif.message,
-                    icon: '/vite.svg',
+                    icon: '/mamba-snake-head.svg',
                   });
                 } catch (e) {
                   console.error('[Browser Notification] Failed to trigger', e);

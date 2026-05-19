@@ -73,8 +73,8 @@ async function canEditBrandingTarget(userId: string, targetAgencyId: string, isS
 }
 
 const PLATFORM_DEFAULTS = {
-    primaryColor: '#ec4899',
-    secondaryColor: '#6366f1',
+    primaryColor: '#28D99E',
+    secondaryColor: '#1FA97C',
     displayName: 'Mamba',
 } as const;
 
@@ -175,58 +175,58 @@ async function fetchTenantBrandingRow(tenantId: string): Promise<{ data: Brandin
 
 /** Canonical seller-facing theme fallbacks (keep aligned with src/lib/platformBrandingDefaults.ts). */
 const PLATFORM_THEME_MERGE_DEFAULTS = {
-    bg_color: '#111827',
-    sidebar_bg_color: '#111827',
-    sidebar_border_color: '#1f2937',
-    card_bg_color: '#ffffff06',
-    card_border_color: '#ffffff1a',
-    text_color: '#ffffff',
-    text_muted_color: '#6b7280',
-    btn_text_color: '#ffffff',
-    card_hover_color: '#ffffff12',
-    interactive_hover_bg: '#ffffff12',
-    interactive_focus_ring: '#ec489955',
-    success_bg: '#10b9811f',
-    success_text: '#6ee7b7',
-    success_border: '#10b98166',
+    bg_color: '#06141A',
+    sidebar_bg_color: '#0D1B21',
+    sidebar_border_color: '#1F3A43',
+    card_bg_color: '#13262E',
+    card_border_color: '#1F3A43',
+    text_color: '#E6F3F1',
+    text_muted_color: '#8CAFB3',
+    btn_text_color: '#06141A',
+    card_hover_color: '#ffffff14',
+    interactive_hover_bg: '#ffffff0d',
+    interactive_focus_ring: '#28D99E99',
+    success_bg: '#28D99E1f',
+    success_text: '#49FFB7',
+    success_border: '#28D99E66',
     warning_bg: '#f59e0b1f',
     warning_text: '#fcd34d',
     warning_border: '#f59e0b66',
     danger_bg: '#ef44441f',
     danger_text: '#fca5a5',
     danger_border: '#ef444466',
-    info_bg: '#3b82f61f',
-    info_text: '#93c5fd',
-    info_border: '#3b82f666',
-    profit_color: '#34d399',
+    info_bg: '#06b6d41f',
+    info_text: '#67e8f9',
+    info_border: '#22d3ee66',
+    profit_color: '#49FFB7',
     loss_color: '#f87171',
-    primary_card_bg: '#111827',
-    primary_card_border: '#374151',
-    secondary_card_bg: '#1f2937',
-    secondary_card_border: '#374151',
-    toast_success_bg: '#052e22',
-    toast_success_border: '#10b98173',
-    toast_success_icon: '#34d399',
+    primary_card_bg: '#0D1B21',
+    primary_card_border: '#1F3A43',
+    secondary_card_bg: '#13262E',
+    secondary_card_border: '#1F3A43',
+    toast_success_bg: '#041816',
+    toast_success_border: '#28D99E73',
+    toast_success_icon: '#49FFB7',
     toast_error_bg: '#3f1010',
     toast_error_border: '#ef444473',
     toast_error_icon: '#f87171',
-    toast_info_bg: '#0f1f3f',
-    toast_info_border: '#3b82f673',
-    toast_info_icon: '#60a5fa',
+    toast_info_bg: '#082f3a',
+    toast_info_border: '#22d3ee73',
+    toast_info_icon: '#67e8f9',
     toast_warning_bg: '#3b2208',
     toast_warning_border: '#f59e0b73',
     toast_warning_icon: '#fbbf24',
-    chart_grid: '#33415566',
-    chart_axis: '#94a3b8',
-    chart_series_1: '#ec4899',
-    chart_series_2: '#6366f1',
-    chart_series_3: '#22c55e',
+    chart_grid: '#1F3A4366',
+    chart_axis: '#8CAFB3',
+    chart_series_1: '#28D99E',
+    chart_series_2: '#49FFB7',
+    chart_series_3: '#1FA97C',
     chart_series_4: '#eab308',
-    chart_series_5: '#06b6d4',
-    chart_series_6: '#f97316',
-    chart_positive: '#34d399',
+    chart_series_5: '#f97316',
+    chart_series_6: '#a78bfa',
+    chart_positive: '#49FFB7',
     chart_negative: '#f87171',
-    chart_neutral: '#64748b',
+    chart_neutral: '#8CAFB3',
 } as const;
 
 function mergeBranding(row: BrandingRow | null, agencyTenantId: string | null) {
@@ -677,6 +677,7 @@ async function handleBrandingAuditGet(req: express.Request, res: express.Respons
 /**
  * GET /api/branding
  * Optional query: agencyTenantId — read branding for that agency (must pass visibility + view_brand_settings rules).
+ * Optional query: accountId — shop console: allow read when caller has view_pnl / financials.view on that account (custom roles on seller/agency paths).
  * Optional query: audit=1 — branding change history (same as GET /api/branding/audit).
  * Without query: agency from profile tenant, or parent agency when profile tenant is a linked seller.
  */
@@ -686,7 +687,40 @@ router.get('/', async (req, res) => {
         return;
     }
     try {
-        const auth = await authorize(req, { action: 'view_brand_settings', denyAction: 'branding.view_denied' });
+        const rawAccountId = typeof req.query.accountId === 'string' ? req.query.accountId.trim() : '';
+        /**
+         * Authorized via financial/P&L visibility, not view_brand_settings.
+         * `canViewBrandingTarget` still requires view_brand_settings on the agency — coordinators with
+         * only financial custom roles would 403 after authorize otherwise.
+         */
+        let brandingReadWithoutBrandSettingsPerm = false;
+
+        let auth = await authorize(req, { action: 'view_brand_settings', denyAction: 'branding.view_denied' });
+        if (!auth.allowed && rawAccountId && UUID_RE.test(rawAccountId)) {
+            auth = await authorize(req, {
+                action: 'view_pnl',
+                accountId: rawAccountId,
+                denyAction: 'branding.view_denied',
+            });
+            if (auth.allowed) brandingReadWithoutBrandSettingsPerm = true;
+        }
+        if (!auth.allowed && rawAccountId && UUID_RE.test(rawAccountId)) {
+            auth = await authorize(req, {
+                action: 'financials.view',
+                accountId: rawAccountId,
+                denyAction: 'branding.view_denied',
+            });
+            if (auth.allowed) brandingReadWithoutBrandSettingsPerm = true;
+        }
+        // Profile-tenant financial access (e.g. agency JWT + custom role on agency): plain GET /api/branding
+        if (!auth.allowed) {
+            auth = await authorize(req, { action: 'view_pnl', denyAction: 'branding.view_denied' });
+            if (auth.allowed) brandingReadWithoutBrandSettingsPerm = true;
+        }
+        if (!auth.allowed) {
+            auth = await authorize(req, { action: 'financials.view', denyAction: 'branding.view_denied' });
+            if (auth.allowed) brandingReadWithoutBrandSettingsPerm = true;
+        }
         if (!auth.allowed) {
             res.status(auth.status).json({ success: false, error: auth.reason });
             return;
@@ -728,7 +762,10 @@ router.get('/', async (req, res) => {
             return;
         }
 
-        if (!(await canViewBrandingTarget(auth.context.userId, auth.context, targetAgencyId, isSuper))) {
+        const canView =
+            brandingReadWithoutBrandSettingsPerm ||
+            (await canViewBrandingTarget(auth.context.userId, auth.context, targetAgencyId, isSuper));
+        if (!canView) {
             res.status(403).json({ success: false, error: 'Access denied' });
             return;
         }

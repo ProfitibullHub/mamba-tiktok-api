@@ -1,4 +1,4 @@
-import { DollarSign, TrendingUp, TrendingDown, Minus, Wallet, PieChart, Percent, AlertTriangle, ChevronDown, ChevronUp, Package, Truck, Receipt, Users, Megaphone, Building2, SlidersHorizontal, RotateCcw, Download, Plus, Trash2, Calendar, Lock, CircleDollarSign, Loader2, RefreshCw } from 'lucide-react';
+import { DollarSign, TrendingUp, TrendingDown, Minus, Wallet, PieChart, Percent, AlertTriangle, ChevronDown, ChevronUp, Package, Truck, Receipt, Users, Megaphone, Building2, SlidersHorizontal, RotateCcw, Download, Plus, Trash2, Calendar, Lock, CircleDollarSign, RefreshCw, ListOrdered } from 'lucide-react';
 // Note: LayoutGrid, Layers are used by the View Mode Toggle — re-add to import when uncommenting the toggle
 import { useState, useEffect, useMemo, useCallback } from 'react';
 import { useShopStore, Order } from '../../store/useShopStore';
@@ -8,7 +8,6 @@ import {
   formatShopDateISO,
   formatShopDateTime,
   getShopDayStartTimestamp,
-  getShopDayEndExclusiveTimestamp,
   getDateRangeFromPreset,
   previousCalendarDayISO,
 } from '../../utils/dateUtils';
@@ -18,6 +17,8 @@ import { calculateOrderGMV } from '../../utils/gmvCalculations';
 import { exportToCSV, exportToExcel, exportToPDF, ExportData } from '../../utils/exportUtils';
 import { ManualAffiliateModal } from '../ManualAffiliateModal';
 import { ManualAgencyFeeModal } from '../ManualAgencyFeeModal';
+import { CustomPlManageModal } from '../CustomPlManageModal';
+import { patchCustomPlEmptyValueDisplay } from '../../lib/customPlFinanceApi';
 import { useShopAccessFlags } from '../../hooks/useShopMutationAccess';
 import { isCancelledOrRefunded } from '../../utils/orderFinancials';
 import {
@@ -34,7 +35,15 @@ import {
 import { computeAgencyFeesRollup } from '../../utils/agencyFeeProration';
 import { buildTiktokStatementExportRows } from '../../utils/tiktokStatementExportRows';
 import { useSellerBranding } from '../../contexts/SellerBrandingContext';
+import { useTenantContext } from '../../contexts/TenantContext';
 import { scopedPlDataFromCache } from '../../utils/plDataRangeGuard';
+import { readDefaultLoadDaysFromStorage } from '../../config/dataRetention';
+import { shouldSkipShopTabMountBootstrap } from '../../utils/shopTabBootstrap';
+import {
+  useMergedShopEffectivePermissions,
+  effectiveHasTiktokShopData,
+  effectiveAllowsMarketingFinanceTab,
+} from '../../hooks/useMyEffectivePermissions';
 
 // Use paid_time for filtering (matches backend which loads by paid_time)
 const getOrderTs = (o: Order): number => Number(o.paid_time || o.created_time);
@@ -49,26 +58,25 @@ function plDefaultPresetStorageKey(shopId: string | undefined): string {
 function readPlDefaultDateRange(shopId: string | undefined, timezone: string): DateRange {
   try {
     const raw = localStorage.getItem(plDefaultPresetStorageKey(shopId));
-    const preset = raw && PL_DEFAULT_PRESET_IDS.has(raw) ? raw : 'last30';
+    const preset = raw && PL_DEFAULT_PRESET_IDS.has(raw) ? raw : 'yesterday';
     return getDateRangeFromPreset(preset, timezone);
   } catch {
-    return getDateRangeFromPreset('last30', timezone);
+    return getDateRangeFromPreset('yesterday', timezone);
   }
 }
 
-/** Inclusive calendar-day span for YYYY-MM-DD (noon anchors avoid DST edge glitches). */
-function inclusiveCalendarDaysInRange(startYmd: string, endYmd: string): number {
-  const start = new Date(`${startYmd}T12:00:00`);
-  const end = new Date(`${endYmd}T12:00:00`);
-  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return 1;
-  if (end < start) return 1;
-  return Math.floor((end.getTime() - start.getTime()) / 86400000) + 1;
+/** SPA session snapshot for Profit & Loss only (lost on refresh). */
+function initialProfitLossDateRange(saved: DateRange | undefined, shopId: string | undefined, timezone: string): DateRange {
+  if (saved) return saved;
+  return readPlDefaultDateRange(shopId, timezone);
 }
 
 interface ProfitLossViewProps {
   account: Account;
   shopId?: string;
   timezone?: string; // Shop timezone for date calculations
+  sessionDateRange?: DateRange;
+  onSessionDateRangeChange?: (range: DateRange) => void;
 }
 
 // Aggregated P&L data from backend
@@ -86,6 +94,8 @@ interface PLData {
   supplementary: Record<string, number>;
   statement_totals: {
     total_revenue: number;
+    /** Seller Center gross sales: transaction rollup (≠ legacy `total_revenue`, which often duplicates net sales). */
+    total_gross_sales?: number;
     total_settlement: number;
     total_fees: number;
     total_adjustments: number;
@@ -104,8 +114,30 @@ interface PLData {
     can_view_margin?: boolean;
     can_view_custom_line_items?: boolean;
     restricted_fields?: string[];
+    restricted_custom_pl_line_item_ids?: string[];
   };
   restriction_notice?: string;
+  custom_line_items?: {
+    /** PRD §5.3 */
+    empty_amount_in_range_display?: 'zero' | 'null';
+    lines: Array<{
+      id: string;
+      name: string;
+      category: string;
+      sort_order: number;
+      is_active: boolean;
+      amount_in_range: number | null;
+      value_segments: Array<{
+        id: string;
+        amount: number;
+        /** Portion of `amount` attributed to the current report range (calendar-day proration when the segment is longer). */
+        amount_in_report?: number;
+        start_date: string;
+        end_date: string | null;
+      }>;
+    }>;
+    by_category: Record<string, number>;
+  };
 }
 
 const PL_AMOUNT_EPS = 0.005;
@@ -356,17 +388,26 @@ function labelPlDateRangeForSyncPrompt(startDate: string, endDate: string, timez
   return `${a} – ${b}`;
 }
 
-export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angeles' }: ProfitLossViewProps) {
-  const [dateRange, setDateRange] = useState<DateRange>(() => readPlDefaultDateRange(shopId, timezone));
+export function ProfitLossView({
+  account,
+  shopId,
+  timezone = 'America/Los_Angeles',
+  sessionDateRange,
+  onSessionDateRangeChange,
+}: ProfitLossViewProps) {
+  const { isPlatformSuperAdmin } = useTenantContext();
+  const [dateRange, setDateRange] = useState<DateRange>(() =>
+    initialProfitLossDateRange(sessionDateRange, shopId, timezone),
+  );
 
-  const applyDateRange = useCallback((r: DateRange) => {
-    setDateRange(r);
-  }, []);
+  const applyDateRange = useCallback(
+    (r: DateRange) => {
+      setDateRange(r);
+      onSessionDateRangeChange?.(r);
+    },
+    [onSessionDateRangeChange],
+  );
 
-  // Reset P&L range when shop or timezone changes (default: last 30 days in shop TZ, not dashboard preset).
-  useEffect(() => {
-    setDateRange(readPlDefaultDateRange(shopId, timezone));
-  }, [shopId, timezone]);
   const [showExportMenu, setShowExportMenu] = useState(false);
   const { data: sellerBrand } = useSellerBranding();
   const [expandedHero, setExpandedHero] = useState<'gmv' | 'grossProfit' | 'netProfit' | null>(null);
@@ -390,21 +431,28 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
     return () => window.removeEventListener('mamba:cancelled_financials_changed', handler);
   }, [shopId]);
 
-  const products = useShopStore(state => state.products);
+  const { data: mergedSellerPerms, isLoading: permsLoading } = useMergedShopEffectivePermissions(
+    account.tenant_id,
+    account.id,
+    { enabled: Boolean(account.tenant_id && account.id) },
+  );
+  const bypassShopPermissionCeiling = isPlatformSuperAdmin;
+  const operationalShopData = Boolean(
+    bypassShopPermissionCeiling || (mergedSellerPerms && effectiveHasTiktokShopData(mergedSellerPerms))
+  );
+  const loadMarketingForFinance = Boolean(
+    bypassShopPermissionCeiling || (mergedSellerPerms && effectiveAllowsMarketingFinanceTab(mergedSellerPerms))
+  );
   const orders = useShopStore(state => state.orders);
+  const products = useShopStore(state => state.products);
   const dataVersion = useShopStore(state => state.dataVersion);
   const isLoading = useShopStore(state => state.isLoading);
   const syncData = useShopStore(state => state.syncData);
   const cacheMetadata = useShopStore(state => state.cacheMetadata);
   const fetchShopData = useShopStore(state => state.fetchShopData);
-  const isFetchingDateRange = useShopStore(state => state.isFetchingDateRange);
-  const dateRangeFetchShopId = useShopStore(state => state.dateRangeFetchShopId);
-  const fetchDateRange = useShopStore(state => state.fetchDateRange);
-  const dataLoadIncomplete = useShopStore(state => state.dataLoadIncomplete);
   const syncProgress = useShopStore(state => state.syncProgress);
   const syncProgressShopId = useShopStore(state => state.syncProgressShopId);
-  const metrics = useShopStore(state => state.metrics);
-  const lastFetchShopId = useShopStore(state => state.lastFetchShopId);
+  const fetchInProgress = useShopStore((state) => state.fetchInProgress);
 
   // P&L data from Zustand store (persists across navigations, no flickering)
   const plDataRaw = useShopStore(state => state.plData) as PLData | null;
@@ -413,19 +461,53 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
   const plLoading = useShopStore(state => state.plLoading);
   const error = useShopStore(state => state.plError);
   const fetchPLData = useShopStore(state => state.fetchPLData);
+  const refreshPlDataCustomLineItems = useShopStore((state) => state.refreshPlDataCustomLineItems);
 
   const plData = useMemo(
     () => scopedPlDataFromCache(plDataRaw, plDataKey, plDataCache, account.id, shopId, dateRange.startDate, dateRange.endDate) as PLData | null,
     [plDataRaw, plDataKey, plDataCache, account.id, shopId, dateRange.startDate, dateRange.endDate]
   );
 
-  const canViewCogs = plData?.financial_visibility?.can_view_cogs !== false;
-  const canViewMargin = plData?.financial_visibility?.can_view_margin !== false;
+  const canViewCogs = bypassShopPermissionCeiling || plData?.financial_visibility?.can_view_cogs !== false;
+  const canViewMargin = bypassShopPermissionCeiling || plData?.financial_visibility?.can_view_margin !== false;
+  const canViewCustomLineItems =
+    bypassShopPermissionCeiling || plData?.financial_visibility?.can_view_custom_line_items !== false;
+
+  const customPlPayload = plData?.custom_line_items;
+  const customPlNetDisplay = useMemo(() => {
+    if (!customPlPayload?.lines?.length) return 0;
+    return customPlPayload.lines.reduce((sum, row) => sum + (Number(row.amount_in_range) || 0), 0);
+  }, [customPlPayload]);
+
+  const refreshCustomPlAfterModalSave = useCallback(async () => {
+    if (!shopId) return;
+    await refreshPlDataCustomLineItems(account.id, shopId, dateRange.startDate, dateRange.endDate, timezone);
+  }, [account.id, shopId, dateRange.startDate, dateRange.endDate, timezone, refreshPlDataCustomLineItems]);
+
+  const saveCustomPlEmptyDisplay = useCallback(
+    async (mode: 'zero' | 'null') => {
+      if (!shopId) return;
+      setCustomPlEmptyDisplaySaving(true);
+      try {
+        await patchCustomPlEmptyValueDisplay(account.id, shopId, mode);
+        await refreshPlDataCustomLineItems(account.id, shopId, dateRange.startDate, dateRange.endDate, timezone);
+      } catch (err) {
+        console.error(err);
+      } finally {
+        setCustomPlEmptyDisplaySaving(false);
+      }
+    },
+    [account.id, shopId, dateRange.startDate, dateRange.endDate, timezone, refreshPlDataCustomLineItems],
+  );
+
   const restrictedFieldSet = useMemo(
-    () => new Set(plData?.financial_visibility?.restricted_fields || []),
-    [plData?.financial_visibility?.restricted_fields]
+    () => (bypassShopPermissionCeiling ? new Set<string>() : new Set(plData?.financial_visibility?.restricted_fields || [])),
+    [bypassShopPermissionCeiling, plData?.financial_visibility?.restricted_fields]
   );
   const isRestricted = useCallback((field: string) => restrictedFieldSet.has(field), [restrictedFieldSet]);
+  /** Hide affiliate block when policy targets commission lines or custom line items (manual retainers), independent of product COGS visibility. */
+  const hideAffiliatePlSection =
+    restrictedFieldSet.has('affiliate_commissions') || restrictedFieldSet.has('custom_line_items');
 
   // Manual Affiliate Settlements
   const affiliateSettlements = useShopStore(state => state.finance.affiliateSettlements);
@@ -442,6 +524,8 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
   const fetchAgencyFees = useShopStore(state => state.fetchAgencyFees);
   const deleteAgencyFee = useShopStore(state => state.deleteAgencyFee);
   const [isAgencyModalOpen, setIsAgencyModalOpen] = useState(false);
+  const [isCustomPlModalOpen, setIsCustomPlModalOpen] = useState(false);
+  const [customPlEmptyDisplaySaving, setCustomPlEmptyDisplaySaving] = useState(false);
 
   const { canMutateShop, canSyncShop } = useShopAccessFlags(account);
 
@@ -472,97 +556,72 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
     fetchAgencyFees(account.id, shopId, dateRange.startDate, dateRange.endDate);
   };
 
-  /** Orders for this view are loaded in batches; surface ~calendar-day coverage from load progress. */
-  const plOrdersLoadProgress = useMemo(() => {
+  /** Same shop-data progress copy as Overview (e.g. "Loading 22/30 days…"). */
+  const ordersLoadStatusText = useMemo(() => {
+    if (!operationalShopData) return null;
     if (!shopId) return null;
-    const rangeMatches =
-      fetchDateRange.startDate === dateRange.startDate &&
-      fetchDateRange.endDate === dateRange.endDate &&
-      lastFetchShopId === shopId;
-
-    if (!rangeMatches) return null;
-
-    const totalDays = inclusiveCalendarDaysInRange(dateRange.startDate, dateRange.endDate);
-    const rangeStart = getShopDayStartTimestamp(dateRange.startDate, timezone);
-    const rangeEndExc = getShopDayEndExclusiveTimestamp(dateRange.endDate, timezone);
-    const ordersInRange = orders.reduce((n, o) => {
-      const ts = getOrderTs(o);
-      return ts >= rangeStart && ts < rangeEndExc ? n + 1 : n;
-    }, 0);
-
-    const chunking =
+    if (cacheMetadata.isSyncing && cacheMetadata.shopId === shopId) return null;
+    if (
       syncProgressShopId === shopId &&
-      syncProgress.isActive &&
-      syncProgress.currentStep === 'orders' &&
-      !cacheMetadata.isSyncing;
-    const httpWait = isFetchingDateRange && dateRangeFetchShopId === shopId;
-    const incompleteOnly = dataLoadIncomplete && !chunking && !httpWait;
-
-    if (!chunking && !httpWait && !incompleteOnly) return null;
-
-    const ordersExpected = Math.max(1, syncProgress.ordersTotal || metrics.totalOrders || ordersInRange);
-    const loadedCount = chunking || httpWait ? Math.max(syncProgress.ordersFetched, ordersInRange) : ordersInRange;
-    const ratio = Math.min(1, loadedCount / ordersExpected);
-    const estDaysShown = httpWait ? 0 : Math.max(1, Math.min(totalDays, Math.round(ratio * totalDays)));
-    const estDaysRemaining = Math.max(0, totalDays - estDaysShown);
-
-    if (incompleteOnly) {
-      return {
-        kind: 'incomplete' as const,
-        totalDays,
-        ordersLoaded: loadedCount,
-        ordersExpected,
-        message: syncProgress.message || `Loaded ${loadedCount} of ${ordersExpected} orders for this range.`,
-      };
+      (syncProgress.isActive || fetchInProgress) &&
+      syncProgress.message?.trim()
+    ) {
+      return syncProgress.message.trim();
     }
-
-    return {
-      kind: 'loading' as const,
-      totalDays,
-      httpWait,
-      ordersLoaded: loadedCount,
-      ordersExpected,
-      ratio,
-      estDaysShown,
-      estDaysRemaining,
-    };
+    return null;
   }, [
+    operationalShopData,
+    shopId,
+    cacheMetadata.isSyncing,
+    cacheMetadata.shopId,
+    syncProgressShopId,
+    syncProgress.isActive,
+    fetchInProgress,
+    syncProgress.message,
+  ]);
+
+  useEffect(() => {
+    if (!shopId || !loadMarketingForFinance || marketingLoaded || permsLoading) return;
+    void loadMarketingFromDB(account.id);
+  }, [shopId, account.id, marketingLoaded, loadMarketingFromDB, loadMarketingForFinance, permsLoading]);
+
+  // Fetch P&L data when params change (store handles caching & dedup). Same-range remounts skip the
+  // full waterfall so tab switches stay snappy; user date changes still rerun (fingerprint changes).
+  // Operational `fetchShopData` (orders/products) runs only when the user has `tiktok.shop.data`.
+  useEffect(() => {
+    if (!shopId || permsLoading) return;
+    const ld = readDefaultLoadDaysFromStorage(shopId);
+    const fp = `${account.id}|${dateRange.startDate}|${dateRange.endDate}|${ld}|${operationalShopData ? 'shop' : 'fin'}`;
+    if (shouldSkipShopTabMountBootstrap(shopId, 'profit-loss', fp)) return;
+    if (operationalShopData) {
+      fetchShopData(
+        account.id,
+        shopId,
+        {
+          skipSyncCheck: true,
+          initialLoadDays: ld,
+          timezone,
+        },
+        dateRange.startDate,
+        dateRange.endDate,
+      );
+    }
+    fetchPLData(account.id, shopId, dateRange.startDate, dateRange.endDate, false, timezone);
+    fetchAffiliateSettlements(account.id, shopId, dateRange.startDate, dateRange.endDate);
+    fetchAgencyFees(account.id, shopId, dateRange.startDate, dateRange.endDate);
+  }, [
+    account.id,
     shopId,
     dateRange.startDate,
     dateRange.endDate,
     timezone,
-    fetchDateRange.startDate,
-    fetchDateRange.endDate,
-    lastFetchShopId,
-    isFetchingDateRange,
-    dateRangeFetchShopId,
-    syncProgressShopId,
-    dataLoadIncomplete,
-    syncProgress.isActive,
-    syncProgress.currentStep,
-    syncProgress.ordersFetched,
-    syncProgress.ordersTotal,
-    syncProgress.message,
-    cacheMetadata.isSyncing,
-    metrics.totalOrders,
-    orders,
-    dataVersion,
+    operationalShopData,
+    permsLoading,
+    fetchShopData,
+    fetchPLData,
+    fetchAffiliateSettlements,
+    fetchAgencyFees,
   ]);
-
-  // Fetch P&L data when params change (store handles caching & dedup)
-  useEffect(() => {
-    if (shopId) {
-      // Load any missing orders data for this date range (smart cache — only fetches what isn't loaded yet)
-      fetchShopData(account.id, shopId, { skipSyncCheck: true }, dateRange.startDate, dateRange.endDate);
-      fetchPLData(account.id, shopId, dateRange.startDate, dateRange.endDate, false, timezone);
-      fetchAffiliateSettlements(account.id, shopId, dateRange.startDate, dateRange.endDate);
-      fetchAgencyFees(account.id, shopId, dateRange.startDate, dateRange.endDate);
-      // Load synced marketing data from DB if not loaded yet
-      if (!marketingLoaded) {
-        loadMarketingFromDB(account.id);
-      }
-    }
-  }, [account.id, shopId, dateRange, fetchShopData, fetchPLData, loadMarketingFromDB, marketingLoaded, fetchAffiliateSettlements]);
 
 
   // Calculate COGS from orders (useMemo avoids extra re-renders)
@@ -594,8 +653,27 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
       return isDate && !isReturned && isSample;
     });
 
+    /** Per-SKU rollup for “how we calculated COGS” (non-sample qualifying orders only). */
+    const regularCogsBySku = new Map<
+      string,
+      {
+        skuKey: string;
+        productName: string;
+        skuName: string;
+        skuImage: string;
+        quantity: number;
+        totalCogs: number;
+        fromSnapshot: number;
+        fromCatalog: number;
+      }
+    >();
+    let cogsFromOrderSnapshot = 0;
+    let cogsFromCatalogFallback = 0;
+    let regularCogsLineItems = 0;
+
     validOrders.forEach(order => {
       order.line_items.forEach(item => {
+        regularCogsLineItems += 1;
         // Find product by SKU or name (for stats and fallback)
         const product = products.find(p =>
           (item.seller_sku && p.skus?.some(s => s.seller_sku === item.seller_sku)) ||
@@ -612,6 +690,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
         // PRIORITY 1: Use Snapshot COGS from Order (Historical Accuracy)
         let itemCogs = (item as any).cogs;
         let itemShippingCost = 0;
+        const usedOrderSnapshotCogs = itemCogs !== undefined && itemCogs !== null;
 
         // PRIORITY 2: Fallback to Current Product Catalog COGS
         if (itemCogs === undefined || itemCogs === null) {
@@ -635,8 +714,37 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
           }
         }
 
-        realCogs += (Number(itemCogs) * item.quantity);
-        realShippingCost += (Number(itemShippingCost) * item.quantity);
+        const qty = Number(item.quantity) || 0;
+        const unit = Number(itemCogs);
+        const lineCogs = unit * qty;
+        if (usedOrderSnapshotCogs) {
+          cogsFromOrderSnapshot += lineCogs;
+        } else {
+          cogsFromCatalogFallback += lineCogs;
+        }
+
+        const skuKey = item.seller_sku || item.product_name || 'unknown';
+        const existing = regularCogsBySku.get(skuKey);
+        if (existing) {
+          existing.quantity += qty;
+          existing.totalCogs += lineCogs;
+          if (usedOrderSnapshotCogs) existing.fromSnapshot += lineCogs;
+          else existing.fromCatalog += lineCogs;
+        } else {
+          regularCogsBySku.set(skuKey, {
+            skuKey,
+            productName: item.product_name || 'Unknown product',
+            skuName: item.sku_name || '',
+            skuImage: item.sku_image || '',
+            quantity: qty,
+            totalCogs: lineCogs,
+            fromSnapshot: usedOrderSnapshotCogs ? lineCogs : 0,
+            fromCatalog: usedOrderSnapshotCogs ? 0 : lineCogs,
+          });
+        }
+
+        realCogs += lineCogs;
+        realShippingCost += (Number(itemShippingCost) * qty);
       });
     });
 
@@ -752,11 +860,26 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
     const skuBreakdown = Array.from(skuBreakdownMap.values())
       .sort((a, b) => b.totalCogs - a.totalCogs);
 
+    // Sort regular-order COGS breakdown by extended cost (matches Σ line totals)
+    const regularCogsBreakdown = Array.from(regularCogsBySku.values())
+      .map((row) => ({
+        ...row,
+        unitCogs: row.quantity > 0 ? row.totalCogs / row.quantity : 0,
+      }))
+      .sort((a, b) => b.totalCogs - a.totalCogs);
+
     return {
       withCogs: productsWithCogs,
       total: productsWithSales,
       totalCogs: realCogs,
       totalProductShippingCost: realShippingCost,
+      regularOrdersCogsDetail: {
+        qualifyingOrders: validOrders.length,
+        lineItems: regularCogsLineItems,
+        fromOrderSnapshot: cogsFromOrderSnapshot,
+        fromCatalogFallback: cogsFromCatalogFallback,
+        breakdown: regularCogsBreakdown,
+      },
       sampleOrders: {
         count: sampleOrderCount,
         ordersWithCogs: sampleOrdersWithCogs.size,
@@ -771,7 +894,8 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
     };
   }, [products, orders, dateRange, dataVersion, timezone]);
 
-  const formatCurrency = (num: number): string => {
+  const formatCurrency = (num: number | null): string => {
+    if (num === null) return '—';
     return `$${Math.abs(num).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
   };
 
@@ -783,6 +907,248 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
   const financials = useMemo(() => {
     const startTs = getShopDayStartTimestamp(dateRange.startDate, timezone);
     const endTs = getShopDayStartTimestamp(dateRange.endDate, timezone) + 86400;
+
+    /** No order/product API data — P&amp;L from TikTok statements + marketing sync only. */
+    if (!operationalShopData) {
+      const statementGrossSales =
+        typeof plData?.statement_totals?.total_gross_sales === 'number' &&
+        Number.isFinite(plData.statement_totals.total_gross_sales)
+          ? plData.statement_totals.total_gross_sales
+          : (() => {
+              if (!plData || !(Number(plData.transaction_count) > 0)) {
+                return plData?.statement_totals?.total_revenue ?? 0;
+              }
+              const rev = plData.revenue || {};
+              const sb = Number(rev.subtotal_before_discount ?? 0);
+              if (Math.abs(sb) >= PL_AMOUNT_EPS) return sb;
+              const br = sb + Number(rev.refund_subtotal_before_discount ?? 0);
+              if (Math.abs(br) >= PL_AMOUNT_EPS) return br;
+              const tr = Number(plData.total_revenue ?? 0);
+              if (Math.abs(tr) >= PL_AMOUNT_EPS) return tr;
+              return plData?.statement_totals?.total_revenue ?? 0;
+            })();
+
+      const netRevenue = plData?.statement_totals?.total_net_sales ?? 0;
+      const grossSalesGMV = statementGrossSales;
+      const totalOrderAmount = 0;
+      const totalTax = 0;
+      const totalProductTax = 0;
+      const totalShippingTax = 0;
+      const refunds = 0;
+
+      const platformFeesNet = netByKeys(plData?.fees, platformFeeKeys);
+      const platformFeesSum = expenseFromNet(platformFeesNet);
+      const tiktokCommission = platformFeesSum > 0 ? platformFeesSum : netRevenue * 0.06;
+      const autoAffiliateNet = netByKeys(plData?.fees, affiliateFeeKeys);
+      const autoAffiliateCommission = expenseFromNet(autoAffiliateNet);
+      const manualAffiliateRetainers = affiliateSettlementsInRange.reduce((sum, s) => sum + Number(s.amount), 0);
+      const totalAffiliateCost = autoAffiliateCommission + manualAffiliateRetainers;
+      const plCustomBcStmt = plData?.custom_line_items?.by_category;
+      const customOpExStmt =
+        Number(plCustomBcStmt?.expenses ?? 0) + Number(plCustomBcStmt?.supplementary ?? 0);
+      const customCogsStmt = Number(plCustomBcStmt?.cogs ?? 0);
+
+      const totalCogs = 0;
+      const totalProductShippingCost = 0;
+      /** No order/COGS-backed profit in statements-only mode — heroes use statement totals only. */
+      const grossProfit = 0;
+
+      const shippingCosts = plData?.shipping
+        ? shippingTotalForOperatingExpenses(plData.shipping)
+        : Math.abs(plData?.statement_totals?.total_shipping ?? 0);
+      const shopAdsNet = netByKeys(plData?.fees, adSpendFeeKeys);
+      const shopAdsFees = expenseFromNet(shopAdsNet);
+      const spendEnd = dateRange.endDate + 'T23:59:59';
+      const syncedMarketingSpend = marketingDaily
+        .filter((d: any) => d.spend_date >= dateRange.startDate && d.spend_date <= spendEnd)
+        .reduce((sum: number, d: any) => sum + (parseFloat(d.total_spend) || 0), 0);
+      const syncedMarketingConversionValue = marketingDaily
+        .filter((d: any) => d.spend_date >= dateRange.startDate && d.spend_date <= spendEnd)
+        .reduce((sum: number, d: any) => sum + (parseFloat(d.conversion_value) || 0), 0);
+      const adSpend = syncedMarketingSpend;
+      const adConversionValue = syncedMarketingConversionValue;
+      const adROAS = adSpend > 0 ? adConversionValue / adSpend : 0;
+
+      const {
+        total: totalAgencyFees,
+        lines: agencyFeeLines,
+        summaryNotes: agencyFeeSummaryNotes,
+      } = computeAgencyFeesRollup(
+        agencyFees,
+        dateRange.startDate,
+        dateRange.endDate,
+        timezone,
+        { grossSalesGMV: statementGrossSales, netRevenue, grossProfit }
+      );
+
+      let realOperatingExpenses = 0;
+      let feesBase = 0;
+      let shippingBase = 0;
+      if (plData && plData.statement_totals) {
+        feesBase = plData.total_fee_tax != null
+          ? Math.abs(plData.total_fee_tax)
+          : Math.abs(plData.statement_totals.total_fees);
+        shippingBase = plData.shipping
+          ? shippingTotalForOperatingExpenses(plData.shipping)
+          : Math.abs(plData.statement_totals.total_shipping);
+        realOperatingExpenses = feesBase + shippingBase - shopAdsFees - autoAffiliateCommission + totalAgencyFees + customOpExStmt;
+      } else {
+        realOperatingExpenses = tiktokCommission + shippingCosts + totalAgencyFees + customOpExStmt;
+      }
+
+      const heroGmvLines: { label: string; value: number }[] = [];
+      if (plData?.revenue && Number(plData.transaction_count) > 0) {
+        const rev = plData.revenue;
+        const pushIf = (label: string, key: string) => {
+          const v = Number((rev as Record<string, number>)[key] ?? 0);
+          if (Math.abs(v) >= PL_AMOUNT_EPS) heroGmvLines.push({ label, value: v });
+        };
+        pushIf('Subtotal before discount', 'subtotal_before_discount');
+        pushIf('Refund subtotal before discount', 'refund_subtotal_before_discount');
+        if (heroGmvLines.length === 0) {
+          heroGmvLines.push({ label: 'Gross sales (statement transactions)', value: statementGrossSales });
+        }
+      } else {
+        heroGmvLines.push({ label: 'Gross sales (TikTok statements)', value: statementGrossSales });
+      }
+
+      /** Net sales drill-down: revenue lines from synced statement transactions only (no COGS/affiliate walk). */
+      const heroGrossProfitLines: { label: string; value: number; emphasis?: 'total' }[] = [];
+      if (plData?.revenue && Number(plData.transaction_count) > 0) {
+        const rev = plData.revenue as Record<string, number>;
+        const pushRev = (label: string, key: string) => {
+          const v = Number(rev[key] ?? 0);
+          if (Math.abs(v) >= PL_AMOUNT_EPS) heroGrossProfitLines.push({ label, value: v });
+        };
+        pushRev('Gross sales', 'subtotal_before_discount');
+        pushRev('Gross sales refund', 'refund_subtotal_before_discount');
+        pushRev('Seller discount', 'seller_discount');
+        pushRev('Seller discount refund', 'seller_discount_refund');
+      }
+      if (heroGrossProfitLines.length === 0) {
+        heroGrossProfitLines.push({ label: 'Gross sales (statement rollup)', value: statementGrossSales });
+      }
+      heroGrossProfitLines.push({ label: 'Net sales (statement rollup)', value: netRevenue, emphasis: 'total' });
+
+      const packagingSupplies = 0;
+      const totalTaxes = plData?.taxes ? Object.values(plData.taxes).reduce((sum, v) => sum + Math.abs(v), 0) : 0;
+      const totalExpenses = realOperatingExpenses + adSpend;
+      const operatingExpensesBeforeExclusion = totalExpenses + totalCogs + customCogsStmt + totalAffiliateCost;
+      const grossMargin = 0;
+      const roi = 0;
+      const grossProfitPct = 0;
+      const operatingIncome = 0;
+      const operatingIncomePct = 0;
+      const totalUnitsSold = 0;
+      const netProfit = 0;
+
+      /** Settlement drill-down: statement_totals only (not a reconciled accounting identity). */
+      const st = plData?.statement_totals;
+      const settlementAmt = st?.total_settlement ?? 0;
+      const heroNetProfitLines: { label: string; value: number; emphasis?: 'subtotal' | 'total' }[] = [];
+      if (st) {
+        heroNetProfitLines.push({ label: 'Net sales (statement)', value: st.total_net_sales ?? netRevenue });
+        heroNetProfitLines.push({ label: 'Total fees (statement)', value: -Math.abs(st.total_fees ?? 0) });
+        heroNetProfitLines.push({ label: 'Total shipping (statement)', value: -Math.abs(st.total_shipping ?? 0) });
+        const adj = st.total_adjustments ?? 0;
+        if (Math.abs(adj) >= PL_AMOUNT_EPS) {
+          heroNetProfitLines.push({ label: 'Adjustments (statement, net)', value: adj });
+        }
+        heroNetProfitLines.push({ label: 'Total settlement (statement)', value: settlementAmt, emphasis: 'total' });
+      } else {
+        heroNetProfitLines.push({ label: 'Total settlement (statement)', value: settlementAmt, emphasis: 'total' });
+      }
+
+      const serviceFeesResidual = plData
+        ? Math.max(
+            0,
+            Math.abs(plData.total_fee_tax ?? plData.statement_totals?.total_fees ?? 0) -
+              platformFeesSum -
+              autoAffiliateCommission -
+              shopAdsFees,
+          )
+        : 0;
+
+      let serviceFeeItems: { label: string; value: number }[] = [];
+      if (plData && plData.fees) {
+        const itemizedServiceFees = Object.keys(plData.fees)
+          .filter(
+            (k) =>
+              !isPlatformFeeKey(k) &&
+              !isAffiliateCogsFeeKey(k) &&
+              !isAdSpendFeeKey(k) &&
+              Math.abs(plData.fees[k]) > 0,
+          )
+          .map((k) => ({
+            label: k.replace(/_/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase()),
+            value: Math.abs(plData.fees[k]),
+          }))
+          .sort((a, b) => b.value - a.value);
+
+        const itemizedSum = itemizedServiceFees.reduce((sum, item) => sum + item.value, 0);
+        const diff = serviceFeesResidual - itemizedSum;
+        serviceFeeItems = [...itemizedServiceFees];
+        if (diff > 0.05) {
+          serviceFeeItems.push({ label: 'Other Uncategorized Fees', value: diff });
+        }
+      }
+
+      return {
+        totalOrderAmount,
+        totalTax,
+        totalProductTax,
+        totalShippingTax,
+        grossSalesGMV,
+        refunds,
+        netRevenue,
+        totalCogs,
+        totalProductShippingCost,
+        grossProfit,
+        tiktokCommission,
+        shippingCosts,
+        adSpend,
+        packagingSupplies,
+        totalExpenses,
+        netProfit,
+        grossMargin,
+        roi,
+        adConversionValue,
+        adROAS,
+        totalUnitsSold,
+        realOperatingExpenses,
+        fbtFeesFromOrders: 0,
+        gmvOriginalProductPrice: 0,
+        gmvShippingFees: 0,
+        gmvSellerDiscounts: 0,
+        gmvPlatformDiscounts: 0,
+        manualAffiliateRetainers,
+        autoAffiliateCommission,
+        totalAffiliateCost,
+        shopAdsFees,
+        totalAgencyFees,
+        agencyFeeLines,
+        agencyFeeSummaryNotes,
+        hasTransactionData: plData?.meta?.has_complete_data || false,
+        totalFees: Math.abs(plData?.statement_totals?.total_fees || 0) - shopAdsFees - autoAffiliateCommission,
+        totalShipping: Math.abs(plData?.statement_totals?.total_shipping || 0),
+        settlementAmount: plData?.statement_totals?.total_settlement || 0,
+        statementNetSales: plData?.statement_totals?.total_net_sales ?? 0,
+        statementGrossSales,
+        platformFees: platformFeesSum,
+        fbtFees: 0,
+        serviceFees: serviceFeesResidual,
+        serviceFeeItems,
+        totalTaxes,
+        operatingExpenses: totalExpenses,
+        operatingExpensesBeforeExclusion,
+        grossProfitPct,
+        operatingIncome,
+        operatingIncomePct,
+        heroGmvLines,
+        heroGrossProfitLines,
+        heroNetProfitLines,
+      };
+    }
 
     // Calculate Gross Sales (GMV) from orders in range.
     // When includeCancelledFinancials is false, cancelled/refunded orders are excluded so
@@ -845,11 +1211,22 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
     // Calculate Manual Affiliate Retainers
     const manualAffiliateRetainers = affiliateSettlementsInRange.reduce((sum, s) => sum + Number(s.amount), 0);
 
-    // Total Affiliate Cost (treated as COGS - deducted from revenue to get Gross Profit)
+    // Total affiliate payout (creator/affiliate fees + manual retainers) — deducted for gross profit, shown separately from product COGS in UI
     const totalAffiliateCost = autoAffiliateCommission + manualAffiliateRetainers;
 
-    // Gross Profit = Net Revenue - COGS - Affiliate Commissions (affiliate treated as cost of goods)
-    const grossProfit = netRevenue - totalCogs - totalProductShippingCost - totalAffiliateCost;
+    const plCustomBc = plData?.custom_line_items?.by_category;
+    const customPlRevenue = Number(plCustomBc?.revenue ?? 0);
+    const customPlCogs = Number(plCustomBc?.cogs ?? 0);
+    const customPlOpEx = Number(plCustomBc?.expenses ?? 0) + Number(plCustomBc?.supplementary ?? 0);
+
+    // Gross Profit = Net Revenue − Product COGS − Product shipping − Affiliate commission
+    const grossProfit =
+      netRevenue +
+      customPlRevenue -
+      totalCogs -
+      customPlCogs -
+      totalProductShippingCost -
+      totalAffiliateCost;
 
     // Shipping Costs: prefer settlement transaction shipping net when available (more accurate than order-level estimate)
     const shippingCostsFallbackFromOrders = allOrdersInRange.reduce((sum, o) => {
@@ -915,10 +1292,10 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
         ? shippingTotalForOperatingExpenses(plData.shipping)
         : Math.abs(plData.statement_totals.total_shipping);
       // FBT fulfillment fees are excluded from operating expenses (shown as informational only in dropdown)
-      realOperatingExpenses = feesBase + shippingBase - shopAdsFees - autoAffiliateCommission + totalAgencyFees;
+      realOperatingExpenses = feesBase + shippingBase - shopAdsFees - autoAffiliateCommission + totalAgencyFees + customPlOpEx;
     } else {
       // Fallback: Estimates if no statement data
-      realOperatingExpenses = tiktokCommission + shippingCosts + totalAgencyFees;
+      realOperatingExpenses = tiktokCommission + shippingCosts + totalAgencyFees + customPlOpEx;
     }
 
     const heroGmvLines: { label: string; value: number }[] = [
@@ -930,10 +1307,20 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
 
     const heroGrossProfitLines: { label: string; value: number }[] = [
       { label: 'Net revenue (orders, after refunds)', value: netRevenue },
+    ];
+    if (Math.abs(customPlRevenue) >= PL_AMOUNT_EPS) {
+      heroGrossProfitLines.push({ label: 'Custom P&L revenue', value: customPlRevenue });
+    }
+    heroGrossProfitLines.push(
       { label: 'Product COGS', value: -totalCogs },
+    );
+    if (Math.abs(customPlCogs) >= PL_AMOUNT_EPS) {
+      heroGrossProfitLines.push({ label: 'Custom P&L COGS', value: -customPlCogs });
+    }
+    heroGrossProfitLines.push(
       { label: 'Product shipping cost', value: -totalProductShippingCost },
       { label: 'Affiliate commissions (auto + manual)', value: -totalAffiliateCost },
-    ];
+    );
 
     // Packaging/Supplies (manual input - not available yet, set to 0)
     const packagingSupplies = 0;
@@ -941,19 +1328,31 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
     // Calculate taxes sum from plData
     const totalTaxes = plData?.taxes ? Object.values(plData.taxes).reduce((sum, v) => sum + Math.abs(v), 0) : 0;
 
-    // Operating Expenses = platform fees + shipping + agency fees + ad spend (affiliate moved to COGS)
+    // Operating Expenses = platform fees + shipping + agency fees + ad spend (affiliate commission handled in gross profit, not here)
     const totalExpenses = realOperatingExpenses + adSpend;
+    /** Sum of OpEx-for-net-profit plus COGS and affiliate — reconciles adding every row in the Operating Expenses section. */
+    const operatingExpensesBeforeExclusion = totalExpenses + totalCogs + customPlCogs + totalAffiliateCost;
 
     // Operating Income = Gross Profit - Operating Expenses
     const netProfit = grossProfit - totalExpenses;
 
     const heroNetProfitLines: { label: string; value: number; emphasis?: 'subtotal' | 'total' }[] = [
       { label: 'Net revenue (orders, after refunds)', value: netRevenue },
+    ];
+    if (Math.abs(customPlRevenue) >= PL_AMOUNT_EPS) {
+      heroNetProfitLines.push({ label: 'Custom P&L revenue', value: customPlRevenue });
+    }
+    heroNetProfitLines.push(
       { label: 'Product COGS', value: -totalCogs },
+    );
+    if (Math.abs(customPlCogs) >= PL_AMOUNT_EPS) {
+      heroNetProfitLines.push({ label: 'Custom P&L COGS', value: -customPlCogs });
+    }
+    heroNetProfitLines.push(
       { label: 'Product shipping cost', value: -totalProductShippingCost },
       { label: 'Affiliate commissions (auto + manual)', value: -totalAffiliateCost },
       { label: 'Gross profit', value: grossProfit, emphasis: 'subtotal' },
-    ];
+    );
 
     if (plData && plData.statement_totals) {
       heroNetProfitLines.push(
@@ -971,12 +1370,19 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
       );
     }
 
+    if (Math.abs(customPlOpEx) >= PL_AMOUNT_EPS) {
+      heroNetProfitLines.push({ label: 'Custom P&L (expenses + supplementary)', value: -customPlOpEx });
+    }
+
     heroNetProfitLines.push(
       { label: 'Marketing ad spend (synced)', value: -adSpend },
       { label: 'Net profit', value: netProfit, emphasis: 'total' },
     );
     const grossMargin = netRevenue > 0 ? (grossProfit / netRevenue) * 100 : 0;
-    const roi = (totalCogs + totalProductShippingCost + totalAffiliateCost + totalExpenses) > 0 ? (netProfit / (totalCogs + totalProductShippingCost + totalAffiliateCost + totalExpenses)) * 100 : 0;
+    const roi =
+      (totalCogs + customPlCogs + totalProductShippingCost + totalAffiliateCost + totalExpenses) > 0
+        ? (netProfit / (totalCogs + customPlCogs + totalProductShippingCost + totalAffiliateCost + totalExpenses)) * 100
+        : 0;
 
     // Gross Profit % and Operating Income metrics
     const grossProfitPct = grossMargin; // GP / Net Revenue * 100
@@ -1061,12 +1467,35 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
         totalShipping: Math.abs(plData?.statement_totals?.total_shipping || 0),
         settlementAmount: plData?.statement_totals?.total_settlement || 0,
         statementNetSales: plData?.statement_totals?.total_net_sales ?? 0,
+        /**
+         * Statement gross sales: Seller Center row = summed `subtotal_before_discount` from synced transactions,
+         * not Σ `revenue_amount` (often equals Net sales).
+         */
+        statementGrossSales:
+          typeof plData?.statement_totals?.total_gross_sales === 'number' &&
+          Number.isFinite(plData.statement_totals.total_gross_sales)
+            ? plData.statement_totals.total_gross_sales
+            : (() => {
+                if (!plData || !(Number(plData.transaction_count) > 0)) {
+                  return plData?.statement_totals?.total_revenue ?? 0;
+                }
+                const rev = plData.revenue || {};
+                const sb = Number(rev.subtotal_before_discount ?? 0);
+                if (Math.abs(sb) >= PL_AMOUNT_EPS) return sb;
+                const br =
+                  sb + Number(rev.refund_subtotal_before_discount ?? 0);
+                if (Math.abs(br) >= PL_AMOUNT_EPS) return br;
+                const tr = Number(plData.total_revenue ?? 0);
+                if (Math.abs(tr) >= PL_AMOUNT_EPS) return tr;
+                return plData?.statement_totals?.total_revenue ?? 0;
+              })(),
         platformFees: platformFeesSum,
         fbtFees: totalFbtFees,
         serviceFees: serviceFeesResidual,
         serviceFeeItems,
         totalTaxes,
         operatingExpenses: totalExpenses,
+        operatingExpensesBeforeExclusion,
         grossProfitPct,
         operatingIncome,
         operatingIncomePct,
@@ -1074,7 +1503,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
         heroGrossProfitLines,
         heroNetProfitLines,
       };
-  }, [orders, cogsStats, dateRange, dataVersion, affiliateSettlementsInRange, agencyFees, plData, includeCancelledFinancials, marketingDaily, timezone]);
+  }, [operationalShopData, orders, cogsStats, dateRange, dataVersion, affiliateSettlementsInRange, agencyFees, plData, includeCancelledFinancials, marketingDaily, timezone]);
 
   // Destructure for easier usage in render
   const {
@@ -1155,8 +1584,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
 
   // Today / Yesterday quick-select handlers
   const handleTodayClick = useCallback(() => {
-    const today = new Date();
-    const todayStr = formatShopDateISO(today, timezone);
+    const todayStr = formatShopDateISO(new Date(), timezone);
     applyDateRange({ startDate: todayStr, endDate: todayStr });
   }, [timezone, applyDateRange]);
 
@@ -1166,16 +1594,14 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
   };
 
   const handleYesterdayClick = useCallback(() => {
-    const yesterday = new Date();
-    yesterday.setDate(yesterday.getDate() - 1);
-    const yesterdayStr = formatShopDateISO(yesterday, timezone);
+    const todayStr = formatShopDateISO(new Date(), timezone);
+    const yesterdayStr = previousCalendarDayISO(todayStr, timezone);
     applyDateRange({ startDate: yesterdayStr, endDate: yesterdayStr });
   }, [timezone, applyDateRange]);
 
   const isYesterdayActive = () => {
-    const yesterday = new Date();
-    yesterday.setDate(yesterday.getDate() - 1);
-    const yesterdayStr = formatShopDateISO(yesterday, timezone);
+    const todayStr = formatShopDateISO(new Date(), timezone);
+    const yesterdayStr = previousCalendarDayISO(todayStr, timezone);
     return dateRange.startDate === yesterdayStr && dateRange.endDate === yesterdayStr;
   };
 
@@ -1186,6 +1612,10 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
       headers: ['Metric', 'Value'],
       rows: [
         ['Date Range', `${dateRange.startDate} to ${dateRange.endDate}`],
+        [
+          'Date basis',
+          'TikTok settlement block: settlement_time (matches Seller Center). Order-based sections: paid_time. Shop timezone.',
+        ],
         ['Shop', account.name],
         ['Export Date', new Date().toLocaleDateString()],
         ['', ''],
@@ -1196,7 +1626,24 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
           timezoneLabel: timezone,
         }),
 
-        // ===== MAMBA P&L (orders + statements) ═══
+        ...(canViewCustomLineItems && !isRestricted('custom_line_items') && customPlPayload?.lines?.length
+          ? ([
+              ['═══ CUSTOM P&L (manual) ═══', ''],
+              ...customPlPayload.lines.map((ln) => [ln.name, formatCurrency(ln.amount_in_range)] as [string, string]),
+              ...((plData?.financial_visibility?.restricted_custom_pl_line_item_ids?.length ?? 0) > 0
+                ? ([
+                    [
+                      'Visibility note',
+                      'Some custom lines may be withheld for certain roles by line-level policy; omitted lines are not shown here.',
+                    ],
+                  ] as [string, string][])
+                : []),
+              ['', ''],
+            ] as [string, string][])
+          : []),
+
+        ...(operationalShopData
+          ? ([
         ['═══ REVENUE (order-based) ═══', ''],
         ['Gross Sales (GMV)', formatCurrency(financials.grossSalesGMV)],
         ['  Original Product Price', formatCurrency(financials.gmvOriginalProductPrice)],
@@ -1206,6 +1653,13 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
         ['Returns & Refunds', `-${formatCurrency(financials.refunds)}`],
         ['Net Revenue', formatCurrency(financials.netRevenue)],
         ['', ''],
+          ] as [string, string][])
+          : ([
+        ['═══ REVENUE (TikTok statements) ═══', ''],
+        ['Gross sales (statement sync)', formatCurrency(financials.grossSalesGMV)],
+        ['Net sales (statement sync)', formatCurrency(financials.netRevenue)],
+        ['', ''],
+          ] as [string, string][])),
 
         // ===== OPERATING EXPENSES =====
         ['═══ OPERATING EXPENSES ═══', ''],
@@ -1254,50 +1708,81 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
         ['Packaging & Supplies', `-${formatCurrency(financials.packagingSupplies)}`],
         ['', ''],
 
-        ['Total Operating Expenses', `-${formatCurrency(financials.totalExpenses)}`],
+        ['Total Operating Expenses (before exclusion, incl. COGS & affiliate)', `-${formatCurrency(financials.operatingExpensesBeforeExclusion)}`],
+        ['Total Operating Expenses (after exclusion, OpEx for net profit)', `-${formatCurrency(financials.totalExpenses)}`],
         ['', ''],
 
-        // FBT Fees (Informational)
+        ...(operationalShopData
+          ? ([
         ['FBT (Non-Shipping) Fees', `-${formatCurrency(financials.fbtFeesFromOrders || 0)}`],
         ['  FBT Orders with Fees', orders.filter(o => o.fbt_fulfillment_fee && o.fbt_fulfillment_fee > 0).length.toString()],
         ['', ''],
+          ] as [string, string][])
+          : []),
 
-        // ===== COST OF GOODS SOLD =====
-        ['═══ COST OF GOODS SOLD ═══', ''],
-        ['Total COGS', `-${formatCurrency(financials.totalCogs)}`],
+        ...(operationalShopData
+          ? ([
+        ['═══ PRODUCT COGS ═══', ''],
+        ['Total product COGS', `-${formatCurrency(financials.totalCogs)}`],
         ['  Regular Orders COGS', `-${formatCurrency(financials.totalCogs - cogsStats.sampleOrders.totalCogsValue)}`],
         ['  Regular Orders Count', (orders.filter(o => !o.is_sample_order && getOrderTs(o) >= getShopDayStartTimestamp(dateRange.startDate, timezone) && getOrderTs(o) < getShopDayStartTimestamp(dateRange.endDate, timezone) + 86400).length - cogsStats.sampleOrders.count).toString()],
         ['  Regular Orders Units', (financials.totalUnitsSold - cogsStats.sampleOrders.totalProducts).toString()],
         ['  Sample Orders COGS', `-${formatCurrency(cogsStats.sampleOrders.totalCogsValue)}`],
         ['  Sample Orders Count', cogsStats.sampleOrders.count.toString()],
         ['  Sample Orders Units', cogsStats.sampleOrders.totalProducts.toString()],
+        ['', ''],
+          ] as [string, string][])
+          : []),
+        ['═══ AFFILIATE COMMISSION ═══', ''],
+        ['Total affiliate commission (auto + manual)', `-${formatCurrency(financials.totalAffiliateCost)}`],
+        ['', ''],
+        ...(operationalShopData
+          ? ([
         ['Gross Profit', formatCurrency(financials.grossProfit)],
         ['Gross Margin', formatPercent(financials.grossMargin)],
         ['', ''],
+          ] as [string, string][])
+          : []),
 
         // ===== PROFITABILITY =====
         ['═══ PROFITABILITY ═══', ''],
+        ...(operationalShopData
+          ? ([
+        ['TikTok statement gross sales (reference)', formatCurrency(financials.statementGrossSales)],
         ['TikTok statement net sales (reference)', formatCurrency(financials.statementNetSales)],
         ['Total Settlement Amount (TikTok)', formatCurrency(financials.settlementAmount)],
         ['Net Profit', formatCurrency(financials.netProfit)],
         ['ROI', formatPercent(financials.roi)],
+          ] as [string, string][])
+          : ([
+        ['TikTok statement gross sales', formatCurrency(financials.statementGrossSales)],
+        ['TikTok statement net sales', formatCurrency(financials.statementNetSales)],
+        ['Total Settlement Amount (TikTok)', formatCurrency(financials.settlementAmount)],
+        ['Order-based profit metrics', 'Omitted — shop order data not loaded for this role'],
+          ] as [string, string][])),
         ['Ad ROAS', financials.adROAS.toFixed(2) + 'x'],
         ['', ''],
 
-        // ===== ORDER STATISTICS =====
+        ...(operationalShopData
+          ? ([
         ['═══ ORDER STATISTICS ═══', ''],
         ['Total Units Sold', financials.totalUnitsSold.toString()],
         ['Regular Orders', (orders.filter(o => !o.is_sample_order && getOrderTs(o) >= getShopDayStartTimestamp(dateRange.startDate, timezone) && getOrderTs(o) < getShopDayStartTimestamp(dateRange.endDate, timezone) + 86400).length - cogsStats.sampleOrders.count).toString()],
         ['Sample Orders', cogsStats.sampleOrders.count.toString()],
         ['FBT Orders', orders.filter(o => o.is_fbt).length.toString()],
         ['Seller Fulfilled Orders', orders.filter(o => !o.is_fbt).length.toString()],
+          ] as [string, string][])
+          : []),
       ]
     };
+
+    const restrictionNoticeParts: string[] = [];
 
     if (!canViewCogs || !canViewMargin) {
       const blocked = new Set<string>();
       if (!canViewCogs) {
-        blocked.add('Total COGS');
+        blocked.add('═══ PRODUCT COGS ═══');
+        blocked.add('Total product COGS');
         blocked.add('  Regular Orders COGS');
         blocked.add('  Sample Orders COGS');
         blocked.add('Product Costs (COGS)');
@@ -1306,17 +1791,41 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
         blocked.add('Gross Margin');
       }
       exportData.rows = exportData.rows.filter((r) => !blocked.has(String(r[0])));
+      restrictionNoticeParts.push('Some financial fields were excluded by seller visibility policy.');
+    }
+    if (!canViewCustomLineItems || isRestricted('custom_line_items')) {
+      const customNames = new Set((customPlPayload?.lines ?? []).map((l) => l.name));
+      customNames.add('═══ CUSTOM P&L (manual) ═══');
+      exportData.rows = exportData.rows.filter((r) => {
+        const k = String(r[0]);
+        if (customNames.has(k)) return false;
+        if (k === 'Visibility note' && String(r[1]).includes('line-level policy')) return false;
+        return true;
+      });
+      restrictionNoticeParts.push('Custom P&L line detail was excluded by seller visibility policy.');
+    }
+    if (restrictionNoticeParts.length > 0) {
       exportData.rows.push(['', '']);
-      exportData.rows.push(['Restriction Notice', 'Some financial fields were excluded by seller visibility policy.']);
+      exportData.rows.push(['Restriction Notice', restrictionNoticeParts.join(' ')]);
     }
     const restrictedFieldLabels: Record<string, string[]> = {
       platform_fees: ['Platform Fees'],
       agency_fees: ['Agency Fees'],
       ad_spend: ['Ad Spend'],
       shipping_costs: ['Shipping Costs'],
-      affiliate_commissions: ['Affiliate Fees', 'Affiliate Commissions'],
+      affiliate_commissions: [
+        'Affiliate Fees',
+        'Affiliate Commissions',
+        '═══ AFFILIATE COMMISSION ═══',
+        'Total affiliate commission (auto + manual)',
+      ],
       gross_profit: ['Gross Profit'],
       net_profit: ['Net Profit'],
+      custom_line_items: [
+        '═══ CUSTOM P&L (manual) ═══',
+        'Visibility note',
+        ...(customPlPayload?.lines ?? []).map((l) => l.name),
+      ],
     };
     const policyFields = Array.isArray(plData?.financial_visibility?.restricted_fields)
       ? plData!.financial_visibility!.restricted_fields!
@@ -1354,7 +1863,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
         );
         break;
     }
-  }, [dateRange, financials, account.name, cogsStats, plData, orders, timezone, sellerBrand.displayName, sellerBrand.primaryColor, canViewCogs, canViewMargin]);
+  }, [operationalShopData, dateRange, financials, account.name, cogsStats, plData, orders, timezone, sellerBrand.displayName, sellerBrand.primaryColor, canViewCogs, canViewMargin, canViewCustomLineItems, isRestricted, customPlPayload]);
 
 
   // Simulated P&L calculation
@@ -1427,7 +1936,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
     serviceFees,
     serviceFeeItems,
     operatingExpenses,
-    grossProfitPct,
+    operatingExpensesBeforeExclusion,
     operatingIncome,
     operatingIncomePct,
     netProfit,
@@ -1651,117 +2160,48 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
             )}
           </div>
 
-          <button
-            onClick={handleTodayClick}
-            className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all border ${isTodayActive()
-              ? 'bg-gray-600 hover:bg-gray-500 text-white border-gray-500 shadow-md shadow-black/20'
-              : 'bg-gray-800 border-gray-700 text-gray-300 hover:bg-gray-700 hover:text-white hover:border-gray-600'
-              }`}
-          >
-            <Calendar className={`w-4 h-4 ${isTodayActive() ? 'text-white' : 'text-gray-400'}`} />
-            Today
-          </button>
-          <button
-            onClick={handleYesterdayClick}
-            className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all border ${isYesterdayActive()
-              ? 'bg-gray-600 hover:bg-gray-500 text-white border-gray-500 shadow-md shadow-black/20'
-              : 'bg-gray-800 border-gray-700 text-gray-300 hover:bg-gray-700 hover:text-white hover:border-gray-600'
-              }`}
-          >
-            <Calendar className={`w-4 h-4 ${isYesterdayActive() ? 'text-white' : 'text-gray-400'}`} />
-            Yesterday
-          </button>
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              onClick={handleTodayClick}
+              className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-semibold transition-all border ${isTodayActive()
+                ? 'bg-mamba-green hover:bg-mamba-deep text-mamba-dark border-mamba-green shadow-md shadow-mamba-green/35'
+                : 'bg-gray-800 border-gray-700 text-gray-300 hover:bg-gray-700 hover:text-white hover:border-gray-600'
+                }`}
+            >
+              <Calendar className={`w-4 h-4 ${isTodayActive() ? 'text-mamba-dark' : 'text-gray-400'}`} />
+              Today
+            </button>
+            <button
+              type="button"
+              onClick={handleYesterdayClick}
+              className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-semibold transition-all border ${isYesterdayActive()
+                ? 'bg-mamba-green hover:bg-mamba-deep text-mamba-dark border-mamba-green shadow-md shadow-mamba-green/35'
+                : 'bg-gray-800 border-gray-700 text-gray-300 hover:bg-gray-700 hover:text-white hover:border-gray-600'
+                }`}
+            >
+              <Calendar className={`w-4 h-4 ${isYesterdayActive() ? 'text-mamba-dark' : 'text-gray-400'}`} />
+              Yesterday
+            </button>
 
-          <DateRangePicker value={dateRange} onChange={applyDateRange} />
-        </div>
-      </div>
-
-      {(plOrdersLoadProgress || plLoading) && shopId && (
-        <div
-          role="status"
-          aria-live="polite"
-          className={`rounded-xl border px-4 py-3 text-sm ${
-            plOrdersLoadProgress?.kind === 'incomplete'
-              ? 'border-amber-500/35 bg-amber-500/10 text-amber-100/95'
-              : 'border-gray-700 bg-gray-800/80 text-gray-300'
-          }`}
-        >
-          <div className="flex items-start gap-3">
-            {plOrdersLoadProgress?.kind === 'incomplete' ? (
-              <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-400" aria-hidden />
-            ) : (
-              <Loader2 className="w-4 h-4 shrink-0 mt-0.5 text-gray-400 animate-spin" aria-hidden />
-            )}
-            <div className="flex-1 min-w-0 space-y-2">
-              {plOrdersLoadProgress?.kind === 'loading' && (
-                <>
-                  {plOrdersLoadProgress.httpWait ? (
-                    <p className="text-gray-200">
-                      Fetching orders for this range ({plOrdersLoadProgress.totalDays} calendar day
-                      {plOrdersLoadProgress.totalDays === 1 ? '' : 's'})…
-                    </p>
-                  ) : (
-                    <>
-                      <p className="text-gray-200 leading-relaxed">
-                        Showing roughly{' '}
-                        <span className="font-semibold text-white tabular-nums">{plOrdersLoadProgress.estDaysShown}</span>
-                        {' '}of{' '}
-                        <span className="font-semibold text-white tabular-nums">{plOrdersLoadProgress.totalDays}</span>
-                        {' '}day{plOrdersLoadProgress.totalDays === 1 ? '' : 's'} of history in view —{' '}
-                        <span className="tabular-nums">{plOrdersLoadProgress.ordersLoaded.toLocaleString()}</span>
-                        {' / '}
-                        <span className="tabular-nums">{plOrdersLoadProgress.ordersExpected.toLocaleString()}</span>
-                        {' '}orders
-                        {plOrdersLoadProgress.estDaysRemaining > 0 ? (
-                          <>
-                            {' '}
-                            · about{' '}
-                            <span className="font-semibold brand-metric-zero tabular-nums">
-                              {plOrdersLoadProgress.estDaysRemaining}
-                            </span>
-                            {' '}
-                            more day{plOrdersLoadProgress.estDaysRemaining === 1 ? '' : 's'} still loading
-                          </>
-                        ) : null}
-                        .
-                      </p>
-                      <div className="h-1 rounded-full bg-gray-700/80 overflow-hidden">
-                        <div
-                          className="h-full rounded-full bg-gray-400 transition-[width] duration-300 ease-out"
-                          style={{ width: `${Math.round(Math.min(1, plOrdersLoadProgress.ratio) * 100)}%` }}
-                        />
-                      </div>
-                      <p className="text-[11px] text-gray-500 leading-snug">
-                        Day coverage is estimated from order load progress (batches of up to 500) versus the total
-                        expected for this date range; numbers update as each batch finishes.
-                      </p>
-                    </>
-                  )}
-                </>
-              )}
-              {plOrdersLoadProgress?.kind === 'incomplete' && (
-                <>
-                  <p className="font-medium text-amber-50">Order load stopped early</p>
-                  <p className="text-xs text-amber-100/90 leading-relaxed">{plOrdersLoadProgress.message}</p>
-                  <p className="text-[11px] text-amber-200/70">
-                    Profit &amp; Loss may be missing older orders for this range. Retry from the toolbar or run a sync,
-                    then pick this range again.
-                  </p>
-                </>
-              )}
-              {plLoading && (
-                <p
-                  className={`text-xs text-gray-400 leading-relaxed ${
-                    plOrdersLoadProgress ? 'border-t border-gray-700/60 pt-2 mt-0.5' : ''
-                  }`}
+            <div className="relative inline-flex min-h-[2.5rem] items-stretch self-center">
+              <DateRangePicker value={dateRange} onChange={applyDateRange} timezone={timezone} />
+              {ordersLoadStatusText && (
+                <div
+                  className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center rounded-lg bg-gray-950/70 backdrop-blur-[1px] ring-1 ring-gray-600/40"
+                  aria-live="polite"
+                  role="status"
                 >
-                  Loading statement totals and fee breakdown for this range…
-                </p>
+                  <span className="px-2 text-center text-xs font-medium tabular-nums text-white">
+                    {ordersLoadStatusText}
+                  </span>
+                </div>
               )}
             </div>
+           
           </div>
         </div>
-      )}
+      </div>
 
       {/* Error state */}
       {error && (
@@ -1784,16 +2224,19 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
 
       {/* Loading state - only shown on initial load when no cached data exists */}
       {plLoading && !plData && (
-        <div className="flex justify-center items-center h-64">
-          <div className="animate-spin rounded-full h-12 w-12 border-4 border-gray-500 border-t-transparent"></div>
+        <div className="flex flex-col justify-center items-center h-64 gap-4">
+          <div className="animate-spin rounded-full h-12 w-12 border-4 border-gray-500 border-t-transparent" />
+          {ordersLoadStatusText && (
+            <p className="text-sm text-gray-300 tabular-nums text-center max-w-md px-4">{ordersLoadStatusText}</p>
+          )}
         </div>
       )}
 
       {/* Always show content - no plData check needed for order-based calculations */}
       <>
 
-        {/* COGS Warning */}
-        {canViewCogs && cogsStats.total > 0 && cogsStats.withCogs < cogsStats.total && (
+        {/* COGS Warning — requires order-level product sales */}
+        {operationalShopData && canViewCogs && cogsStats.total > 0 && cogsStats.withCogs < cogsStats.total && (
           <div className="brand-secondary-card rounded-xl p-4 border" style={{ borderColor: 'var(--brand-warning-border)' }}>
             <div className="flex items-start gap-4">
               <div className="w-11 h-11 rounded-lg flex items-center justify-center shrink-0 brand-icon-tile-zero">
@@ -1830,7 +2273,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
           </div>
         )}
 
-        {canViewCogs && cogsStats.total > 0 && cogsStats.withCogs === cogsStats.total && (
+        {operationalShopData && canViewCogs && cogsStats.total > 0 && cogsStats.withCogs === cogsStats.total && (
           <div className="brand-secondary-card rounded-xl p-3 border">
             <div className="flex items-center gap-3">
               <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${plSemanticToIconTileClass('brand-profit')}`}>
@@ -1884,16 +2327,26 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                     <div className="p-2.5 rounded-xl shrink-0 brand-state-info">
                       <DollarSign className="w-6 h-6" />
                     </div>
-                    <p className="brand-muted text-sm font-semibold uppercase tracking-widest">Gross Merchandise Value</p>
+                    <p className="brand-muted text-sm font-semibold uppercase tracking-widest">
+                      {operationalShopData ? 'Gross Merchandise Value' : 'Gross sales (statements)'}
+                    </p>
                   </div>
                   <ChevronDown className={`w-5 h-5 shrink-0 brand-muted mt-1 transition-transform ${expandedHero === 'gmv' ? 'rotate-180' : ''}`} aria-hidden />
                 </div>
                 <p className="text-5xl font-bold brand-text tracking-tight">{formatCurrency(financials.grossSalesGMV)}</p>
-                <p className="brand-muted text-sm mt-3">Total revenue generated from all orders · click for breakdown</p>
+                <p className="brand-muted text-sm mt-3">
+                  {operationalShopData
+                    ? 'Total revenue generated from all orders · click for breakdown'
+                    : 'From synced TikTok settlement transactions · order-level GMV is not loaded for your role'}
+                </p>
               </div>
               {expandedHero === 'gmv' && (
                 <div className="px-6 md:px-8 pb-6 md:pb-8 pt-0 border-t space-y-2 text-sm" style={{ borderColor: 'var(--brand-card-border)' }}>
-                  <p className="brand-muted text-xs uppercase tracking-wide mb-2">How this total is built (orders in date range)</p>
+                  <p className="brand-muted text-xs uppercase tracking-wide mb-2">
+                    {operationalShopData
+                      ? 'How this total is built (orders in date range)'
+                      : 'Rollup from statement transaction revenue'}
+                  </p>
                   {heroGmvLines.map((row, i) => (
                     <div key={i} className="flex justify-between gap-3">
                       <span className="brand-muted">{row.label}</span>
@@ -1903,10 +2356,12 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                     </div>
                   ))}
                   <div className="flex justify-between gap-3 pt-2 border-t mt-2 font-semibold" style={{ borderColor: 'var(--brand-card-border)' }}>
-                    <span className="brand-text">Gross Merchandise Value</span>
+                    <span className="brand-text">
+                      {operationalShopData ? 'Gross Merchandise Value' : 'Gross sales (statements)'}
+                    </span>
                     <span className="font-mono tabular-nums brand-text">{formatCurrency(financials.grossSalesGMV)}</span>
                   </div>
-                  {refunds > 0.005 && (
+                  {operationalShopData && refunds > 0.005 && (
                     <>
                       <div className="flex justify-between gap-3 pt-2">
                         <span className="brand-muted">Refunds (cancelled/refunded orders)</span>
@@ -1922,7 +2377,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
               )}
             </div>
 
-            {/* Gross Profit Card */}
+            {/* Gross profit (orders) or Net sales (statements only) */}
             <div className="brand-card rounded-2xl overflow-hidden">
               <div
                 role="button"
@@ -1942,61 +2397,107 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                     <div className="p-2.5 rounded-xl shrink-0 brand-state-info">
                       <Wallet className="w-6 h-6" />
                     </div>
-                    <p className="brand-muted text-sm font-semibold uppercase tracking-widest truncate">Gross Profit</p>
+                    <p className="brand-muted text-sm font-semibold uppercase tracking-widest truncate">
+                      {operationalShopData ? 'Gross Profit' : 'Net Sales'}
+                    </p>
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
                     <span onClick={e => e.stopPropagation()} className="inline-flex">
                       <CalculationTooltip
-                        source="Calculated in app"
-                        calculation="Net revenue (orders, after refunds) − product COGS − product shipping cost − affiliate commissions (treated as COGS)."
-                        api="TikTok API: none (computed from orders + synced fee rollups)"
+                        source={operationalShopData ? 'Calculated in app' : 'TikTok Shop statements'}
+                        calculation={
+                          operationalShopData
+                            ? 'Net revenue (orders, after refunds) − product COGS − product shipping cost − affiliate commission.'
+                            : 'Net sales from synced settlement data (TikTok statement rollup). No order or COGS allocation.'
+                        }
+                        api={
+                          operationalShopData
+                            ? 'TikTok API: none (computed from orders + synced fee rollups)'
+                            : 'GET /finance/pl-data → statement_totals.total_net_sales'
+                        }
                       />
                     </span>
                     <ChevronDown className={`w-5 h-5 brand-muted transition-transform ${expandedHero === 'grossProfit' ? 'rotate-180' : ''}`} aria-hidden />
                   </div>
                 </div>
-                {isRestricted('gross_profit') ? (
+                {isRestricted('gross_profit') && operationalShopData ? (
                   <>
                     <p className="text-5xl font-bold tracking-tight text-gray-400">Restricted</p>
                     <p className="brand-muted text-sm mt-3">Hidden by seller visibility policy</p>
                   </>
                 ) : (
                   <>
-                    <p className={`text-5xl font-bold tracking-tight ${financials.grossProfit >= 0 ? 'brand-profit' : 'brand-loss'}`}>
-                      {financials.grossProfit < 0 ? '-' : ''}{formatCurrency(financials.grossProfit)}
+                    <p className={`text-5xl font-bold tracking-tight ${
+                      operationalShopData
+                        ? (financials.grossProfit >= 0 ? 'brand-profit' : 'brand-loss')
+                        : (financials.statementNetSales >= 0 ? 'brand-profit' : 'brand-loss')
+                    }`}>
+                      {(operationalShopData ? financials.grossProfit : financials.statementNetSales) < 0 ? '-' : ''}
+                      {formatCurrency(
+                        Math.abs(operationalShopData ? financials.grossProfit : financials.statementNetSales),
+                      )}
                     </p>
-                    <p className="brand-muted text-sm mt-3">After COGS, product shipping, and affiliate · click for breakdown</p>
+                    <p className="brand-muted text-sm mt-3">
+                      {operationalShopData
+                        ? 'After product COGS, shipping, and affiliate · click for breakdown'
+                        : 'From TikTok statement sync · click for revenue detail'}
+                    </p>
                   </>
                 )}
               </div>
-              {expandedHero === 'grossProfit' && !isRestricted('gross_profit') && (
+              {expandedHero === 'grossProfit' && (!isRestricted('gross_profit') || !operationalShopData) && (
                 <div className="px-6 md:px-8 pb-6 md:pb-8 pt-0 border-t space-y-2 text-sm" style={{ borderColor: 'var(--brand-card-border)' }}>
-                  <p className="brand-muted text-xs uppercase tracking-wide mb-2">How gross profit is built</p>
-                  {heroGrossProfitLines.map((row, i) => (
-                    <div key={i} className="flex justify-between gap-3">
-                      <span className="brand-muted">{row.label}</span>
-                      <span className={`font-mono tabular-nums ${row.value < 0 ? 'brand-loss' : 'brand-text'}`}>
-                        {row.value < 0 ? '-' : ''}{formatCurrency(Math.abs(row.value))}
+                  <p className="brand-muted text-xs uppercase tracking-wide mb-2">
+                    {operationalShopData ? 'How gross profit is built' : 'Net sales detail (statement transactions)'}
+                  </p>
+                  {heroGrossProfitLines.map((row, i) => {
+                    const isTot = 'emphasis' in row && row.emphasis === 'total';
+                    const neg = row.value < -0.005;
+                    const cls = isTot
+                      ? 'brand-text font-bold text-base pt-2 border-t mt-1'
+                      : '';
+                    return (
+                      <div key={i} className={`flex justify-between gap-3 ${cls}`}>
+                        <span className={isTot ? 'brand-text' : 'brand-muted'}>{row.label}</span>
+                        <span
+                          className={`font-mono tabular-nums ${
+                            isTot
+                              ? (row.value >= 0 ? 'brand-profit' : 'brand-loss')
+                              : neg
+                                ? 'brand-loss'
+                                : row.value > 0.005
+                                  ? 'brand-profit'
+                                  : 'brand-text'
+                          }`}
+                        >
+                          {row.value < 0 ? '-' : ''}{formatCurrency(Math.abs(row.value))}
+                        </span>
+                      </div>
+                    );
+                  })}
+                  {operationalShopData && (
+                    <div className="flex justify-between gap-3 pt-2 border-t mt-2 font-semibold" style={{ borderColor: 'var(--brand-card-border)' }}>
+                      <span className="brand-text">Gross profit</span>
+                      <span className={`font-mono tabular-nums ${financials.grossProfit >= 0 ? 'brand-profit' : 'brand-loss'}`}>
+                        {financials.grossProfit < 0 ? '-' : ''}{formatCurrency(Math.abs(financials.grossProfit))}
                       </span>
                     </div>
-                  ))}
-                  <div className="flex justify-between gap-3 pt-2 border-t mt-2 font-semibold" style={{ borderColor: 'var(--brand-card-border)' }}>
-                    <span className="brand-text">Gross profit</span>
-                    <span className={`font-mono tabular-nums ${financials.grossProfit >= 0 ? 'brand-profit' : 'brand-loss'}`}>
-                      {financials.grossProfit < 0 ? '-' : ''}{formatCurrency(Math.abs(financials.grossProfit))}
-                    </span>
-                  </div>
+                  )}
                 </div>
               )}
             </div>
 
-            {/* Net Profit Card */}
+            {/* Net profit (orders) or Total settlement (statements only) */}
             <div
-              className="rounded-2xl overflow-hidden border"
-              style={{
-                backgroundColor: netProfit >= 0 ? 'var(--brand-success-bg)' : 'var(--brand-danger-bg)',
-                borderColor: netProfit >= 0 ? 'var(--brand-success-border)' : 'var(--brand-danger-border)',
-              }}
+              className={operationalShopData ? 'rounded-2xl overflow-hidden border' : 'brand-card rounded-2xl overflow-hidden'}
+              style={
+                operationalShopData
+                  ? {
+                      backgroundColor: netProfit >= 0 ? 'var(--brand-success-bg)' : 'var(--brand-danger-bg)',
+                      borderColor: netProfit >= 0 ? 'var(--brand-success-border)' : 'var(--brand-danger-border)',
+                    }
+                  : undefined
+              }
             >
               <div
                 role="button"
@@ -2013,16 +2514,41 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
               >
                 <div className="flex items-start justify-between gap-2 mb-4">
                   <div className="flex items-center gap-3 min-w-0">
-                    <div className={`p-2.5 rounded-xl shrink-0 ${netProfit >= 0 ? 'brand-state-success' : 'brand-state-danger'}`}>
-                      {netProfit >= 0
-                        ? <TrendingUp className="w-6 h-6" />
-                        : <TrendingDown className="w-6 h-6" />}
+                    <div
+                      className={`p-2.5 rounded-xl shrink-0 ${
+                        operationalShopData
+                          ? netProfit >= 0
+                            ? 'brand-state-success'
+                            : 'brand-state-danger'
+                          : financials.settlementAmount >= 0
+                            ? 'brand-state-success'
+                            : 'brand-state-danger'
+                      }`}
+                    >
+                      {(operationalShopData ? netProfit : financials.settlementAmount) >= 0 ? (
+                        <TrendingUp className="w-6 h-6" />
+                      ) : (
+                        <TrendingDown className="w-6 h-6" />
+                      )}
                     </div>
-                    <p className="brand-muted text-sm font-semibold uppercase tracking-widest">Net Profit</p>
+                    <p className="brand-muted text-sm font-semibold uppercase tracking-widest">
+                      {operationalShopData ? 'Net Profit' : 'Total Settlement'}
+                    </p>
                   </div>
-                  <ChevronDown className={`w-5 h-5 shrink-0 brand-muted mt-1 transition-transform ${expandedHero === 'netProfit' ? 'rotate-180' : ''}`} aria-hidden />
+                  <div className="flex items-center gap-2 shrink-0">
+                    {!operationalShopData && (
+                      <span onClick={e => e.stopPropagation()} className="inline-flex">
+                        <CalculationTooltip
+                          source="TikTok Shop statements"
+                          calculation="Total settlement amount from Seller Center settlement files for the selected range (not a recomputed profit line)."
+                          api="GET /finance/pl-data → statement_totals.total_settlement"
+                        />
+                      </span>
+                    )}
+                    <ChevronDown className={`w-5 h-5 shrink-0 brand-muted mt-1 transition-transform ${expandedHero === 'netProfit' ? 'rotate-180' : ''}`} aria-hidden />
+                  </div>
                 </div>
-                {isRestricted('net_profit') ? (
+                {isRestricted('net_profit') && operationalShopData ? (
                   <>
                     <p className="text-5xl font-bold tracking-tight text-gray-400">Restricted</p>
                     <div className="flex items-center gap-3 mt-3 flex-wrap">
@@ -2031,21 +2557,38 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                   </>
                 ) : (
                   <>
-                    <p className={`text-5xl font-bold tracking-tight ${netProfit >= 0 ? 'brand-profit' : 'brand-loss'}`}>
-                      {netProfit < 0 ? '-' : ''}{formatCurrency(netProfit)}
+                    <p
+                      className={`text-5xl font-bold tracking-tight ${
+                        (operationalShopData ? netProfit : financials.settlementAmount) >= 0 ? 'brand-profit' : 'brand-loss'
+                      }`}
+                    >
+                      {(operationalShopData ? netProfit : financials.settlementAmount) < 0 ? '-' : ''}
+                      {formatCurrency(Math.abs(operationalShopData ? netProfit : financials.settlementAmount))}
                     </p>
                     <div className="flex items-center gap-3 mt-3 flex-wrap">
-                      <span className={`text-sm font-medium ${netProfit >= 0 ? 'brand-profit' : 'brand-loss'}`}>
-                        {operatingIncomePct.toFixed(1)}% of net revenue
-                      </span>
-                      <span className="brand-muted text-xs">· After COGS, affiliate, and operating expenses · click for math</span>
+                      {operationalShopData ? (
+                        <>
+                          <span className={`text-sm font-medium ${netProfit >= 0 ? 'brand-profit' : 'brand-loss'}`}>
+                            {operatingIncomePct.toFixed(1)}% of net revenue
+                          </span>
+                          <span className="brand-muted text-xs">
+                            · After product costs, affiliate, and operating expenses · click for math
+                          </span>
+                        </>
+                      ) : (
+                        <span className="brand-muted text-xs">
+                          TikTok statement rollup · click for fees, shipping, and adjustments reference
+                        </span>
+                      )}
                     </div>
                   </>
                 )}
               </div>
-              {expandedHero === 'netProfit' && !isRestricted('net_profit') && (
+              {expandedHero === 'netProfit' && (!isRestricted('net_profit') || !operationalShopData) && (
                 <div className="px-6 md:px-8 pb-6 md:pb-8 pt-0 border-t space-y-2 text-sm" style={{ borderColor: 'var(--brand-card-border)' }}>
-                  <p className="brand-muted text-xs uppercase tracking-wide mb-2">Net profit calculation</p>
+                  <p className="brand-muted text-xs uppercase tracking-wide mb-2">
+                    {operationalShopData ? 'Net profit calculation' : 'Statement settlement rollup (reference)'}
+                  </p>
                   {heroNetProfitLines.map((row, i) => {
                     const isSub = row.emphasis === 'subtotal';
                     const isTot = row.emphasis === 'total';
@@ -2055,10 +2598,24 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                       : isSub
                         ? 'brand-text font-semibold pt-2 border-t mt-1'
                         : '';
+                    const totalForTone = operationalShopData ? netProfit : financials.settlementAmount;
                     return (
                       <div key={i} className={`flex justify-between gap-3 ${cls}`}>
                         <span className={isTot || isSub ? 'brand-text' : 'brand-muted'}>{row.label}</span>
-                        <span className={`font-mono tabular-nums ${isTot ? (netProfit >= 0 ? 'brand-profit' : 'brand-loss') : neg ? 'brand-loss' : row.value > 0.005 ? 'brand-profit' : 'brand-text'}`} style={isSub ? { color: 'var(--brand-info-text)' } : undefined}>
+                        <span
+                          className={`font-mono tabular-nums ${
+                            isTot
+                              ? totalForTone >= 0
+                                ? 'brand-profit'
+                                : 'brand-loss'
+                              : neg
+                                ? 'brand-loss'
+                                : row.value > 0.005
+                                  ? 'brand-profit'
+                                  : 'brand-text'
+                          }`}
+                          style={isSub ? { color: 'var(--brand-info-text)' } : undefined}
+                        >
                           {row.value < 0 ? '-' : ''}{formatCurrency(Math.abs(row.value))}
                         </span>
                       </div>
@@ -2069,6 +2626,8 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
             </div>
           </div>
 
+          {operationalShopData && (
+          <>
           {/* ═══════════════════ REVENUE SECTION ═══════════════════ */}
           <div className="brand-card rounded-xl p-6">
             <h3 className="text-lg font-semibold brand-text mb-2">Revenue</h3>
@@ -2172,14 +2731,20 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
               </div>
             </div>
           </div>
+          </>
+          )}
 
           {/* ═══════════════════ OPERATING EXPENSES ═══════════════════ */}
           <div className="brand-card rounded-xl p-6">
             <h3 className="text-lg font-semibold brand-text mb-2">Operating Expenses</h3>
             <p className="brand-muted text-sm mb-4">
-              {hasTransactionData
-                ? 'Itemized from statement transaction data'
-                : 'Summary from settlement statements - sync to get itemized breakdowns'}
+              {!operationalShopData
+                ? hasTransactionData
+                  ? 'Fees, shipping, marketing, and agency lines from synced TikTok statements. Order-based revenue and product COGS are not shown because shop order data is not loaded for your role.'
+                  : 'Summary from settlement statements — sync finance to load itemized breakdowns.'
+                : hasTransactionData
+                  ? 'Platform, shipping, marketing, and agency lines from statement transactions. COGS and affiliate commissions appear below for drill-down; they reduce gross profit first. The summary at the bottom shows operating expense totals before and after excluding those direct costs.'
+                  : 'Summary from settlement statements — sync to get itemized breakdowns. COGS and affiliate commissions are listed below when visible; the footer compares the full rollup (before exclusion) with OpEx-only (after exclusion) for net profit.'}
             </p>
             <div className="space-y-1">
               {/* Platform Fees & Commissions */}
@@ -2351,6 +2916,130 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
               />
               )}
 
+              {canViewCustomLineItems && !isRestricted('custom_line_items') && (
+                <ExpandableItem
+                  icon={<ListOrdered className="w-5 h-5 shrink-0" />}
+                  title="Custom P&L lines"
+                  subtitle="Seller-defined · UTC calendar dates · overlap the report range; long segments are prorated by calendar days in range"
+                  value={formatCurrency(customPlNetDisplay)}
+                  valueColor={plSignedMetricClass(customPlNetDisplay)}
+                  isNegative={customPlNetDisplay < 0}
+                  tooltip={{
+                    source: 'Manual (database)',
+                    calculation:
+                      'Line structure from pl_custom_line_items; amounts from pl_custom_line_item_values where the value date range overlaps the P&L period (inclusive, UTC calendar). If a value covers more calendar days than the selected report, only the overlapping portion counts — prorated by calendar days in range vs segment length.',
+                    api: 'GET /finance/pl-data (custom_line_items)',
+                  }}
+                  expandedContent={
+                    <div className="space-y-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <p className="text-xs brand-muted">
+                          Manage structure and dated amounts for this shop (UTC calendar).
+                        </p>
+                        {canMutateShop && shopId && (
+                          <button
+                            type="button"
+                            onClick={e => {
+                              e.stopPropagation();
+                              setIsCustomPlModalOpen(true);
+                            }}
+                            className="shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors"
+                            style={{
+                              backgroundColor: 'var(--brand-interactive-hover-bg)',
+                              color: 'var(--brand-primary)',
+                              borderColor: 'var(--brand-card-border)',
+                            }}
+                          >
+                            Manage lines & values
+                          </button>
+                        )}
+                      </div>
+                        {canMutateShop && shopId && customPlPayload && (
+                          <div
+                            className="flex flex-wrap items-center gap-2 pt-2 mt-1 border-t text-xs"
+                            style={{ borderColor: 'var(--brand-card-border)' }}
+                          >
+                            <span className="brand-muted shrink-0">No value in this date range:</span>
+                            <div className="inline-flex rounded-md border overflow-hidden shrink-0" style={{ borderColor: 'var(--brand-card-border)' }}>
+                              <button
+                                type="button"
+                                disabled={customPlEmptyDisplaySaving}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void saveCustomPlEmptyDisplay('zero');
+                                }}
+                                className={`px-2 py-1 font-medium transition-colors ${
+                                  (customPlPayload.empty_amount_in_range_display ?? 'zero') === 'zero'
+                                    ? 'brand-text'
+                                    : 'brand-muted hover:opacity-90'
+                                }`}
+                                style={{
+                                  backgroundColor:
+                                    (customPlPayload.empty_amount_in_range_display ?? 'zero') === 'zero'
+                                      ? 'var(--brand-interactive-hover-bg)'
+                                      : 'transparent',
+                                }}
+                              >
+                                Show $0.00
+                              </button>
+                              <button
+                                type="button"
+                                disabled={customPlEmptyDisplaySaving}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void saveCustomPlEmptyDisplay('null');
+                                }}
+                                className={`px-2 py-1 font-medium border-l transition-colors ${
+                                  customPlPayload.empty_amount_in_range_display === 'null'
+                                    ? 'brand-text'
+                                    : 'brand-muted hover:opacity-90'
+                                }`}
+                                style={{
+                                  borderColor: 'var(--brand-card-border)',
+                                  backgroundColor:
+                                    customPlPayload.empty_amount_in_range_display === 'null'
+                                      ? 'var(--brand-interactive-hover-bg)'
+                                      : 'transparent',
+                                }}
+                              >
+                                Show blank (—)
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      {!customPlPayload?.lines?.length ? (
+                        <p className="brand-muted text-sm italic">No custom lines configured for this shop.</p>
+                      ) : (
+                        <div className="space-y-2">
+                          {customPlPayload.lines.map(row => (
+                            <div
+                              key={row.id}
+                              className="flex justify-between gap-2 text-sm border-b pb-2 last:border-0"
+                              style={{ borderColor: 'var(--brand-card-border)' }}
+                            >
+                              <div className="min-w-0">
+                                <p className="brand-text font-medium truncate">
+                                  {row.name}
+                                  {!row.is_active && <span className="text-xs brand-muted ml-1">(inactive)</span>}
+                                </p>
+                                <p className="text-xs brand-muted capitalize">{row.category.replace(/_/g, ' ')}</p>
+                              </div>
+                              <span
+                                className={`font-mono tabular-nums shrink-0 ${
+                                  row.amount_in_range === null ? 'brand-muted' : plSignedMetricClass(row.amount_in_range)
+                                }`}
+                              >
+                                {formatCurrency(row.amount_in_range)}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  }
+                />
+              )}
+
               {/* Ad Spend / Marketing */}
               {!isRestricted('ad_spend') && (
               <ExpandableItem
@@ -2364,7 +3053,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                 isNegative={adSpend > 0}
                 tooltip={{
                   source: adsConnected ? "TikTok Business API + Shop Settlements" : "Not Available",
-                  calculation: "Marketing API Spend + Shop Ads Fees (TAP from settlements); affiliate ads commission is in Affiliate COGS",
+                  calculation: "Marketing API Spend + Shop Ads Fees (TAP from settlements); affiliate ads amounts appear under Affiliate commission",
                   api: "GET /tiktok-ads/spend + GET /finance/pl-data"
                 }}
                 expandedContent={
@@ -2444,7 +3133,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                       </div>
                     )}
                     {/* FBT fees — shown for reference, excluded from OpEx calculation */}
-                    {fbtFees > 0 && (
+                    {operationalShopData && fbtFees > 0 && (
                       <div className="mt-3 pt-3 border-t" style={{ borderColor: 'var(--brand-card-border)' }}>
                         <p className="text-xs brand-muted mb-2 uppercase tracking-wide">FBT Fees (excluded from OpEx)</p>
                         <div className="flex justify-between text-sm opacity-50">
@@ -2465,90 +3154,23 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
               />
               )}
 
-
-              {/* Total Operating Expenses */}
-              <div className="flex items-center justify-between py-4 rounded-lg px-4 mt-2 brand-state-danger">
-                <div className="flex items-center gap-3">
-                  <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${plSemanticToIconTileClass(plExpenseMetricClass(operatingExpenses))}`}>
-                    <TrendingDown className="w-5 h-5 shrink-0" />
-                  </div>
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <p className="text-lg font-bold brand-text">Total Operating Expenses</p>
-                      <CalculationTooltip
-                        source="Calculated"
-                        calculation="Platform Fees + Service Fees + Shipping + Marketing/Ad Spend + Agency Fees"
-                        api="Calculated"
-                      />
-                    </div>
-                    <p className="text-xs brand-muted">Platform, service fees + Shipping (excl. FBT) + Marketing + Agency (excludes Affiliate COGS, FBT & Taxes)</p>
-                  </div>
-                </div>
-                <p className={`text-2xl font-bold ${plExpenseMetricClass(operatingExpenses)}`}>-{formatCurrency(operatingExpenses)}</p>
-              </div>
-
-              {/* Operating Income */}
-              <div className={`flex items-center justify-between py-4 rounded-lg px-4 mt-2 ${operatingIncome >= 0 ? 'brand-state-success' : 'brand-state-danger'}`}>
-                <div className="flex items-center gap-3">
-                  <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${plSemanticToIconTileClass(plSignedMetricClass(operatingIncome))}`}>
-                    {operatingIncome > PL_AMOUNT_EPS ? (
-                      <TrendingUp className="w-5 h-5 shrink-0" />
-                    ) : operatingIncome < -PL_AMOUNT_EPS ? (
-                      <TrendingDown className="w-5 h-5 shrink-0" />
-                    ) : (
-                      <Minus className="w-5 h-5 shrink-0" />
-                    )}
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <p className="text-lg font-bold brand-text">Operating Income</p>
-                    <CalculationTooltip
-                      source="Calculated"
-                      calculation="Gross Profit - Operating Expenses"
-                      api="Calculated"
-                    />
-                  </div>
-                </div>
-                <div className="text-right">
-                  {isRestricted('net_profit') ? (
-                    <>
-                      <p className="text-2xl font-bold text-gray-400">Restricted</p>
-                      <p className="text-sm font-medium text-gray-400">Hidden by seller policy</p>
-                    </>
-                  ) : (
-                    <>
-                      <p className={`text-2xl font-bold ${plSignedMetricClass(operatingIncome)}`}>
-                        {operatingIncome < 0 ? '-' : ''}{formatCurrency(operatingIncome)}
-                      </p>
-                      <p className={`text-sm font-medium ${plSignedPctClass(operatingIncomePct)}`}>
-                        {formatPercent(operatingIncomePct)}
-                      </p>
-                    </>
-                  )}
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* ═══════════════════ COST OF GOODS SOLD ═══════════════════ */}
-          {canViewCogs && (
-          <div className="brand-card rounded-xl p-6">
-            <h3 className="text-lg font-semibold brand-text mb-2">Cost of Goods Sold</h3>
-            <p className="brand-muted text-sm mb-4">Your product costs (manually entered per product)</p>
-            <div className="space-y-1">
+              {/* COGS & affiliate: same economics as gross profit (not included in OpEx total below) */}
+              {operationalShopData && canViewCogs && (
               <ExpandableItem
                 icon={<Package className="w-5 h-5 shrink-0" />}
-                title="Product Costs (COGS)"
+                title="Cost of Goods Sold (COGS)"
                 subtitle={cogsStats.total > 0
                   ? (cogsStats.withCogs > 0
-                    ? `${cogsStats.withCogs}/${cogsStats.total} products with COGS`
-                    : 'No COGS data set - add COGS to products')
+                    ? `${cogsStats.withCogs}/${cogsStats.total} products with COGS · reduces gross profit`
+                    : 'No COGS data set — add COGS to products')
                   : 'No products with sales found'}
                 value={cogsStats.withCogs > 0 ? formatCurrency(totalCogs) : '$0.00'}
                 valueColor={plExpenseMetricClass(totalCogs)}
+                isNegative={totalCogs > 0}
                 tooltip={{
-                  source: "Product Catalog",
-                  calculation: "Sum(product.cogs x quantity_sold)",
-                  api: "Manual input on products"
+                  source: 'Product Catalog',
+                  calculation: 'Sum(product COGS × quantity sold); excluded from total operating expenses (flows through gross profit)',
+                  api: 'Manual input on products',
                 }}
                 expandedContent={
                   <div className="space-y-3 text-sm">
@@ -2561,31 +3183,125 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                       <span className="brand-loss">{cogsStats.total - cogsStats.withCogs}</span>
                     </div>
                     <div className="flex justify-between">
-                      <span className="brand-muted">Total Products with Sales</span>
+                      <span className="brand-muted">Total products with sales</span>
                       <span className="brand-text">{cogsStats.total}</span>
                     </div>
-                    <div className="border-t pt-2 flex justify-between font-medium" style={{ borderColor: 'var(--brand-card-border)' }}>
-                      <span className="brand-text">Calculated COGS</span>
-                      <span className="brand-loss">{formatCurrency(totalCogs)}</span>
-                    </div>
-                    <p className="brand-muted text-xs">Go to Products &rarr; Click product &rarr; Add COGS value</p>
+
+                    <details
+                      className="rounded-lg border overflow-hidden group"
+                      style={{ borderColor: 'var(--brand-card-border)' }}
+                    >
+                      <summary className="cursor-pointer select-none px-3 py-2.5 flex justify-between items-center gap-2 brand-row-hover list-none [&::-webkit-details-marker]:hidden">
+                        <span className="font-medium brand-text">Calculated product COGS — how this total is computed</span>
+                        <ChevronDown className="w-4 h-4 shrink-0 brand-muted transition-transform group-open:rotate-180" aria-hidden />
+                      </summary>
+                      <div className="px-3 pb-3 pt-1 space-y-3 border-t text-xs leading-relaxed" style={{ borderColor: 'var(--brand-card-border)' }}>
+                        <p className="brand-muted">
+                          Sum of <span className="brand-text font-medium">unit COGS × quantity</span> for every line item on{' '}
+                          <span className="brand-text font-medium">{cogsStats.regularOrdersCogsDetail.qualifyingOrders}</span>{' '}
+                          qualifying paid orders ({cogsStats.regularOrdersCogsDetail.lineItems} line items). Orders exclude{' '}
+                          <span className="brand-text">returns</span>, <span className="brand-text">samples</span>, and{' '}
+                          <span className="brand-text">cancelled/refunded</span> (same window as this COGS total).
+                        </p>
+                        <p className="brand-muted">
+                          <span className="font-medium brand-text">Unit COGS</span> uses the amount{' '}
+                          <span className="brand-text">stored on the order line</span> when TikTok synced it (historical snapshot).
+                          If missing, Mamba uses <span className="brand-text">current catalog COGS</span>, preferring{' '}
+                          <span className="brand-text">SKU-level COGS</span> when the line has a seller SKU match.
+                        </p>
+                        <div className="rounded-md brand-card p-2.5 space-y-1.5">
+                          <div className="flex justify-between gap-3">
+                            <span className="brand-muted">Portion from order snapshot COGS</span>
+                            <span className="font-mono tabular-nums brand-loss shrink-0">
+                              {formatCurrency(cogsStats.regularOrdersCogsDetail.fromOrderSnapshot)}
+                            </span>
+                          </div>
+                          <div className="flex justify-between gap-3">
+                            <span className="brand-muted">Portion from catalog / SKU fallback</span>
+                            <span className="font-mono tabular-nums brand-loss shrink-0">
+                              {formatCurrency(cogsStats.regularOrdersCogsDetail.fromCatalogFallback)}
+                            </span>
+                          </div>
+                          <div className="flex justify-between gap-3 pt-1.5 border-t font-medium text-sm" style={{ borderColor: 'var(--brand-card-border)' }}>
+                            <span className="brand-text">Total calculated product COGS</span>
+                            <span className="font-mono tabular-nums brand-loss shrink-0">{formatCurrency(totalCogs)}</span>
+                          </div>
+                        </div>
+
+                        {cogsStats.regularOrdersCogsDetail.breakdown.length > 0 ? (
+                          <div className="space-y-2">
+                            <p className="text-[11px] font-semibold brand-text uppercase tracking-wide">By SKU / product (sorted by cost)</p>
+                            <div className="max-h-56 overflow-y-auto pr-1 custom-scrollbar rounded-md border brand-card" style={{ borderColor: 'var(--brand-card-border)' }}>
+                              <div className="flex items-center gap-2 text-[10px] brand-muted uppercase tracking-wider px-2 py-1.5 border-b sticky top-0 bg-[var(--brand-card-bg)] z-[1]" style={{ borderColor: 'var(--brand-card-border)' }}>
+                                <span className="flex-1 min-w-0">Product / SKU</span>
+                                <span className="w-10 text-center shrink-0">Qty</span>
+                                <span className="w-[4.5rem] text-right shrink-0">Unit</span>
+                                <span className="w-[4.5rem] text-right shrink-0">Total</span>
+                                <span className="w-16 text-right shrink-0 hidden sm:inline">Source</span>
+                              </div>
+                              <div className="divide-y" style={{ borderColor: 'var(--brand-card-border)' }}>
+                                {cogsStats.regularOrdersCogsDetail.breakdown.map((row) => {
+                                  const src =
+                                    row.fromSnapshot > 0.01 && row.fromCatalog > 0.01
+                                      ? 'Mixed'
+                                      : row.fromSnapshot > 0.01
+                                        ? 'Snapshot'
+                                        : 'Catalog';
+                                  return (
+                                    <div key={row.skuKey} className="flex items-start gap-2 px-2 py-1.5 text-[11px]">
+                                      <div className="flex items-start gap-2 flex-1 min-w-0 pt-0.5">
+                                        {row.skuImage ? (
+                                          <img src={row.skuImage} alt="" className="w-7 h-7 rounded object-cover shrink-0 mt-0.5" />
+                                        ) : (
+                                          <div className="w-7 h-7 rounded brand-card flex items-center justify-center shrink-0 mt-0.5">
+                                            <Package className="w-3.5 h-3.5 brand-muted" />
+                                          </div>
+                                        )}
+                                        <div className="min-w-0">
+                                          <p className="brand-text truncate">{row.productName}</p>
+                                          {(row.skuName || row.skuKey) && (
+                                            <p className="brand-muted truncate text-[10px]">{row.skuName || row.skuKey}</p>
+                                          )}
+                                        </div>
+                                      </div>
+                                      <span className="w-10 text-center brand-text font-medium shrink-0 pt-1">{row.quantity}</span>
+                                      <span className="w-[4.5rem] text-right brand-muted shrink-0 font-mono tabular-nums pt-1">
+                                        {formatCurrency(row.unitCogs)}
+                                      </span>
+                                      <span className="w-[4.5rem] text-right brand-loss font-medium shrink-0 font-mono tabular-nums pt-1">
+                                        {formatCurrency(row.totalCogs)}
+                                      </span>
+                                      <span className="w-16 text-right brand-muted shrink-0 pt-1 hidden sm:inline">{src}</span>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          </div>
+                        ) : (
+                          <p className="brand-muted italic">No qualifying line items in this range.</p>
+                        )}
+                      </div>
+                    </details>
+
+                    <p className="brand-muted text-xs">Go to Products → open a product → add COGS.</p>
                   </div>
                 }
               />
+              )}
 
-              {/* Affiliate Commissions (COGS) */}
-              {!isRestricted('affiliate_commissions') && !isRestricted('custom_line_items') && (
+              {!hideAffiliatePlSection && (
               <ExpandableItem
                 icon={<Users className="w-5 h-5 shrink-0" />}
                 title="Affiliate Commissions"
-                subtitle="Commissions paid to affiliates & creators (Auto + Manual) — treated as COGS"
+                subtitle="Automatic (statement) + manual retainers · reduces gross profit"
                 value={formatCurrency(totalAffiliateCost)}
                 valueColor={plExpenseMetricClass(totalAffiliateCost)}
-                isNegative
+                isNegative={totalAffiliateCost > 0}
                 tooltip={{
-                  source: "Statement Transactions + Manual",
-                  calculation: "Auto Commissions + Manual Retainers",
-                  api: "GET /finance/pl-data"
+                  source: 'Statement Transactions + Manual',
+                  calculation: 'Affiliate-related fee lines from synced statements (net of reversals) + manual retainers; excluded from total operating expenses (flows through gross profit)',
+                  api: 'GET /finance/pl-data',
                 }}
                 expandedContent={
                   <div className="space-y-4">
@@ -2596,7 +3312,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                             .filter(k => Math.abs(plData.fees[k] || 0) >= 0.01)
                             .map(k => ({
                               label: AFFILIATE_LABELS[k] || k.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
-                              value: Math.abs(plData.fees[k] || 0)
+                              value: Math.abs(plData.fees[k] || 0),
                             }))
                           : [{ label: 'Automatic Commission (TikTok)', value: autoAffiliateCommission }]
                         ),
@@ -2604,7 +3320,6 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                       ]}
                     />
 
-                    {/* Manual Retainers List */}
                     <div className="mt-4 border-t pt-4" style={{ borderColor: 'var(--brand-card-border)' }}>
                       <div className="flex items-center justify-between mb-2">
                         <h4 className="text-sm font-medium brand-text">Manual Retainers</h4>
@@ -2664,42 +3379,89 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
               />
               )}
 
-              {/* Gross Profit */}
-              <div className="flex items-center justify-between py-4 rounded-lg px-4 mt-2 brand-state-info">
+              {/* Operating expense totals + operating income — order-level gross profit bridge only */}
+              {operationalShopData && (
+              <>
+              <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between py-4 rounded-lg px-4 mt-2 brand-state-danger">
+                <div className="flex items-center gap-3 min-w-0">
+                  <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${plSemanticToIconTileClass(plExpenseMetricClass(operatingExpenses))}`}>
+                    <TrendingDown className="w-5 h-5 shrink-0" />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <p className="text-lg font-bold brand-text">Operating expense totals</p>
+                      <CalculationTooltip
+                        source="Calculated"
+                        calculation="Before exclusion = OpEx for net profit + product COGS + affiliate commissions (matches summing every row in this section). After exclusion = fees, shipping (excl. FBT), marketing, and agency only — this is subtracted from gross profit for operating income."
+                        api="Calculated"
+                      />
+                    </div>
+                    <p className="text-xs brand-muted mt-0.5">
+                      Before exclusion adds COGS and affiliate to the OpEx total. After exclusion is what drives operating income (same as gross profit math).
+                    </p>
+                  </div>
+                </div>
+                <div className="flex flex-col gap-3 text-right shrink-0 sm:min-w-[13rem]">
+                  <div>
+                    <p className="text-[11px] font-medium brand-muted uppercase tracking-wide">Before exclusion</p>
+                    <p className="text-xs brand-muted mb-0.5">Incl. COGS &amp; affiliate</p>
+                    <p className={`text-xl font-bold font-mono tabular-nums ${plExpenseMetricClass(operatingExpensesBeforeExclusion)}`}>
+                      -{formatCurrency(operatingExpensesBeforeExclusion)}
+                    </p>
+                  </div>
+                  <div className="pt-2 border-t" style={{ borderColor: 'var(--brand-card-border)' }}>
+                    <p className="text-[11px] font-medium brand-muted uppercase tracking-wide">After exclusion</p>
+                    <p className="text-xs brand-muted mb-0.5">OpEx for operating income</p>
+                    <p className={`text-2xl font-bold font-mono tabular-nums ${plExpenseMetricClass(operatingExpenses)}`}>
+                      -{formatCurrency(operatingExpenses)}
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              {/* Operating Income */}
+              <div className={`flex items-center justify-between py-4 rounded-lg px-4 mt-2 ${operatingIncome >= 0 ? 'brand-state-success' : 'brand-state-danger'}`}>
                 <div className="flex items-center gap-3">
-                  <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${plSemanticToIconTileClass(isRestricted('gross_profit') ? 'brand-muted' : plSignedMetricClass(grossProfit))}`}>
-                    <Wallet className="w-5 h-5 shrink-0" />
+                  <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${plSemanticToIconTileClass(plSignedMetricClass(operatingIncome))}`}>
+                    {operatingIncome > PL_AMOUNT_EPS ? (
+                      <TrendingUp className="w-5 h-5 shrink-0" />
+                    ) : operatingIncome < -PL_AMOUNT_EPS ? (
+                      <TrendingDown className="w-5 h-5 shrink-0" />
+                    ) : (
+                      <Minus className="w-5 h-5 shrink-0" />
+                    )}
                   </div>
                   <div className="flex items-center gap-2">
-                    <p className="text-lg font-bold brand-text">Gross Profit</p>
+                    <p className="text-lg font-bold brand-text">Operating Income</p>
                     <CalculationTooltip
                       source="Calculated"
-                      calculation="Net Revenue - COGS - Affiliate Commissions"
+                      calculation="Gross Profit − Operating Expenses (after exclusion — excludes COGS and affiliate, which were already deducted in gross profit)"
                       api="Calculated"
                     />
                   </div>
                 </div>
                 <div className="text-right">
-                  {isRestricted('gross_profit') ? (
+                  {isRestricted('net_profit') ? (
                     <>
                       <p className="text-2xl font-bold text-gray-400">Restricted</p>
                       <p className="text-sm font-medium text-gray-400">Hidden by seller policy</p>
                     </>
                   ) : (
                     <>
-                      <p className={`text-2xl font-bold ${plSignedMetricClass(grossProfit)}`}>
-                        {grossProfit < 0 ? '-' : ''}{formatCurrency(grossProfit)}
+                      <p className={`text-2xl font-bold ${plSignedMetricClass(operatingIncome)}`}>
+                        {operatingIncome < 0 ? '-' : ''}{formatCurrency(operatingIncome)}
                       </p>
-                      <p className={`text-sm font-medium ${plSignedPctClass(grossProfitPct)}`}>
-                        {formatPercent(grossProfitPct)}
+                      <p className={`text-sm font-medium ${plSignedPctClass(operatingIncomePct)}`}>
+                        {formatPercent(operatingIncomePct)}
                       </p>
                     </>
                   )}
                 </div>
               </div>
+              </>
+              )}
             </div>
           </div>
-          )}
 
           {/* ═══════════════════ SAMPLE ORDERS ═══════════════════ */}
           <div className="brand-card rounded-xl p-6">
@@ -2810,20 +3572,29 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                 />
 
                 {/* Note about exclusion */}
+                {operationalShopData && (
                 <div className="mt-4 rounded-lg p-4 brand-state-info">
                   <p className="brand-text text-sm">
                     <strong>Note:</strong> Sample orders are excluded from all P&L calculations including Revenue, COGS, and Net Profit to provide accurate financial reporting.
                   </p>
                 </div>
+                )}
               </div>
             )}
           </div>
 
           {/* ═══════════════════ PROFITABILITY SUMMARY ═══════════════════ */}
           <div className="brand-card rounded-xl p-6 border">
-            <h3 className="text-lg font-semibold brand-text mb-6">Profitability Summary</h3>
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-7 gap-4">
-              {/* GMV — brand-card matches OpEx section surfaces; avoids agency secondary-card accent floods */}
+            <h3 className="text-lg font-semibold brand-text mb-6">
+              {operationalShopData ? 'Profitability Summary' : 'Statement totals'}
+            </h3>
+            <p className="text-sm brand-muted mb-4 -mt-2">
+              {operationalShopData
+                ? 'Top row: order GMV plus three TikTok statement totals. Second row: margins and profit vs order net revenue.'
+                : 'Gross sales, net sales, and total settlement from TikTok statement sync only — no order-level GMV or profit metrics.'}
+            </p>
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+              {operationalShopData && (
               <div className="brand-card rounded-lg p-5">
                 <div className="flex items-center gap-3 mb-3">
                   <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${plSemanticToIconTileClass(plSignedMetricClass(financials.grossSalesGMV))}`}>
@@ -2832,8 +3603,9 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                   <p className="brand-muted text-sm font-medium">GMV</p>
                 </div>
                 <p className={`text-2xl font-bold ${plSignedMetricClass(financials.grossSalesGMV)}`}>{formatCurrency(financials.grossSalesGMV)}</p>
-                <p className="text-xs brand-muted mt-1">Gross Merchandise Value</p>
+                <p className="text-xs brand-muted mt-1">Gross merchandise value (paid orders)</p>
               </div>
+              )}
 
               {/* Net sales (TikTok statements) */}
               <div className="brand-card rounded-lg p-5">
@@ -2851,7 +3623,26 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                   />
                 </div>
                 <p className={`text-2xl font-bold ${plSignedMetricClass(financials.statementNetSales)}`}>{formatCurrency(financials.statementNetSales)}</p>
-                <p className="text-xs brand-muted mt-1">From statement data (TikTok)</p>
+                <p className="text-xs brand-muted mt-1">Statements (TikTok)</p>
+              </div>
+
+              {/* Gross sales (TikTok statements) */}
+              <div className="brand-card rounded-lg p-5">
+                <div className="flex items-center justify-between gap-2 mb-3">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${plSemanticToIconTileClass(plSignedMetricClass(financials.statementGrossSales))}`}>
+                      <Package className="w-5 h-5 shrink-0" />
+                    </div>
+                    <p className="brand-muted text-sm font-medium truncate">Gross Sales</p>
+                  </div>
+                  <CalculationTooltip
+                    source="TikTok Shop settlements"
+                    calculation="Matches Seller Center’s Gross sales line: sum of revenue breakdown Subtotal before discount (`subtotal_before_discount`) across synced statement transactions. We deliberately do not use Σ transaction revenue_amount — on TikTok that total often equals Net sales (same as Net sales tile)."
+                    api="GET /finance/pl-data → statement_totals.total_gross_sales"
+                  />
+                </div>
+                <p className={`text-2xl font-bold ${plSignedMetricClass(financials.statementGrossSales)}`}>{formatCurrency(financials.statementGrossSales)}</p>
+                <p className="text-xs brand-muted mt-1">Statements (TikTok)</p>
               </div>
 
               {/* Total settlement amount */}
@@ -2870,9 +3661,11 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                   />
                 </div>
                 <p className={`text-2xl font-bold ${plSignedMetricClass(financials.settlementAmount)}`}>{formatCurrency(financials.settlementAmount)}</p>
-                <p className="text-xs brand-muted mt-1">Settlement amount (TikTok)</p>
+                <p className="text-xs brand-muted mt-1">Statements (TikTok)</p>
               </div>
 
+              {operationalShopData && (
+              <>
               {/* Gross Profit */}
               <div className="brand-card rounded-lg p-5">
                 <div className="flex items-center justify-between gap-2 mb-3">
@@ -2884,7 +3677,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                   </div>
                   <CalculationTooltip
                     source="Calculated in app"
-                    calculation="Net Revenue − Product COGS − Product Shipping Cost (your data) − Affiliate Commissions (COGS)"
+                    calculation="Net Revenue − Product COGS − Product Shipping − Affiliate commission"
                     api="TikTok API: none (computed from orders + statement fee rollups)"
                   />
                 </div>
@@ -2898,7 +3691,7 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                     <p className={`text-2xl font-bold ${plSignedMetricClass(financials.grossProfit)}`}>
                       {financials.grossProfit < 0 ? '-' : ''}{formatCurrency(financials.grossProfit)}
                     </p>
-                    <p className="text-xs brand-muted mt-1">Profit after COGS & affiliate commissions</p>
+                    <p className="text-xs brand-muted mt-1">After product COGS, shipping, and affiliate</p>
                   </>
                 )}
               </div>
@@ -2984,10 +3777,14 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
                   </>
                 )}
               </div>
+              </>
+              )}
 
             </div>
           </div>
 
+          {operationalShopData && (
+          <>
           {/* ═══════════════════ PROFITABILITY CALCULATOR ═══════════════════ */}
           <div className="brand-card rounded-xl overflow-hidden">
             {/* Header — always visible */}
@@ -3189,10 +3986,14 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
               </div>
             )}
           </div>
+          </>
+          )}
 
           {/* Data source info */}
           <div className="text-center text-gray-600 text-xs pb-4">
-            Based on {orders.length} orders in date range
+            {operationalShopData
+              ? `Based on ${orders.length} orders in date range`
+              : 'Figures from TikTok statement sync — shop orders are not loaded for your role'}
           </div>
         </>
       </>
@@ -3214,6 +4015,22 @@ export function ProfitLossView({ account, shopId, timezone = 'America/Los_Angele
           shopId={shopId || ''}
         />
       )}
+
+      {canMutateShop &&
+        shopId &&
+        canViewCustomLineItems &&
+        !isRestricted('custom_line_items') && (
+          <CustomPlManageModal
+            isOpen={isCustomPlModalOpen}
+            onClose={() => setIsCustomPlModalOpen(false)}
+            account={account}
+            shopId={shopId}
+            dateRange={dateRange}
+            timezone={timezone}
+            lines={customPlPayload?.lines ?? []}
+            onAfterSave={refreshCustomPlAfterModalSave}
+          />
+        )}
     </div>
   );
 }

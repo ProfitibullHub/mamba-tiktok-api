@@ -152,7 +152,7 @@ export function PlatformTenantsView() {
 
     return (
         <div className="w-full max-w-none animate-in fade-in duration-500 pb-12 relative">
-            <div className="absolute inset-x-0 top-0 h-64 bg-gradient-to-b from-blue-500/10 via-pink-500/5 to-transparent -z-10 rounded-full blur-[100px] opacity-60 pointer-events-none" />
+            <div className="absolute inset-x-0 top-0 h-64 bg-gradient-to-b from-blue-500/10 via-mamba-green/5 to-transparent -z-10 rounded-full blur-[100px] opacity-60 pointer-events-none" />
             
             <div className="relative z-10 mb-8">
                 <h1 className="text-4xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-white via-blue-100 to-white flex items-center gap-4">
@@ -162,7 +162,7 @@ export function PlatformTenantsView() {
                     Platform Tenants
                 </h1>
                 <p className="text-gray-400/90 mt-4 text-base max-w-2xl leading-relaxed">
-                    Internal tools for platform operators. Search people and organizations, then run bootstrap actions without juggling raw UUIDs. Requires legacy <code className="text-pink-300/80">profiles.role = admin</code> or a <strong className="text-gray-200">Super Admin</strong> membership.
+                    Internal tools for platform operators. Search people and organizations, then run bootstrap actions without juggling raw UUIDs. Requires legacy <code className="text-mamba-neon/80">profiles.role = admin</code> or a <strong className="text-gray-200">Super Admin</strong> membership.
                 </p>
             </div>
 
@@ -247,7 +247,7 @@ export function PlatformTenantsView() {
                                 type="button"
                                 disabled={busy === 'create-agency' || !agencyOwner}
                                 onClick={createAgencyForOwner}
-                                className="mt-8 px-6 py-3 rounded-xl bg-gradient-to-r from-violet-600 to-fuchsia-600 hover:from-violet-500 hover:to-fuchsia-500 text-white text-sm font-bold disabled:opacity-50 inline-flex items-center gap-2 hover:shadow-lg hover:shadow-violet-500/20 transition-all hover:-translate-y-0.5"
+                                className="mt-8 px-6 py-3 rounded-xl bg-gradient-to-r from-violet-600 to-mamba-deep hover:from-violet-500 hover:to-mamba-green text-white text-sm font-bold disabled:opacity-50 inline-flex items-center gap-2 hover:shadow-lg hover:shadow-violet-500/20 transition-all hover:-translate-y-0.5"
                             >
                                 {busy === 'create-agency' ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
                                 Create agency &amp; assign owner
@@ -256,9 +256,9 @@ export function PlatformTenantsView() {
                     </section>
 
                     <section className="bg-white/[0.02] border border-white/10 rounded-3xl p-6 md:p-8 relative overflow-hidden backdrop-blur-sm mt-8">
-                        <div className="absolute inset-0 bg-gradient-to-br from-fuchsia-500/5 to-transparent pointer-events-none" />
+                        <div className="absolute inset-0 bg-gradient-to-br from-mamba-green/5 to-transparent pointer-events-none" />
                         <div className="relative z-10">
-                            <div className="flex items-center gap-2 text-fuchsia-400 font-extrabold uppercase tracking-widest text-xs mb-2">
+                            <div className="flex items-center gap-2 text-mamba-neon font-extrabold uppercase tracking-widest text-xs mb-2">
                                 Step 2
                             </div>
                             <h2 className="text-2xl font-bold text-white mb-2">Attach a seller organization to an agency</h2>
@@ -277,11 +277,11 @@ export function PlatformTenantsView() {
                                     label="Parent agency"
                                     hint="Search by agency name or tenant id."
                                 />
-                                <div className="hidden md:flex flex-col items-center justify-center text-fuchsia-500 bg-fuchsia-500/10 p-2 rounded-full mt-4 border border-fuchsia-500/20 shadow-[0_0_15px_rgba(217,70,239,0.3)]">
+                                <div className="hidden md:flex flex-col items-center justify-center text-mamba-green bg-mamba-green/10 p-2 rounded-full mt-4 border border-mamba-green/20 shadow-[0_0_15px_rgba(217,70,239,0.3)]">
                                     <ChevronRight className="w-5 h-5" />
                                 </div>
-                                <div className="md:hidden flex justify-center py-2 text-fuchsia-500">
-                                    <div className="bg-fuchsia-500/10 p-2 rounded-full border border-fuchsia-500/20 shadow-[0_0_15px_rgba(217,70,239,0.3)]">
+                                <div className="md:hidden flex justify-center py-2 text-mamba-green">
+                                    <div className="bg-mamba-green/10 p-2 rounded-full border border-mamba-green/20 shadow-[0_0_15px_rgba(217,70,239,0.3)]">
                                         <ArrowDown className="w-5 h-5" />
                                     </div>
                                 </div>
@@ -296,8 +296,8 @@ export function PlatformTenantsView() {
                             </div>
 
                             {linkAgency && linkSeller ? (
-                                <div className="mt-6 rounded-xl border border-fuchsia-500/20 bg-fuchsia-500/5 px-5 py-3.5 text-sm text-fuchsia-200/80 flex items-center gap-2">
-                                    <div className="w-2 h-2 rounded-full bg-fuchsia-500 animate-pulse" />
+                                <div className="mt-6 rounded-xl border border-mamba-green/20 bg-mamba-green/5 px-5 py-3.5 text-sm text-mamba-text/80 flex items-center gap-2">
+                                    <div className="w-2 h-2 rounded-full bg-mamba-green animate-pulse" />
                                     <span>
                                         <span className="text-white font-bold">{linkSeller.name}</span> will sit under <span className="text-white font-bold">{linkAgency.name}</span> in the hierarchy.
                                     </span>
@@ -308,7 +308,7 @@ export function PlatformTenantsView() {
                                 type="button"
                                 disabled={busy === 'link-seller' || !linkAgency || !linkSeller}
                                 onClick={linkSellerUnderAgency}
-                                className="mt-8 px-6 py-3 rounded-xl border border-fuchsia-500/50 bg-white/5 text-fuchsia-50 hover:bg-fuchsia-500/20 hover:border-fuchsia-400 text-sm font-bold disabled:opacity-50 inline-flex items-center gap-2 hover:shadow-lg hover:shadow-fuchsia-500/20 transition-all hover:-translate-y-0.5"
+                                className="mt-8 px-6 py-3 rounded-xl border border-mamba-green/50 bg-white/5 text-mamba-muted hover:bg-mamba-green/20 hover:border-mamba-neon text-sm font-bold disabled:opacity-50 inline-flex items-center gap-2 hover:shadow-lg hover:shadow-mamba-green/20 transition-all hover:-translate-y-0.5"
                             >
                                 {busy === 'link-seller' ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
                                 Attach seller to agency
@@ -390,7 +390,7 @@ export function PlatformTenantsView() {
                                                         <Shield className="w-3 h-3" /> Platform
                                                     </span>
                                                 ) : (
-                                                    <span className="inline-flex items-center gap-1.5 text-pink-300 font-medium bg-pink-500/10 px-2.5 py-1 text-xs rounded-lg border border-pink-500/20">
+                                                    <span className="inline-flex items-center gap-1.5 text-mamba-neon font-medium bg-mamba-green/10 px-2.5 py-1 text-xs rounded-lg border border-mamba-green/20">
                                                         <Store className="w-3 h-3" /> Seller
                                                     </span>
                                                 )}
@@ -426,11 +426,11 @@ export function PlatformTenantsView() {
 
             {tab === 'super' && canManageSuperAdmins && (
                 <section className="bg-white/[0.02] border border-white/10 rounded-3xl p-6 md:p-8 relative overflow-hidden backdrop-blur-sm">
-                    <div className="absolute inset-0 bg-gradient-to-br from-pink-500/5 to-transparent pointer-events-none" />
+                    <div className="absolute inset-0 bg-gradient-to-br from-mamba-green/5 to-transparent pointer-events-none" />
                     <div className="relative z-10">
                         <h2 className="text-2xl font-bold text-white flex items-center gap-3 mb-2">
-                            <div className="p-2 bg-pink-500/20 rounded-xl">
-                                <Shield className="w-6 h-6 text-pink-400" />
+                            <div className="p-2 bg-mamba-green/20 rounded-xl">
+                                <Shield className="w-6 h-6 text-mamba-neon" />
                             </div>
                             Super Admin memberships
                         </h2>
@@ -454,7 +454,7 @@ export function PlatformTenantsView() {
                                 <button
                                     type="button"
                                     onClick={() => setShowSuperUuidAdvanced((v) => !v)}
-                                    className="text-xs text-pink-400 hover:text-pink-300 font-bold uppercase tracking-wider text-left transition-colors flex items-center gap-1"
+                                    className="text-xs text-mamba-neon hover:text-mamba-neon font-bold uppercase tracking-wider text-left transition-colors flex items-center gap-1"
                                 >
                                     <ChevronRight className={`w-3 h-3 transition-transform ${showSuperUuidAdvanced ? 'rotate-90' : ''}`} />
                                     {showSuperUuidAdvanced ? 'Hide' : 'Show'} advanced — paste UUID
@@ -470,7 +470,7 @@ export function PlatformTenantsView() {
                                             }}
                                             placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
                                             disabled={busy === 'grant'}
-                                            className="w-full bg-gray-950/80 border border-white/10 rounded-xl px-4 py-3 text-sm font-mono text-white disabled:opacity-50 placeholder-gray-600 focus:border-pink-500/50 focus:outline-none transition-all"
+                                            className="w-full bg-gray-950/80 border border-white/10 rounded-xl px-4 py-3 text-sm font-mono text-white disabled:opacity-50 placeholder-gray-600 focus:border-mamba-green/50 focus:outline-none transition-all"
                                         />
                                     </div>
                                 ) : null}
@@ -481,7 +481,7 @@ export function PlatformTenantsView() {
                             type="button"
                             disabled={busy === 'grant' || !superGrantTargetId}
                             onClick={grant}
-                            className="flex items-center gap-2 px-6 py-3 rounded-xl bg-gradient-to-r from-pink-600 to-rose-600 hover:from-pink-500 hover:to-rose-500 text-white text-sm font-bold disabled:opacity-50 mb-10 hover:shadow-lg hover:shadow-pink-500/20 transition-all hover:-translate-y-0.5"
+                            className="flex items-center gap-2 px-6 py-3 rounded-xl bg-gradient-to-r from-mamba-green to-mamba-deep hover:from-mamba-green hover:to-mamba-deep text-mamba-dark text-sm font-bold disabled:opacity-50 mb-10 hover:shadow-lg hover:shadow-mamba-green/20 transition-all hover:-translate-y-0.5"
                         >
                             {busy === 'grant' ? <Loader2 className="w-4 h-4 animate-spin" /> : <UserPlus className="w-4 h-4" />}
                             Grant Super Admin

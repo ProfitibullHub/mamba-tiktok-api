@@ -148,15 +148,80 @@ export async function enqueueIngestionJob(input: EnqueueJobInput): Promise<{ job
     return { job: data as IngestionJobRow, deduped: false };
 }
 
-export async function claimIngestionJobs(workerId: string, stream: IngestionStream, limit = 5): Promise<IngestionJobRow[]> {
+async function claimOneQueuedJobRow(workerId: string, job: IngestionJobRow): Promise<IngestionJobRow | null> {
+    const nowIso = new Date().toISOString();
+    const { data: updated, error: upErr } = await supabase
+        .from('ingestion_jobs')
+        .update({
+            status: 'running',
+            locked_by: workerId,
+            locked_at: nowIso,
+            updated_at: nowIso,
+            attempt_count: job.attempt_count + 1,
+        })
+        .eq('id', job.id)
+        .eq('status', 'queued')
+        .select('*')
+        .maybeSingle();
+
+    if (!upErr && updated) {
+        await supabase.from('ingestion_job_attempts').insert({
+            job_id: job.id,
+            attempt_no: (job.attempt_count ?? 0) + 1,
+            status: 'running',
+            worker_id: workerId,
+        });
+        return updated as IngestionJobRow;
+    }
+    return null;
+}
+
+export async function claimIngestionJobs(
+    workerId: string,
+    stream: IngestionStream,
+    limit = 5,
+    opts?: { accountId?: string; preferredJobId?: string },
+): Promise<IngestionJobRow[]> {
     await reclaimStaleRunningJobs(stream);
     const nowIso = new Date().toISOString();
-    const { data, error } = await supabase
+    const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+    if (
+        opts?.preferredJobId &&
+        uuidRe.test(opts.preferredJobId) &&
+        opts.accountId &&
+        uuidRe.test(opts.accountId)
+    ) {
+        const { data: prefRow, error: prefErr } = await supabase
+            .from('ingestion_jobs')
+            .select('*')
+            .eq('id', opts.preferredJobId)
+            .eq('stream', stream)
+            .eq('account_id', opts.accountId)
+            .eq('status', 'queued')
+            .lte('next_retry_at', nowIso)
+            .maybeSingle();
+
+        if (!prefErr && prefRow) {
+            const claimedPreferred = await claimOneQueuedJobRow(workerId, prefRow as IngestionJobRow);
+            if (claimedPreferred) {
+                return [claimedPreferred];
+            }
+        }
+    }
+
+    let qb = supabase
         .from('ingestion_jobs')
         .select('*')
         .eq('stream', stream)
         .eq('status', 'queued')
-        .lte('next_retry_at', nowIso)
+        .lte('next_retry_at', nowIso);
+
+    if (opts?.accountId) {
+        qb = qb.eq('account_id', opts.accountId);
+    }
+
+    const { data, error } = await qb
         .order('priority', { ascending: true })
         .order('created_at', { ascending: true })
         .limit(limit);
@@ -167,28 +232,9 @@ export async function claimIngestionJobs(workerId: string, stream: IngestionStre
 
     const claimed: IngestionJobRow[] = [];
     for (const job of jobs) {
-        const { data: updated, error: upErr } = await supabase
-            .from('ingestion_jobs')
-            .update({
-                status: 'running',
-                locked_by: workerId,
-                locked_at: nowIso,
-                updated_at: nowIso,
-                attempt_count: job.attempt_count + 1,
-            })
-            .eq('id', job.id)
-            .eq('status', 'queued')
-            .select('*')
-            .maybeSingle();
-
-        if (!upErr && updated) {
-            claimed.push(updated as IngestionJobRow);
-            await supabase.from('ingestion_job_attempts').insert({
-                job_id: job.id,
-                attempt_no: (job.attempt_count ?? 0) + 1,
-                status: 'running',
-                worker_id: workerId,
-            });
+        const updated = await claimOneQueuedJobRow(workerId, job);
+        if (updated) {
+            claimed.push(updated);
         }
     }
 

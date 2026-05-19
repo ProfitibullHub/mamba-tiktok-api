@@ -746,7 +746,7 @@ export function FinanceDebugView({ account, shopId, timezone = 'America/Los_Ange
                     <p>Data structure not suitable for table view (not an array).</p>
                     <button
                         onClick={() => setViewMode('json')}
-                        className="text-pink-500 hover:underline mt-2"
+                        className="text-mamba-green hover:underline mt-2"
                     >
                         Switch to JSON view
                     </button>
@@ -890,7 +890,7 @@ export function FinanceDebugView({ account, shopId, timezone = 'America/Los_Ange
                                 setError(null);
                             }}
                             className={`flex items-center space-x-2 px-4 py-3 rounded-lg transition-colors whitespace-nowrap ${isActive
-                                ? 'bg-pink-500/20 text-pink-400 border border-pink-500/30'
+                                ? 'bg-mamba-green/20 text-mamba-neon border border-mamba-green/30'
                                 : 'bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-white border border-gray-700'
                                 }`}
                         >
@@ -927,7 +927,7 @@ export function FinanceDebugView({ account, shopId, timezone = 'America/Los_Ange
                                 <div className="w-full bg-gray-900 border border-gray-700 rounded-lg px-4 py-3 text-gray-300 text-sm space-y-2">
                                     <p>
                                         <strong className="text-gray-200">P&amp;L audit:</strong> Master Date Range is converted with{' '}
-                                        <span className="font-mono text-pink-300">{timezone}</span> to <span className="font-mono">start_time</span> /{' '}
+                                        <span className="font-mono text-mamba-neon">{timezone}</span> to <span className="font-mono">start_time</span> /{' '}
                                         <span className="font-mono">end_time</span> (Unix). That is the <strong>same window</strong> Profit &amp; Loss uses when you pick the same dates
                                         (P&amp;L reads synced <span className="font-mono">shop_settlements</span>; this calls TikTok live).
                                     </p>
@@ -947,7 +947,7 @@ export function FinanceDebugView({ account, shopId, timezone = 'America/Los_Ange
                                     <select
                                         value={envelopeFocusId}
                                         onChange={(e) => setEnvelopeFocusId(e.target.value)}
-                                        className="w-full bg-gray-900 border border-gray-700 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-pink-500 text-sm"
+                                        className="w-full bg-gray-900 border border-gray-700 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-mamba-green text-sm"
                                     >
                                         <option value="">All statements in master range only (newest first)</option>
                                         {tiktokStatementOptions.map((s) => (
@@ -968,7 +968,7 @@ export function FinanceDebugView({ account, shopId, timezone = 'America/Los_Ange
                                     value={statementEnvelopePageToken}
                                     onChange={(e) => setStatementEnvelopePageToken(e.target.value)}
                                     placeholder="Leave empty to merge all transaction pages. Set to next_page_token for one page only (totals incomplete)."
-                                    className="w-full bg-gray-900 border border-gray-700 rounded-lg px-4 py-2 text-white placeholder-gray-500 focus:outline-none focus:border-pink-500 font-mono text-sm"
+                                    className="w-full bg-gray-900 border border-gray-700 rounded-lg px-4 py-2 text-white placeholder-gray-500 focus:outline-none focus:border-mamba-green font-mono text-sm"
                                 />
                             </div>
                         </>
@@ -980,7 +980,7 @@ export function FinanceDebugView({ account, shopId, timezone = 'America/Los_Ange
                             <select
                                 value={pageSize}
                                 onChange={(e) => setPageSize(Number(e.target.value))}
-                                className="w-full bg-gray-900 border border-gray-700 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-pink-500"
+                                className="w-full bg-gray-900 border border-gray-700 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-mamba-green"
                             >
                                 <option value={10}>10 items</option>
                                 <option value={20}>20 items</option>
@@ -994,7 +994,7 @@ export function FinanceDebugView({ account, shopId, timezone = 'America/Los_Ange
                         <button
                             onClick={fetchData}
                             disabled={loading || !shopId}
-                            className="w-full flex items-center justify-center space-x-2 px-4 py-2 bg-pink-600 hover:bg-pink-700 text-white rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed font-medium"
+                            className="w-full flex items-center justify-center space-x-2 px-4 py-2 bg-mamba-green hover:bg-mamba-deep text-mamba-dark rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed font-medium"
                         >
                             {loading ? <RefreshCw className="animate-spin" size={20} /> : <Search size={20} />}
                             <span>{loading ? 'Fetching...' : 'Fetch Data'}</span>
@@ -1168,7 +1168,7 @@ export function FinanceDebugView({ account, shopId, timezone = 'America/Los_Ange
                             </div>
                         ) : viewMode === 'totals' ? (
                             <div className="bg-gray-800/50 border border-gray-700 rounded-lg p-4 text-gray-400 text-sm">
-                                Switch to <span className="text-pink-400">Statement TX (TikTok direct · raw)</span>, fetch data, then open Totals.
+                                Switch to <span className="text-mamba-neon">Statement TX (TikTok direct · raw)</span>, fetch data, then open Totals.
                             </div>
                         ) : viewMode === 'table' ? (
                             <div className="bg-black rounded-lg border border-gray-800 overflow-hidden">
@@ -1190,13 +1190,13 @@ export function FinanceDebugView({ account, shopId, timezone = 'America/Los_Ange
 
 function IconForTab({ tab }: { tab: string }) {
     switch (tab) {
-        case 'statements': return <FileText className="text-pink-500" size={20} />;
-        case 'payments': return <CreditCard className="text-pink-500" size={20} />;
-        case 'withdrawals': return <ArrowDownCircle className="text-pink-500" size={20} />;
-        case 'unsettled': return <AlertCircle className="text-pink-500" size={20} />;
-        case 'order_tx': return <Search className="text-pink-500" size={20} />;
-        case 'statement_tx': return <Database className="text-pink-500" size={20} />;
-        case 'statement_tx_envelope': return <FileCode className="text-pink-500" size={20} />;
-        default: return <FileText className="text-pink-500" size={20} />;
+        case 'statements': return <FileText className="text-mamba-green" size={20} />;
+        case 'payments': return <CreditCard className="text-mamba-green" size={20} />;
+        case 'withdrawals': return <ArrowDownCircle className="text-mamba-green" size={20} />;
+        case 'unsettled': return <AlertCircle className="text-mamba-green" size={20} />;
+        case 'order_tx': return <Search className="text-mamba-green" size={20} />;
+        case 'statement_tx': return <Database className="text-mamba-green" size={20} />;
+        case 'statement_tx_envelope': return <FileCode className="text-mamba-green" size={20} />;
+        default: return <FileText className="text-mamba-green" size={20} />;
     }
 }

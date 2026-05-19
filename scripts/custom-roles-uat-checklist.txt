@@ -1,0 +1,27 @@
+Custom roles & effective permissions — manual UAT (staging)
+
+For each row: use a user with only the named custom role (via membership_roles), or toggle a single permission on a test custom role. Confirm UI visibility matches API (no false negatives) and unauthorized users are still blocked (no false positives).
+
+1) Messaging — messages.view / messages.send: open Messaging UI; send a message; confirm 403 without permission.
+
+2) Branding — view_brand_settings / edit_brand_settings: Agency console branding; view vs edit gates.
+
+3) TikTok shop data — tiktok.shop.data + plan entitlement: shop overview, orders sync path; confirm financials.view fallback on whitelisted GET paths only.
+
+4) P&L / finance — view_pnl, financials.view: Profit & Loss tab loads when permitted.
+
+5) Export / schedules — export_pnl, schedule_export: CSV export and schedule creation; plan entitlement where applicable.
+
+6) Dashboard email — email export from Overview: allowed when tiktok.shop.data OR view_pnl / financials.view / financials.restricted on seller tenant; sending still requires backend account access.
+
+7) Team / invite — users.manage, user_can_manage_tenant_members: invite member, change role; agency vs seller.
+
+8) Agency link — agency.sellers.link: link/unlink seller; console sections gated like Agency Admin + custom grant.
+
+9) Role editor — manage_roles / assign_roles / roles.manage: create custom role, assign permissions, assign roles to member; ceiling still enforced.
+
+10) Financial restrictions tab — system Seller Admin on that seller tenant (or Super Admin / legacy JWT admin): Financial Restrictions visible and save works; Agency Admin with linked seller but no Seller Admin must not see the tab; users.manage-only on seller without Seller Admin must not see it (API uses user_is_strict_seller_admin after migration).
+
+11) Dashboard.export_email SQL path (if used by jobs): service_role RPC user_has_permission_for_account honors membership_roles for assigned AM/agency grants.
+
+Record: date, environment, user id, tenant ids, pass/fail notes.

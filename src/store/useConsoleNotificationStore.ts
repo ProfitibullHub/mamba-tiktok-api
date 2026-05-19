@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { supabase } from '../lib/supabase';
 import { isStickyInvitationNotification } from '../lib/teamInviteNotifications';
+import { clearStaleAuthSession, isRevokedSessionPostgrestError } from '../lib/sessionErrors';
 
 export interface UserNotification {
     id: string;
@@ -64,7 +65,11 @@ export const useConsoleNotificationStore = create<ConsoleNotificationState>((set
                 });
             }
         } catch (err) {
-            console.error('[ConsoleNotificationStore] Failed to fetch notifications:', err);
+            if (isRevokedSessionPostgrestError(err)) {
+                void clearStaleAuthSession();
+            } else {
+                console.error('[ConsoleNotificationStore] Failed to fetch notifications:', err);
+            }
             set({ isLoading: false });
         }
     },
@@ -101,7 +106,7 @@ export const useConsoleNotificationStore = create<ConsoleNotificationState>((set
                             try {
                                 new Notification(`Mamba: ${newNotif.title}`, {
                                     body: newNotif.message,
-                                    icon: '/logo.svg', // using logo since vite.svg might be missing
+                                    icon: '/mamba-snake-head.svg',
                                 });
                             } catch (e) {
                                 console.error('[Browser Notification] Failed to trigger', e);

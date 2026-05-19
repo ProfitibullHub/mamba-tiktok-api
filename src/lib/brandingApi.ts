@@ -187,8 +187,11 @@ export type PatchBrandingBody = {
     customPresets?: CustomPreset[];
 };
 
-export async function fetchBranding(agencyTenantId?: string): Promise<BrandingResolved> {
-    const q = agencyTenantId ? `?agencyTenantId=${encodeURIComponent(agencyTenantId)}` : '';
+export async function fetchBranding(agencyTenantId?: string, accountId?: string): Promise<BrandingResolved> {
+    const params = new URLSearchParams();
+    if (agencyTenantId) params.set('agencyTenantId', agencyTenantId);
+    if (accountId) params.set('accountId', accountId);
+    const q = params.size > 0 ? `?${params}` : '';
     const res = await apiFetch(`/api/branding${q}`);
     const json = await res.json().catch(() => ({}));
     if (!res.ok) {

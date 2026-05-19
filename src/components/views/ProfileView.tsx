@@ -83,8 +83,8 @@ export function ProfileView() {
                 <div className="md:col-span-1 space-y-6">
                     <div className="bg-gray-800/50 border border-gray-700 rounded-2xl p-6">
                         <div className="flex flex-col items-center text-center">
-                            <div className="bg-pink-500/10 p-4 rounded-full mb-4 border border-pink-500/20">
-                                <User className="w-12 h-12 text-pink-500" />
+                            <div className="bg-mamba-green/10 p-4 rounded-full mb-4 border border-mamba-green/20">
+                                <User className="w-12 h-12 text-mamba-green" />
                             </div>
                             <h3 className="text-xl font-bold text-white">{profile?.full_name}</h3>
                             <p className="text-gray-400 text-sm">{profile?.email}</p>
@@ -98,11 +98,8 @@ export function ProfileView() {
                                               : 'bg-blue-500/20 text-blue-400 border-blue-500/30'
                                     }`}
                                 >
-                                    {primaryRoleBadge?.label ?? profile?.role?.toUpperCase() ?? 'USER'}
+                                    {primaryRoleBadge?.label ?? (profile?.role === 'admin' ? 'PLATFORM ADMIN' : 'MEMBER')}
                                 </span>
-                                {primaryRoleBadge && profile?.role && profile.role !== 'admin' && (
-                                    <span className="text-[10px] text-gray-500">Account type: {profile.role}</span>
-                                )}
                             </div>
                         </div>
                     </div>
@@ -126,8 +123,8 @@ export function ProfileView() {
                 <div className="md:col-span-2">
                     <div className="bg-gray-800/50 border border-gray-700 rounded-2xl p-8">
                         <div className="flex items-center gap-3 mb-6">
-                            <div className="bg-pink-500/10 p-2 rounded-lg">
-                                <Key className="w-5 h-5 text-pink-500" />
+                            <div className="bg-mamba-green/10 p-2 rounded-lg">
+                                <Key className="w-5 h-5 text-mamba-green" />
                             </div>
                             <h3 className="text-xl font-bold text-white">Change Password</h3>
                         </div>
@@ -143,7 +140,7 @@ export function ProfileView() {
                                         value={currentPassword}
                                         onChange={(e) => setCurrentPassword(e.target.value)}
                                         required
-                                        className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-pink-500 focus:border-transparent transition-all pr-12"
+                                        className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-mamba-green focus:border-transparent transition-all pr-12"
                                         placeholder="••••••••"
                                     />
                                     <button
@@ -167,7 +164,7 @@ export function ProfileView() {
                                             value={newPassword}
                                             onChange={(e) => setNewPassword(e.target.value)}
                                             required
-                                            className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-pink-500 focus:border-transparent transition-all pr-12"
+                                            className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-mamba-green focus:border-transparent transition-all pr-12"
                                             placeholder="••••••••"
                                         />
                                         <button
@@ -189,7 +186,7 @@ export function ProfileView() {
                                             value={confirmPassword}
                                             onChange={(e) => setConfirmPassword(e.target.value)}
                                             required
-                                            className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-pink-500 focus:border-transparent transition-all pr-12"
+                                            className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-mamba-green focus:border-transparent transition-all pr-12"
                                             placeholder="••••••••"
                                         />
                                         <button
@@ -221,7 +218,7 @@ export function ProfileView() {
                                 <button
                                     type="submit"
                                     disabled={loading}
-                                    className="flex items-center gap-2 bg-gradient-to-r from-pink-500 to-red-500 text-white px-6 py-3 rounded-lg font-semibold hover:from-pink-600 hover:to-red-600 focus:outline-none focus:ring-2 focus:ring-pink-500 focus:ring-offset-2 focus:ring-offset-gray-800 disabled:opacity-50 disabled:cursor-not-allowed transition-all transform hover:scale-[1.02]"
+                                    className="flex items-center gap-2 bg-gradient-to-r from-mamba-green to-mamba-deep text-mamba-dark px-6 py-3 rounded-lg font-semibold hover:from-mamba-neon hover:to-mamba-deep focus:outline-none focus:ring-2 focus:ring-mamba-green focus:ring-offset-2 focus:ring-offset-gray-800 disabled:opacity-50 disabled:cursor-not-allowed transition-all transform hover:scale-[1.02]"
                                 >
                                     {loading ? (
                                         <>

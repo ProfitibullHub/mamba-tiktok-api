@@ -4,6 +4,10 @@
  * Server-side utility for writing immutable audit log entries to `audit_logs`.
  * All writes use the service-role client directly — never the user's token.
  *
+ * PRD §10 — Timestamp: every row gets `created_at` (DB default) and, via trigger
+ * `trg_audit_logs_metadata_timestamp`, `metadata.timestamp` as ISO-8601 UTC at insert time.
+ * Callers may add other keys to `metadata`; do not rely on setting `metadata.timestamp` yourself.
+ *
  * Usage:
  *   import { auditLog } from './audit-logger.js';
  *
@@ -55,6 +59,20 @@ export type AuditAction =
     | 'auth.ads_connect'
     | 'branding.create'
     | 'branding.update'
+    | 'messaging.conversation.create'
+    | 'messaging.message.sent'
+    | 'messaging.message.received'
+    // Custom P&L
+    | 'pl.line_item.create'
+    | 'pl.line_item.update'
+    | 'pl.line_item.delete'
+    | 'pl.value.create'
+    | 'pl.value.update'
+    | 'finance.visibility.update'
+    | 'task.create'
+    | 'task.update'
+    | 'task.assign'
+    | 'task.delete'
     // Generic escape hatch
     | (string & {});
 
@@ -66,7 +84,10 @@ export interface AuditLogEntry {
     tenantId?: string | null;
     beforeState?: Record<string, unknown> | null;
     afterState?: Record<string, unknown> | null;
-    /** Extra structured metadata that doesn't fit state snapshots */
+    /**
+     * Extra structured metadata that doesn't fit state snapshots.
+     * On insert, the database merges `timestamp` (UTC ISO string) for PRD §10.
+     */
     metadata?: Record<string, unknown> | null;
 }
 

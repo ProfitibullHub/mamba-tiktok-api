@@ -120,7 +120,7 @@ export function FinanceEnvelopeTotalsPanel({ results }: { results: EnvelopeResul
                                 </tr>
                             ))}
                             {agg.statementRows.some((r) => r.ok) && (
-                                <tr className="bg-pink-500/10 font-medium text-white border-t border-pink-500/30">
+                                <tr className="bg-mamba-green/10 font-medium text-white border-t border-mamba-green/30">
                                     <td className="px-3 py-2" colSpan={2}>
                                         Grand total (statements)
                                     </td>
@@ -203,7 +203,7 @@ export function FinanceEnvelopeTotalsPanel({ results }: { results: EnvelopeResul
                                 </tr>
                             ))}
                             {agg.statementRows.some((r) => r.ok) && (
-                                <tr className="bg-pink-500/10 font-medium text-white border-t border-pink-500/30">
+                                <tr className="bg-mamba-green/10 font-medium text-white border-t border-mamba-green/30">
                                     <td className="px-3 py-2">Grand total</td>
                                     {AFFILIATE_COGS_FEE_FIELD_KEYS.map((k) => (
                                         <td key={k} className="px-3 py-2 text-right font-mono">
@@ -245,7 +245,7 @@ export function FinanceEnvelopeTotalsPanel({ results }: { results: EnvelopeResul
                         return (
                             <div key={section} className="border border-gray-800 rounded-lg overflow-hidden">
                                 <div className="bg-gray-800/80 px-3 py-2 flex justify-between items-center gap-2">
-                                    <span className="text-pink-300 font-medium">{section}</span>
+                                    <span className="text-mamba-neon font-medium">{section}</span>
                                     <span className="text-gray-400 text-xs">
                                         Section sum: <span className="text-white font-mono">{fmt(sectionSum)}</span>
                                     </span>

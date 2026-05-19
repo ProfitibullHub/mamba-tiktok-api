@@ -5,8 +5,9 @@ import {
     LineChart as LineChartIcon, BarChart2, PieChart as PieChartIcon
 } from 'lucide-react';
 import { CalculationTooltip } from './CalculationTooltip';
+import { MeasuredChartHost } from './MeasuredChartHost';
 import {
-    AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
+    AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip,
     BarChart, Bar, PieChart, Pie, Cell, Legend
 } from 'recharts';
 import { Order } from '../store/useShopStore';
@@ -32,8 +33,6 @@ interface ComparisonChartsProps {
     startDate?: string; // Optional: YYYY-MM-DD format
     endDate?: string;   // Optional: YYYY-MM-DD format
     timezone?: string;  // Shop timezone for date calculations
-    /** Matches OverviewView Key Metrics trends & previous-period fetch extension (LA hybrid offset when true). */
-    useHybridTimezone?: boolean;
     includeCancelledInTotal?: boolean;
     includeCancelledFinancials?: boolean;
 }
@@ -56,7 +55,6 @@ export function ComparisonCharts({
     startDate = '',
     endDate = '',
     timezone = 'America/Los_Angeles',
-    useHybridTimezone = false,
     includeCancelledInTotal = false,
     includeCancelledFinancials = false
 }: ComparisonChartsProps) {
@@ -100,9 +98,9 @@ export function ComparisonCharts({
         if (!startDate || !endDate) return null;
         const shopPeriodStart = getShopDayStartTimestamp(startDate, timezone);
         const shopPeriodEndExclusive = getShopDayEndExclusiveTimestamp(endDate, timezone);
-        const { prevStart, prevEndExclusive } = getPreviousPeriodRange(startDate, endDate, timezone, useHybridTimezone);
+        const { prevStart, prevEndExclusive } = getPreviousPeriodRange(startDate, endDate, timezone);
         return { shopPeriodStart, shopPeriodEndExclusive, prevStart, prevEndExclusive };
-    }, [startDate, endDate, timezone, useHybridTimezone]);
+    }, [startDate, endDate, timezone]);
 
     // Check if the loaded orders cover the previous period
     const needsFetch = useMemo(() => {
@@ -225,7 +223,7 @@ export function ComparisonCharts({
                 prevBounds.push({ start: segStart, end: Math.max(segStart, segEnd) });
             }
         } else {
-            // Daily buckets: calendar-aware current slices (DST-safe); partition previous trend window equally so totals match aggregates (including hybrid skew).
+            // Daily buckets: calendar-aware current slices (DST-safe); partition previous trend window equally so totals match aggregates.
             for (let d = startDate; ; ) {
                 const ds = getShopDayStartTimestamp(d, timezone);
                 const de = getShopDayEndExclusiveTimestamp(d, timezone);
@@ -292,10 +290,9 @@ export function ComparisonCharts({
                 previousDateLabel = formatHourTick(previousDayStart);
                 tooltipHeading = `${formatDateHourTooltip(currentDayStart)} vs ${formatDateHourTooltip(previousDayStart)}`;
             } else {
-                const currentDayYmd = formatShopDateISO(currentDayStart * 1000, timezone);
-                const prevCompanionYmd = previousCalendarDayISO(currentDayYmd, timezone);
-                const previousLabelTs = getShopDayStartTimestamp(prevCompanionYmd, timezone);
-                previousDateLabel = formatDateLabel(previousLabelTs);
+                // Must match the same-index previous bucket (prevBounds[i]), not "calendar day before current"
+                // (that incorrectly showed e.g. Feb 10 current vs "Feb 9" while the series point was Feb 2 in the prior window).
+                previousDateLabel = formatDateLabel(previousDayStart);
                 tooltipHeading = undefined;
             }
 
@@ -349,7 +346,6 @@ export function ComparisonCharts({
 
         let periodLabel: { current: string; previous: string };
 
-        // Hybrid trend windows span slightly more UTC than a calendar label; copy still reads "Today vs Yesterday".
         if (startDate === endDate && startDate === shopTodayStr) {
             periodLabel = { current: 'Today', previous: 'Yesterday' };
         } else if (startDate === endDate) {
@@ -639,11 +635,17 @@ export function ComparisonCharts({
                 </p>
             </div>
 
-            {/* Chart Area */}
-            <div className="h-[300px] w-full" key={chartType}>
-                <ResponsiveContainer width="100%" height="100%">
-                    {chartType === 'line' ? (
-                        <AreaChart data={chartData.dailyData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
+            {/* Chart — explicit measured size avoids ResponsiveContainer -1 during layout / subscriptions */}
+            <div className="relative w-full min-w-0" key={chartType}>
+                <MeasuredChartHost heightPx={300}>
+                    {(size) =>
+                        chartType === 'line' ? (
+                        <AreaChart
+                            width={size.width}
+                            height={size.height}
+                            data={chartData.dailyData}
+                            margin={{ top: 10, right: 10, left: 0, bottom: 0 }}
+                        >
                             <defs>
                                 <linearGradient id="colorCurrent" x1="0" y1="0" x2="0" y2="1">
                                     <stop offset="5%" stopColor={chartPrimary} stopOpacity={0.35} />
@@ -698,7 +700,12 @@ export function ComparisonCharts({
                             />
                         </AreaChart>
                     ) : chartType === 'bar' ? (
-                        <BarChart data={chartData.dailyData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
+                        <BarChart
+                            width={size.width}
+                            height={size.height}
+                            data={chartData.dailyData}
+                            margin={{ top: 10, right: 10, left: 0, bottom: 0 }}
+                        >
                             <CartesianGrid strokeDasharray="3 3" stroke={chartGrid} vertical={false} />
                             <XAxis
                                 dataKey="dayLabel"
@@ -732,39 +739,46 @@ export function ComparisonCharts({
                             />
                         </BarChart>
                     ) : (
-                        <PieChart>
-                            <Pie
-                                data={chartData.pieData}
-                                cx="50%"
-                                cy="50%"
-                                innerRadius={60}
-                                outerRadius={80}
-                                paddingAngle={5}
-                                dataKey="value"
-                                isAnimationActive={false}
-                            >
-                                {chartData.pieData.map((_, index) => (
-                                    <Cell key={`cell - ${index} `} fill={COLORS[index % COLORS.length]} />
-                                ))}
-                            </Pie>
-                            <Tooltip content={<CustomTooltip />} />
-                            <Legend
-                                layout="vertical"
-                                verticalAlign="middle"
-                                align="right"
-                                formatter={(value) => (
-                                    <span className="text-gray-300 text-sm ml-2">{value}</span>
-                                )}
-                            />
-                        </PieChart>
+                        (() => {
+                            const m = Math.min(size.width, size.height);
+                            const outerR = Math.max(56, m * 0.28);
+                            const innerR = outerR * 0.55;
+                            return (
+                                <PieChart width={size.width} height={size.height}>
+                                    <Pie
+                                        data={chartData.pieData}
+                                        cx={size.width / 2}
+                                        cy={size.height / 2}
+                                        innerRadius={innerR}
+                                        outerRadius={outerR}
+                                        paddingAngle={5}
+                                        dataKey="value"
+                                        isAnimationActive={false}
+                                    >
+                                        {chartData.pieData.map((_, index) => (
+                                            <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
+                                        ))}
+                                    </Pie>
+                                    <Tooltip content={<CustomTooltip />} />
+                                    <Legend
+                                        layout="vertical"
+                                        verticalAlign="middle"
+                                        align="right"
+                                        formatter={(value) => (
+                                            <span className="text-gray-300 text-sm ml-2">{value}</span>
+                                        )}
+                                    />
+                                </PieChart>
+                            );
+                        })()
                     )}
-                </ResponsiveContainer>
+                </MeasuredChartHost>
+                {chartData.pieData.length === 0 && chartType === 'pie' && (
+                    <div className="absolute inset-0 flex items-center justify-center bg-gray-900/50 backdrop-blur-sm rounded-xl pointer-events-none">
+                        <p className="text-gray-400">No data available for breakdown</p>
+                    </div>
+                )}
             </div>
-            {chartData.pieData.length === 0 && chartType === 'pie' && (
-                <div className="absolute inset-0 flex items-center justify-center bg-gray-900/50 backdrop-blur-sm rounded-xl">
-                    <p className="text-gray-400">No data available for breakdown</p>
-                </div>
-            )}
         </div>
     );
 }

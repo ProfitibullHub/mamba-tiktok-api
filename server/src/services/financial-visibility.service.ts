@@ -5,6 +5,8 @@ export type FinancialFieldAccess = {
     canViewMargin: boolean;
     canViewCustomLineItems: boolean;
     restrictedFields: string[];
+    /** Custom P&L line item ids hidden for this viewer (no payload rows; no inference). */
+    restrictedCustomPlLineItemIds: string[];
 };
 
 const DEFAULT_RESTRICTED: FinancialFieldAccess = {
@@ -12,6 +14,7 @@ const DEFAULT_RESTRICTED: FinancialFieldAccess = {
     canViewMargin: false,
     canViewCustomLineItems: false,
     restrictedFields: ['cogs', 'margin', 'custom_line_items'],
+    restrictedCustomPlLineItemIds: [],
 };
 
 export async function getFinancialFieldAccess(userId: string, sellerTenantId: string): Promise<FinancialFieldAccess> {
@@ -31,11 +34,17 @@ export async function getFinancialFieldAccess(userId: string, sellerTenantId: st
         ? row.restricted_fields.filter((x: unknown): x is string => typeof x === 'string')
         : [];
 
+    const rawLineIds = (row as { restricted_custom_pl_line_item_ids?: unknown }).restricted_custom_pl_line_item_ids;
+    const restrictedCustomPlLineItemIds = Array.isArray(rawLineIds)
+        ? rawLineIds.filter((x: unknown): x is string => typeof x === 'string')
+        : [];
+
     return {
         canViewCogs: row.can_view_cogs === true,
         canViewMargin: row.can_view_margin === true,
         canViewCustomLineItems: row.can_view_custom_line_items === true,
         restrictedFields,
+        restrictedCustomPlLineItemIds,
     };
 }
 

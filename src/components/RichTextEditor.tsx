@@ -25,7 +25,7 @@ const ToolbarButton = memo(({ icon, title, onClick, isActive }: ToolbarButtonPro
         onClick={onClick}
         title={title}
         className={`p-2 rounded-md transition-colors ${isActive
-                ? 'bg-pink-600 text-white'
+                ? 'bg-mamba-green text-mamba-dark'
                 : 'text-gray-400 hover:text-white hover:bg-gray-700'
             }`}
     >
@@ -186,7 +186,7 @@ function RichTextEditorComponent({ value, onChange, placeholder, className }: Ri
                     [&_ul]:list-disc [&_ul]:pl-5 [&_ul]:mb-2
                     [&_ol]:list-decimal [&_ol]:pl-5 [&_ol]:mb-2
                     [&_li]:mb-1
-                    [&_a]:text-pink-400 [&_a]:underline
+                    [&_a]:text-mamba-neon [&_a]:underline
                     [&_strong]:font-bold [&_strong]:text-white
                     [&_em]:italic
                     [&_u]:underline"

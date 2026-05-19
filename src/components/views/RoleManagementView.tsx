@@ -11,6 +11,8 @@ import {
     X,
     Check,
     ChevronRight,
+    ChevronUp,
+    ChevronDown,
     AlertCircle,
     Users,
     Lock,
@@ -18,6 +20,7 @@ import {
     UserX,
     UserCheck,
     LogOut,
+    Mail,
 } from 'lucide-react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTenantContext, type ManageableTenant } from '../../contexts/TenantContext';
@@ -41,6 +44,10 @@ import {
     syncMemberRoleAssignments,
     type TeamProfileRow,
 } from '../../lib/teamApi';
+import {
+    getSellerMessagingRecipients,
+    putSellerMessagingRecipients,
+} from '../../lib/sellerMessagingRecipientsApi';
 import { showAppToast } from '../../store/useAppToastStore';
 
 type RoleRow = {
@@ -132,6 +139,8 @@ export function RoleManagementView() {
     const [assignAccountId, setAssignAccountId] = useState('');
     const [multiRoleTarget, setMultiRoleTarget] = useState<DirectoryRow | null>(null);
     const [multiRoleSelected, setMultiRoleSelected] = useState<Set<string>>(new Set());
+    const [sellerRecipientDraft, setSellerRecipientDraft] = useState<string[]>([]);
+    const [sellerMsgRoleFilter, setSellerMsgRoleFilter] = useState('');
 
     const openAssignModal = () => {
         setAssignOpen(true);
@@ -319,6 +328,7 @@ export function RoleManagementView() {
                     .select('id,name,description,type,scope,tenant_id')
                     .eq('tenant_id', selectedTenantId)
                     .eq('type', 'custom')
+                    .is('deleted_at', null)
                     .order('name'),
             ]);
             if (e1) throw e1;
@@ -410,6 +420,21 @@ export function RoleManagementView() {
         enabled: !!selectedTenantId && activeTab === 'members',
     });
 
+    const {
+        data: sellerRecipientsSettings,
+        isLoading: loadingSellerMsgRecipients,
+        error: sellerMsgRecipientsQueryError,
+    } = useQuery({
+        queryKey: ['seller-messaging-recipients', selectedTenantId],
+        queryFn: () => getSellerMessagingRecipients(selectedTenantId!),
+        enabled: !!selectedTenantId && selectedTenant?.type === 'seller' && activeTab === 'members',
+    });
+
+    React.useEffect(() => {
+        if (!sellerRecipientsSettings) return;
+        setSellerRecipientDraft(sellerRecipientsSettings.recipientUserIds);
+    }, [sellerRecipientsSettings]);
+
     const tenantMemberRolesMap = useMemo(() => {
         const m = new Map<string, string[]>();
         for (const row of tenantMemberRoles as Array<{ user_id: string; role_names: string[] }>) {
@@ -464,6 +489,34 @@ export function RoleManagementView() {
         );
     }, [directory, memberSearch]);
 
+    const sellerMsgDistinctRoles = useMemo(() => {
+        const s = new Set<string>();
+        for (const d of directory) {
+            if (d.role_name?.trim()) s.add(d.role_name);
+        }
+        return Array.from(s).sort((a, b) => a.localeCompare(b));
+    }, [directory]);
+
+    const sellerMsgAddableMembers = useMemo(() => {
+        if (selectedTenant?.type !== 'seller') return [];
+        return directory.filter(
+           (d) =>
+                d.status === 'active' &&
+                typeof d.email === 'string' &&
+                d.email.includes('@') &&
+                !sellerRecipientDraft.includes(d.user_id) &&
+                (!sellerMsgRoleFilter || d.role_name === sellerMsgRoleFilter),
+        );
+    }, [selectedTenant?.type, directory, sellerRecipientDraft, sellerMsgRoleFilter]);
+
+    const sellerMsgDirty = useMemo(() => {
+        if (!sellerRecipientsSettings) return false;
+        const a = sellerRecipientDraft;
+        const b = sellerRecipientsSettings.recipientUserIds;
+        if (a.length !== b.length) return true;
+        return a.some((id, i) => id !== b[i]);
+    }, [sellerRecipientDraft, sellerRecipientsSettings]);
+
     const flash = (type: 'ok' | 'err', text: string) => {
         showAppToast(text, type === 'ok' ? 'ok' : 'err');
     };
@@ -482,9 +535,11 @@ export function RoleManagementView() {
     };
 
     const invalidateTenant = () => {
-        queryClient.invalidateQueries({ queryKey: ['tenant-roles-combined', selectedTenantId] });
-        queryClient.invalidateQueries({ queryKey: ['tenant-directory', selectedTenantId] });
+        queryClient.invalidateQueries({ queryKey: ['tenant-roles-combined'] });
+        queryClient.invalidateQueries({ queryKey: ['tenant-directory'] });
         queryClient.invalidateQueries({ queryKey: ['tenant-memberships'] });
+        queryClient.invalidateQueries({ queryKey: ['agency-assignable-roles'] });
+        queryClient.invalidateQueries({ queryKey: ['seller-messaging-recipients', selectedTenantId] });
     };
 
     const handleSaveCustomPermissions = async (actions: string[]) => {
@@ -525,13 +580,15 @@ export function RoleManagementView() {
     const handleDeleteRole = async () => {
         if (!selectedRoleId || !selectedRole || selectedRole.type !== 'custom') return;
         if (!confirm(`Delete role "${selectedRole.name}"?`)) return;
+        const removedId = selectedRoleId;
         setBusy('delete');
-        const { error } = await deleteCustomRole(selectedRoleId);
+        const { error } = await deleteCustomRole(removedId);
         setBusy(null);
         if (error) {
             flash('err', error.message);
             return;
         }
+        queryClient.removeQueries({ queryKey: ['role-permissions', removedId] });
         setSelectedRoleId(null);
         flash('ok', 'Role deleted');
         invalidateTenant();
@@ -683,6 +740,30 @@ export function RoleManagementView() {
         });
     };
 
+    const saveSellerMessagingRecipients = async () => {
+        if (!selectedTenantId || selectedTenant?.type !== 'seller') return;
+        setBusy('seller-msg-recipients');
+        try {
+            await putSellerMessagingRecipients(selectedTenantId, sellerRecipientDraft);
+            flash('ok', 'Messaging recipients saved');
+            await queryClient.invalidateQueries({ queryKey: ['seller-messaging-recipients', selectedTenantId] });
+        } catch (e: any) {
+            flash('err', e.message || 'Save failed');
+        } finally {
+            setBusy(null);
+        }
+    };
+
+    const moveSellerRecipient = (index: number, delta: number) => {
+        setSellerRecipientDraft((prev) => {
+            const j = index + delta;
+            if (j < 0 || j >= prev.length) return prev;
+            const next = [...prev];
+            [next[index], next[j]] = [next[j], next[index]];
+            return next;
+        });
+    };
+
     if (ctxLoading || (isUnrestrictedAdmin && loadingAllTenants)) {
         return (
             <div className="flex items-center justify-center h-64 text-gray-400">
@@ -697,8 +778,8 @@ export function RoleManagementView() {
                 <Shield className="w-12 h-12 mx-auto text-gray-600" />
                 <h2 className="text-xl font-semibold text-white">No tenant admin access</h2>
                 <p className="text-sm">
-                    You need <span className="text-pink-300">Agency Admin</span> on an agency or{' '}
-                    <span className="text-pink-300">Seller Admin</span> on a seller tenant to manage team roles.
+                    You need <span className="text-mamba-neon">Agency Admin</span> on an agency or{' '}
+                    <span className="text-mamba-neon">Seller Admin</span> on a seller tenant to manage team roles.
                 </p>
             </div>
         );
@@ -706,14 +787,14 @@ export function RoleManagementView() {
 
     return (
         <div className="w-full min-w-0 h-full flex flex-col text-white animate-in fade-in duration-500 relative">
-            <div className="absolute inset-x-0 top-0 h-64 bg-gradient-to-b from-fuchsia-500/10 via-pink-500/5 to-transparent -z-10 rounded-full blur-[100px] opacity-50 pointer-events-none" />
+            <div className="absolute inset-x-0 top-0 h-64 bg-gradient-to-b from-mamba-green/10 via-mamba-green/5 to-transparent -z-10 rounded-full blur-[100px] opacity-50 pointer-events-none" />
 
             <div className="flex-shrink-0 p-8 pb-0 relative z-10">
                 <div className="flex flex-wrap items-center justify-between gap-6 mb-8">
                     <div>
-                        <h1 className="text-4xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-white via-pink-100 to-white flex items-center gap-4">
-                            <div className="p-2.5 bg-pink-500/10 rounded-2xl border border-pink-500/20 backdrop-blur-xl">
-                                <Users className="w-8 h-8 text-pink-400 drop-shadow-lg" />
+                        <h1 className="text-4xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-white via-mamba-text to-white flex items-center gap-4">
+                            <div className="p-2.5 bg-mamba-green/10 rounded-2xl border border-mamba-green/20 backdrop-blur-xl">
+                                <Users className="w-8 h-8 text-mamba-neon drop-shadow-lg" />
                             </div>
                             Team & roles
                         </h1>
@@ -730,7 +811,7 @@ export function RoleManagementView() {
                                 setSelectedTenantId(e.target.value);
                                 setSelectedRoleId(null);
                             }}
-                            className="bg-white/[0.02] backdrop-blur-sm border border-white/10 rounded-2xl px-5 py-3 text-sm text-white min-w-[240px] focus:outline-none focus:border-pink-500/50 transition-all font-medium appearance-none shadow-xl cursor-pointer hover:bg-white/[0.04]"
+                            className="bg-white/[0.02] backdrop-blur-sm border border-white/10 rounded-2xl px-5 py-3 text-sm text-white min-w-[240px] focus:outline-none focus:border-mamba-green/50 transition-all font-medium appearance-none shadow-xl cursor-pointer hover:bg-white/[0.04]"
                             style={{ backgroundImage: `url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%239ca3af' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e")`, backgroundPosition: 'right 0.5rem center', backgroundRepeat: 'no-repeat', backgroundSize: '1.5em 1.5em', paddingRight: '2.5rem' }}
                         >
                             {effectiveTenants.map((t) => (
@@ -748,7 +829,7 @@ export function RoleManagementView() {
                         type="button"
                         onClick={() => setActiveTab('members')}
                         className={`px-5 py-2.5 rounded-2xl font-bold text-sm transition-all duration-300 ${activeTab === 'members'
-                                ? 'bg-pink-600/90 text-white shadow-xl shadow-pink-900/40 border border-pink-500/50 -translate-y-0.5'
+                                ? 'bg-mamba-green/90 text-mamba-dark shadow-xl shadow-mamba-dark/40 border border-mamba-green/50 -translate-y-0.5'
                                 : 'bg-white/[0.02] text-gray-400 border border-white/10 hover:text-white hover:border-white/20 hover:bg-white/5'
                             }`}
                     >
@@ -761,7 +842,7 @@ export function RoleManagementView() {
                         type="button"
                         onClick={() => setActiveTab('roles')}
                         className={`px-5 py-2.5 rounded-2xl font-bold text-sm transition-all duration-300 ${activeTab === 'roles'
-                                ? 'bg-pink-600/90 text-white shadow-xl shadow-pink-900/40 border border-pink-500/50 -translate-y-0.5'
+                                ? 'bg-mamba-green/90 text-mamba-dark shadow-xl shadow-mamba-dark/40 border border-mamba-green/50 -translate-y-0.5'
                                 : 'bg-white/[0.02] text-gray-400 border border-white/10 hover:text-white hover:border-white/20 hover:bg-white/5'
                             }`}
                     >
@@ -784,14 +865,14 @@ export function RoleManagementView() {
                                     value={memberSearch}
                                     onChange={(e) => setMemberSearch(e.target.value)}
                                     placeholder="Search by email, name, or user id…"
-                                    className="w-full bg-gray-950/80 border border-white/10 rounded-2xl py-3 pl-11 pr-4 text-sm focus:outline-none focus:border-pink-500/50 text-white placeholder-gray-600 transition-all font-medium shadow-inner"
+                                    className="w-full bg-gray-950/80 border border-white/10 rounded-2xl py-3 pl-11 pr-4 text-sm focus:outline-none focus:border-mamba-green/50 text-white placeholder-gray-600 transition-all font-medium shadow-inner"
                                 />
                             </div>
                             {!isAccountCoordinatorViewer && (
                                 <button
                                     type="button"
                                     onClick={openAssignModal}
-                                    className="flex items-center justify-center gap-2 bg-gradient-to-r from-pink-600 to-rose-600 hover:from-pink-500 hover:to-rose-500 text-white px-6 py-3 rounded-2xl font-bold text-sm transition-all hover:shadow-lg hover:shadow-pink-500/20 hover:-translate-y-0.5 w-full md:w-auto"
+                                    className="flex items-center justify-center gap-2 bg-gradient-to-r from-mamba-green to-mamba-deep hover:from-mamba-deep hover:to-mamba-green text-mamba-dark px-6 py-3 rounded-2xl font-bold text-sm transition-all hover:shadow-lg hover:shadow-mamba-green/20 hover:-translate-y-0.5 w-full md:w-auto"
                                 >
                                     <UserPlus size={18} />
                                     Assign role to user
@@ -804,6 +885,8 @@ export function RoleManagementView() {
                                     <p>
                                         <span className="font-bold text-cyan-200">View only.</span> Account Coordinators can
                                         see the agency team but cannot change roles, assign members, or use member actions.
+                                        On Team tasks, you only see tasks you created or are assigned to you (within sellers
+                                        assigned to you).
                                     </p>
                                 ) : (
                                     <p>
@@ -819,9 +902,203 @@ export function RoleManagementView() {
                             </div>
                         )}
 
+                        {selectedTenant?.type === 'seller' && (
+                            <div className="rounded-3xl border border-white/10 bg-white/[0.02] p-5 md:p-6 space-y-4 shrink-0">
+                                <div className="flex items-start gap-3">
+                                    <div className="p-2 rounded-xl bg-mamba-green/10 border border-mamba-green/20 shrink-0">
+                                        <Mail className="w-5 h-5 text-mamba-neon" />
+                                    </div>
+                                    <div className="min-w-0 flex-1 space-y-1">
+                                        <h3 className="text-sm font-bold text-white tracking-tight">Agency message recipients</h3>
+                                        <p className="text-xs text-gray-400 leading-relaxed max-w-3xl">
+                                            Choose which people on this shop team receive email when the agency sends from unified
+                                            messaging. The <span className="text-gray-200">first</span> in the list is the primary
+                                            recipient (To); anyone after that is copied (BCC). Leave the list empty to use the
+                                            automatic rule (Seller Admin, then Seller User with email).
+                                        </p>
+                                    </div>
+                                </div>
+                                {loadingSellerMsgRecipients ? (
+                                    <div className="flex items-center gap-2 text-gray-400 text-sm py-4">
+                                        <Loader2 className="w-5 h-5 animate-spin text-mamba-green" />
+                                        Loading recipient settings…
+                                    </div>
+                                ) : sellerMsgRecipientsQueryError ? (
+                                    <p className="text-sm text-red-300/95">
+                                        {sellerMsgRecipientsQueryError instanceof Error
+                                            ? sellerMsgRecipientsQueryError.message
+                                            : 'Could not load messaging recipients.'}
+                                    </p>
+                                ) : sellerRecipientsSettings ? (
+                                    <div className="space-y-4">
+                                        {sellerRecipientsSettings.usesDefault && sellerRecipientDraft.length === 0 && (
+                                            <p className="text-xs text-amber-200/90 bg-amber-500/10 border border-amber-500/20 rounded-xl px-3 py-2">
+                                                Using the default primary contact (not a custom list).
+                                            </p>
+                                        )}
+                                        {sellerRecipientDraft.length > 0 && (
+                                            <ul className="space-y-2">
+                                                {sellerRecipientDraft.map((uid, idx) => {
+                                                    const row = directory.find((d) => d.user_id === uid);
+                                                    const rns = tenantMemberRolesMap.get(uid);
+                                                    const roleLabel =
+                                                        rns && rns.length > 0 ? rns.join(', ') : row?.role_name || '—';
+                                                    const label =
+                                                        row?.full_name?.trim() ||
+                                                        row?.email ||
+                                                        `${uid.slice(0, 8)}…`;
+                                                    return (
+                                                        <li
+                                                            key={`${uid}-${idx}`}
+                                                            className="flex flex-wrap items-center gap-2 bg-black/25 border border-white/10 rounded-2xl px-3 py-2.5"
+                                                        >
+                                                            <span className="text-xs text-gray-500 font-mono w-6 shrink-0">
+                                                                {idx + 1}.
+                                                            </span>
+                                                            <div className="flex-1 min-w-0">
+                                                               <p className="text-sm font-medium text-white truncate">{label}</p>
+                                                                <p className="text-[11px] text-gray-500 truncate">
+                                                                    {roleLabel}
+                                                                    {row?.email ? ` · ${row.email}` : ''}
+                                                                </p>
+                                                            </div>
+                                                            {sellerRecipientsSettings.canManage && (
+                                                                <div className="flex items-center gap-1 shrink-0">
+                                                                    <button
+                                                                        type="button"
+                                                                        disabled={busy === 'seller-msg-recipients' || idx === 0}
+                                                                        onClick={() => moveSellerRecipient(idx, -1)}
+                                                                        className="p-1.5 rounded-lg border border-white/10 text-gray-400 hover:text-white hover:bg-white/5 disabled:opacity-30 disabled:pointer-events-none"
+                                                                        aria-label="Move up"
+                                                                    >
+                                                                        <ChevronUp size={16} />
+                                                                    </button>
+                                                                    <button
+                                                                        type="button"
+                                                                        disabled={
+                                                                            busy === 'seller-msg-recipients' ||
+                                                                            idx >= sellerRecipientDraft.length - 1
+                                                                        }
+                                                                        onClick={() => moveSellerRecipient(idx, 1)}
+                                                                        className="p-1.5 rounded-lg border border-white/10 text-gray-400 hover:text-white hover:bg-white/5 disabled:opacity-30 disabled:pointer-events-none"
+                                                                        aria-label="Move down"
+                                                                    >
+                                                                        <ChevronDown size={16} />
+                                                                    </button>
+                                                                    <button
+                                                                        type="button"
+                                                                        disabled={busy === 'seller-msg-recipients'}
+                                                                        onClick={() =>
+                                                                            setSellerRecipientDraft((p) =>
+                                                                                p.filter((id) => id !== uid),
+                                                                            )
+                                                                        }
+                                                                        className="p-1.5 rounded-lg border border-white/10 text-red-300/90 hover:bg-red-500/10"
+                                                                        aria-label="Remove"
+                                                                    >
+                                                                        <X size={16} />
+                                                                    </button>
+                                                                </div>
+                                                            )}
+                                                        </li>
+                                                    );
+                                                })}
+                                            </ul>
+                                        )}
+                                        {sellerRecipientsSettings.canManage && (
+                                            <>
+                                                <div className="flex flex-col sm:flex-row gap-3 sm:items-end">
+                                                    <label className="block space-y-1.5 flex-1 min-w-0">
+                                                        <span className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide">
+                                                            Filter by role
+                                                        </span>
+                                                        <select
+                                                            value={sellerMsgRoleFilter}
+                                                            onChange={(e) => setSellerMsgRoleFilter(e.target.value)}
+                                                            className="w-full bg-gray-950/80 border border-white/10 rounded-xl px-3 py-2.5 text-sm text-white focus:outline-none focus:border-mamba-green/50"
+                                                        >
+                                                            <option value="">All roles</option>
+                                                            {sellerMsgDistinctRoles.map((rn) => (
+                                                                <option key={rn} value={rn}>
+                                                                    {rn}
+                                                                </option>
+                                                            ))}
+                                                        </select>
+                                                    </label>
+                                                    <label className="block space-y-1.5 flex-1 min-w-0">
+                                                        <span className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide">
+                                                            Add team member
+                                                        </span>
+                                                        <select
+                                                            value=""
+                                                            onChange={(e) => {
+                                                                const v = e.target.value;
+                                                                if (!v) return;
+                                                                setSellerRecipientDraft((p) => [...p, v]);
+                                                                e.target.value = '';
+                                                            }}
+                                                            disabled={busy === 'seller-msg-recipients' || loadingDir}
+                                                            className="w-full bg-gray-950/80 border border-white/10 rounded-xl px-3 py-2.5 text-sm text-white focus:outline-none focus:border-mamba-green/50 disabled:opacity-50"
+                                                        >
+                                                            <option value="">
+                                                                {sellerMsgAddableMembers.length === 0
+                                                                    ? 'No more members with email'
+                                                                    : 'Select a member…'}
+                                                            </option>
+                                                            {sellerMsgAddableMembers.map((d) => (
+                                                                <option key={d.user_id} value={d.user_id}>
+                                                                    {(d.full_name || d.email || d.user_id).slice(0, 72)}
+                                                                    {d.role_name ? ` — ${d.role_name}` : ''}
+                                                                </option>
+                                                            ))}
+                                                        </select>
+                                                    </label>
+                                                </div>
+                                                <div className="flex flex-wrap gap-2 pt-1">
+                                                    <button
+                                                        type="button"
+                                                        disabled={
+                                                            busy === 'seller-msg-recipients' || !sellerMsgDirty
+                                                        }
+                                                        onClick={saveSellerMessagingRecipients}
+                                                        className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-mamba-green/90 text-mamba-dark font-bold text-sm hover:bg-mamba-green disabled:opacity-40 disabled:pointer-events-none"
+                                                    >
+                                                        {busy === 'seller-msg-recipients' ? (
+                                                            <Loader2 className="w-4 h-4 animate-spin" />
+                                                        ) : (
+                                                            <Check className="w-4 h-4" />
+                                                        )}
+                                                        Save recipients
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        disabled={
+                                                            busy === 'seller-msg-recipients' ||
+                                                            (sellerRecipientDraft.length === 0 &&
+                                                                sellerRecipientsSettings.usesDefault)
+                                                        }
+                                                        onClick={() => setSellerRecipientDraft([])}
+                                                        className="px-4 py-2.5 rounded-xl border border-white/15 text-sm text-gray-300 hover:bg-white/5 disabled:opacity-40"
+                                                    >
+                                                        Clear list (use default)
+                                                    </button>
+                                                </div>
+                                            </>
+                                        )}
+                                        {!sellerRecipientsSettings.canManage && (
+                                            <p className="text-xs text-gray-500 border border-white/5 rounded-xl px-3 py-2 bg-white/[0.02]">
+                                                You can view this list but only a Seller Admin or Agency Admin (or platform
+                                                operator) can change who receives agency email for this shop.
+                                            </p>
+                                        )}
+                                    </div>
+                                ) : null}
+                            </div>
+                        )}
+
                         {loadingDir ? (
                             <div className="flex items-center justify-center py-20">
-                                <Loader2 className="w-10 h-10 animate-spin text-pink-500" />
+                                <Loader2 className="w-10 h-10 animate-spin text-mamba-green" />
                             </div>
                         ) : directoryError ? (
                             <div className="flex gap-4 p-6 rounded-3xl border border-red-500/25 bg-red-500/10 text-red-100">
@@ -856,7 +1133,7 @@ export function RoleManagementView() {
                             </div>
                         ) : (
                             <div className="bg-white/[0.02] border border-white/10 rounded-3xl backdrop-blur-md shadow-2xl relative z-10 flex-1 flex flex-col">
-                                <div className="absolute inset-0 bg-gradient-to-br from-pink-500/5 to-transparent pointer-events-none rounded-3xl" />
+                                <div className="absolute inset-0 bg-gradient-to-br from-mamba-green/5 to-transparent pointer-events-none rounded-3xl" />
                                 <div className="relative z-10 flex-1 w-full pb-32">
                                     <table className="w-full text-left text-sm relative z-10">
                                         <thead>
@@ -872,7 +1149,7 @@ export function RoleManagementView() {
                                             <tr key={row.membership_id} className="hover:bg-white/[0.04] transition-colors group">
                                                 <td className="px-6 py-5">
                                                     <div className="flex items-center gap-4">
-                                                        <div className="w-10 h-10 rounded-full bg-gradient-to-br from-gray-800 to-gray-900 border border-white/10 flex items-center justify-center shrink-0 shadow-inner group-hover:border-pink-500/30 transition-colors">
+                                                        <div className="w-10 h-10 rounded-full bg-gradient-to-br from-gray-800 to-gray-900 border border-white/10 flex items-center justify-center shrink-0 shadow-inner group-hover:border-mamba-green/30 transition-colors">
                                                             <span className="text-white font-bold text-sm">
                                                                 {(row.full_name || row.email || '?')[0].toUpperCase()}
                                                             </span>
@@ -890,9 +1167,9 @@ export function RoleManagementView() {
                                                 </td>
                                                 <td className="px-6 py-5 align-top pt-7">
                                                     {row.user_id === user?.id && !isUnrestrictedAdmin ? (
-                                                        <span className="text-pink-300 font-bold text-xs bg-pink-500/10 px-3 py-1.5 rounded-xl border border-pink-500/20 shadow-sm" title="You cannot change your own role">
+                                                        <span className="text-mamba-neon font-bold text-xs bg-mamba-green/10 px-3 py-1.5 rounded-xl border border-mamba-green/20 shadow-sm" title="You cannot change your own role">
                                                             {roleRows.find((r) => r.id === row.role_id)?.name ?? row.role_name}{' '}
-                                                            <span className="text-pink-400 text-[10px] ml-1 uppercase">(you)</span>
+                                                            <span className="text-mamba-neon text-[10px] ml-1 uppercase">(you)</span>
                                                         </span>
                                                     ) : !canEditMemberRole(row) ? (
                                                         <span
@@ -910,7 +1187,7 @@ export function RoleManagementView() {
                                                                     onChange={(e) =>
                                                                         handleMemberRoleChange(row.user_id, e.target.value)
                                                                     }
-                                                                    className="w-full bg-gray-950/80 border border-white/10 rounded-xl px-4 py-2 text-xs font-bold text-white appearance-none cursor-pointer focus:outline-none focus:border-pink-500/50 hover:bg-white/5 transition-all shadow-sm"
+                                                                    className="w-full bg-gray-950/80 border border-white/10 rounded-xl px-4 py-2 text-xs font-bold text-white appearance-none cursor-pointer focus:outline-none focus:border-mamba-green/50 hover:bg-white/5 transition-all shadow-sm"
                                                                     style={{ backgroundImage: `url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%239ca3af' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e")`, backgroundPosition: 'right 0.5rem center', backgroundRepeat: 'no-repeat', backgroundSize: '1.5em 1.5em', paddingRight: '2.5rem' }}
                                                                 >
                                                                     {(() => {
@@ -1046,7 +1323,7 @@ export function RoleManagementView() {
                                     <button
                                         type="button"
                                         onClick={() => setCreateOpen(true)}
-                                        className="p-2.5 bg-gradient-to-r from-pink-600 to-rose-600 hover:from-pink-500 hover:to-rose-500 rounded-xl text-white shadow-lg shadow-pink-500/20 transition-all hover:-translate-y-0.5"
+                                        className="p-2.5 bg-gradient-to-r from-mamba-green to-mamba-deep hover:from-mamba-deep hover:to-mamba-green rounded-xl text-mamba-dark shadow-lg shadow-mamba-green/20 transition-all hover:-translate-y-0.5"
                                         title="New custom role"
                                     >
                                         <Plus size={18} strokeWidth={3} />
@@ -1055,7 +1332,7 @@ export function RoleManagementView() {
                             </div>
                             {loadingRoles ? (
                                 <div className="flex items-center justify-center p-12">
-                                    <Loader2 className="w-8 h-8 animate-spin text-pink-500" />
+                                    <Loader2 className="w-8 h-8 animate-spin text-mamba-green" />
                                 </div>
                             ) : (
                                 <div className="space-y-3 overflow-y-auto pr-2 pb-10">
@@ -1065,25 +1342,25 @@ export function RoleManagementView() {
                                             key={role.id}
                                             onClick={() => setSelectedRoleId(role.id)}
                                             className={`w-full text-left p-5 rounded-3xl border transition-all duration-300 group ${selectedRoleId === role.id
-                                                    ? 'bg-pink-500/10 border-pink-500/40 shadow-[0_0_30px_rgba(236,72,153,0.15)] ring-1 ring-pink-500/20'
-                                                    : 'bg-white/[0.02] border-white/10 hover:border-pink-500/30 hover:bg-white/[0.04] backdrop-blur-sm'
+                                                    ? 'bg-mamba-green/10 border-mamba-green/40 shadow-[0_0_30px_rgba(236,72,153,0.15)] ring-1 ring-mamba-green/20'
+                                                    : 'bg-white/[0.02] border-white/10 hover:border-mamba-green/30 hover:bg-white/[0.04] backdrop-blur-sm'
                                                 }`}
                                         >
                                             <div className="flex items-center justify-between mb-2">
                                                 <div className="flex items-center gap-3 font-bold text-white text-base">
-                                                    <div className={`p-2 rounded-xl border ${selectedRoleId === role.id ? 'bg-pink-500/20 border-pink-500/30 text-pink-400' : 'bg-white/5 border-white/10 text-gray-400 group-hover:bg-white/10 group-hover:text-pink-300'}`}>
+                                                    <div className={`p-2 rounded-xl border ${selectedRoleId === role.id ? 'bg-mamba-green/20 border-mamba-green/30 text-mamba-neon' : 'bg-white/5 border-white/10 text-gray-400 group-hover:bg-white/10 group-hover:text-mamba-neon'}`}>
                                                         {role.type === 'system' ? <Shield size={16} /> : <Lock size={16} />}
                                                     </div>
                                                     <span className="flex items-center gap-2">
                                                         {role.name}
                                                     </span>
                                                 </div>
-                                                <span className={`text-[10px] uppercase font-bold tracking-widest px-2 py-1 rounded-lg border ${role.type === 'system' ? 'bg-pink-500/10 text-pink-400 border-pink-500/20' : 'bg-violet-500/10 text-violet-400 border-violet-500/20'}`}>
+                                                <span className={`text-[10px] uppercase font-bold tracking-widest px-2 py-1 rounded-lg border ${role.type === 'system' ? 'bg-mamba-green/10 text-mamba-neon border-mamba-green/20' : 'bg-violet-500/10 text-violet-400 border-violet-500/20'}`}>
                                                     {role.type}
                                                 </span>
                                             </div>
                                             {role.description && (
-                                                <p className={`text-sm mt-2 line-clamp-2 leading-relaxed ${selectedRoleId === role.id ? 'text-pink-100/70' : 'text-gray-400/80 group-hover:text-gray-300/90'}`}>{role.description}</p>
+                                                <p className={`text-sm mt-2 line-clamp-2 leading-relaxed ${selectedRoleId === role.id ? 'text-mamba-text/70' : 'text-gray-400/80 group-hover:text-gray-300/90'}`}>{role.description}</p>
                                             )}
                                         </button>
                                     ))}
@@ -1092,7 +1369,7 @@ export function RoleManagementView() {
                         </div>
 
                         <div className="flex-1 bg-white/[0.02] border border-white/10 rounded-[32px] p-6 lg:p-10 min-h-[500px] backdrop-blur-md shadow-2xl relative overflow-hidden flex flex-col">
-                            <div className="absolute inset-0 bg-gradient-to-br from-blue-500/5 via-transparent to-pink-500/5 pointer-events-none" />
+                            <div className="absolute inset-0 bg-gradient-to-br from-blue-500/5 via-transparent to-mamba-green/5 pointer-events-none" />
 
                             {!selectedRole ? (
                                 <div className="h-full flex flex-col items-center justify-center text-gray-500 relative z-10 opacity-60">
@@ -1108,7 +1385,7 @@ export function RoleManagementView() {
                                         <div>
                                             <h2 className="text-3xl font-extrabold text-white flex items-center gap-4">
                                                 {selectedRole.name}
-                                                <span className="text-[11px] font-bold uppercase tracking-widest px-3 py-1.5 rounded-xl bg-pink-500/10 text-pink-400 border border-pink-500/20 shadow-sm">
+                                                <span className="text-[11px] font-bold uppercase tracking-widest px-3 py-1.5 rounded-xl bg-mamba-green/10 text-mamba-neon border border-mamba-green/20 shadow-sm">
                                                     System Role
                                                 </span>
                                             </h2>
@@ -1124,9 +1401,9 @@ export function RoleManagementView() {
                                     <div className="space-y-8 overflow-y-auto pr-4 pb-10 flex-1 custom-scrollbar">
                                         {permGroups.map(([group, perms]) => (
                                             <div key={group} className="bg-black/20 p-6 rounded-3xl border border-white/5">
-                                                <h4 className="text-xs font-extrabold text-pink-400 uppercase tracking-widest flex items-center gap-3 mb-5">
-                                                    <div className="p-1.5 bg-pink-500/20 rounded-md">
-                                                        <Key size={14} className="text-pink-400" />
+                                                <h4 className="text-xs font-extrabold text-mamba-neon uppercase tracking-widest flex items-center gap-3 mb-5">
+                                                    <div className="p-1.5 bg-mamba-green/20 rounded-md">
+                                                        <Key size={14} className="text-mamba-neon" />
                                                     </div>
                                                     {group}
                                                 </h4>
@@ -1192,7 +1469,7 @@ export function RoleManagementView() {
                                     <div className="flex-1 overflow-y-auto min-h-0 pb-6">
                                         {!skipPermissionCeiling && ceilingLoading ? (
                                             <div className="flex flex-col items-center justify-center py-16 text-gray-500 gap-3">
-                                                <Loader2 className="w-8 h-8 animate-spin text-pink-500" />
+                                                <Loader2 className="w-8 h-8 animate-spin text-mamba-green" />
                                                 <p className="text-sm">Loading permission scope…</p>
                                             </div>
                                         ) : (
@@ -1288,8 +1565,8 @@ export function RoleManagementView() {
                     <div className="bg-gray-900/90 border border-white/10 rounded-3xl w-full max-w-lg max-h-[90vh] overflow-hidden flex flex-col shadow-2xl relative z-10 backdrop-blur-xl animate-in zoom-in-95 duration-200">
                         <div className="flex justify-between items-center p-6 border-b border-white/10 shrink-0 bg-white/[0.02]">
                             <h2 className="text-xl font-bold text-white flex items-center gap-3">
-                                <div className="p-2 bg-pink-500/10 rounded-xl">
-                                    <Shield size={20} className="text-pink-400" />
+                                <div className="p-2 bg-mamba-green/10 rounded-xl">
+                                    <Shield size={20} className="text-mamba-neon" />
                                 </div>
                                 New Custom Role
                             </h2>
@@ -1304,7 +1581,7 @@ export function RoleManagementView() {
                                     value={newRoleName}
                                     onChange={(e) => setNewRoleName(e.target.value)}
                                     placeholder="e.g. Content Manager"
-                                    className="w-full bg-black/40 border border-white/10 rounded-2xl py-3 px-4 text-sm text-white focus:outline-none focus:border-pink-500/50 transition-colors shadow-inner"
+                                    className="w-full bg-black/40 border border-white/10 rounded-2xl py-3 px-4 text-sm text-white focus:outline-none focus:border-mamba-green/50 transition-colors shadow-inner"
                                 />
                             </div>
                             <div>
@@ -1313,18 +1590,18 @@ export function RoleManagementView() {
                                     value={newRoleDesc}
                                     onChange={(e) => setNewRoleDesc(e.target.value)}
                                     placeholder="Brief explanation of this role's purpose"
-                                    className="w-full bg-black/40 border border-white/10 rounded-2xl py-3 px-4 text-sm text-white focus:outline-none focus:border-pink-500/50 transition-colors shadow-inner"
+                                    className="w-full bg-black/40 border border-white/10 rounded-2xl py-3 px-4 text-sm text-white focus:outline-none focus:border-mamba-green/50 transition-colors shadow-inner"
                                 />
                             </div>
                             <div>
                                 <div className="flex items-center gap-2 mb-3">
                                     <label className="block text-xs font-bold text-gray-400 uppercase tracking-wider">Permissions</label>
-                                    <span className="text-xs text-pink-400 bg-pink-500/10 px-2 py-0.5 rounded border border-pink-500/20">{newRolePerms.size} selected</span>
+                                    <span className="text-xs text-mamba-neon bg-mamba-green/10 px-2 py-0.5 rounded border border-mamba-green/20">{newRolePerms.size} selected</span>
                                 </div>
                                 <div className="max-h-56 overflow-y-auto space-y-2 border border-white/10 rounded-2xl p-3 bg-black/20 custom-scrollbar shadow-inner min-h-[120px]">
                                     {!skipPermissionCeiling && ceilingLoading ? (
                                         <div className="flex flex-col items-center justify-center py-10 text-gray-500 gap-2">
-                                            <Loader2 className="w-7 h-7 animate-spin text-pink-500" />
+                                            <Loader2 className="w-7 h-7 animate-spin text-mamba-green" />
                                             <p className="text-xs">Loading permissions…</p>
                                         </div>
                                     ) : !skipPermissionCeiling && ceilingError ? (
@@ -1357,7 +1634,7 @@ export function RoleManagementView() {
                                     ) : (
                                         catalogForNewRole.map((p) => (
                                             <label key={p.id} className="flex items-start gap-3 text-sm cursor-pointer p-2.5 hover:bg-white/[0.04] rounded-xl transition-colors group">
-                                                <div className={`mt-0.5 flex items-center justify-center w-5 h-5 rounded flex-shrink-0 transition-colors border ${newRolePerms.has(p.action) ? 'bg-pink-500 border-pink-400' : 'bg-black/40 border-white/20 group-hover:border-white/40'}`}>
+                                                <div className={`mt-0.5 flex items-center justify-center w-5 h-5 rounded flex-shrink-0 transition-colors border ${newRolePerms.has(p.action) ? 'bg-mamba-green border-mamba-neon' : 'bg-black/40 border-white/20 group-hover:border-white/40'}`}>
                                                     {newRolePerms.has(p.action) && <Check size={14} className="text-white" strokeWidth={3} />}
                                                 </div>
                                                 <div>
@@ -1388,7 +1665,7 @@ export function RoleManagementView() {
                                 type="button"
                                 disabled={!newRoleName.trim() || busy === 'create'}
                                 onClick={handleCreateRole}
-                                className="flex items-center gap-2 px-6 py-2.5 rounded-2xl bg-gradient-to-r from-pink-600 to-rose-600 hover:from-pink-500 hover:to-rose-500 text-white text-sm font-bold shadow-lg shadow-pink-500/20 transition-all hover:-translate-y-0.5 disabled:opacity-50 disabled:pointer-events-none disabled:transform-none"
+                                className="flex items-center gap-2 px-6 py-2.5 rounded-2xl bg-gradient-to-r from-mamba-green to-mamba-deep hover:from-mamba-deep hover:to-mamba-green text-mamba-dark text-sm font-bold shadow-lg shadow-mamba-green/20 transition-all hover:-translate-y-0.5 disabled:opacity-50 disabled:pointer-events-none disabled:transform-none"
                             >
                                 {busy === 'create' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus size={16} strokeWidth={3} />}
                                 Create Role
@@ -1404,8 +1681,8 @@ export function RoleManagementView() {
                     <div className="bg-gray-900/90 border border-white/10 rounded-3xl w-full max-w-lg shadow-2xl max-h-[90vh] overflow-y-auto relative z-10 backdrop-blur-xl animate-in zoom-in-95 duration-200 custom-scrollbar">
                         <div className="flex justify-between items-center p-6 border-b border-white/10 sticky top-0 bg-gray-900/90 backdrop-blur-xl z-20">
                             <h2 className="text-xl font-bold text-white flex items-center gap-3">
-                                <div className="p-2 bg-pink-500/10 rounded-xl">
-                                    <UserPlus size={20} className="text-pink-400" />
+                                <div className="p-2 bg-mamba-green/10 rounded-xl">
+                                    <UserPlus size={20} className="text-mamba-neon" />
                                 </div>
                                 Add or Assign Member
                             </h2>
@@ -1416,14 +1693,14 @@ export function RoleManagementView() {
                         <div className="p-6 space-y-6">
                             <div className="bg-white/[0.02] border border-white/10 p-5 rounded-2xl shadow-inner">
                                 <label className="block text-xs font-bold text-gray-400 uppercase tracking-wider mb-3 flex items-center gap-2">
-                                    <Shield className="w-4 h-4 text-pink-400" />
+                                    <Shield className="w-4 h-4 text-mamba-neon" />
                                     Select Role
                                 </label>
                                 <div className="relative">
                                     <select
                                         value={assignRoleId}
                                         onChange={(e) => setAssignRoleId(e.target.value)}
-                                        className="w-full bg-black/40 border border-white/10 rounded-xl py-3 px-4 text-sm font-bold text-white appearance-none cursor-pointer focus:outline-none focus:border-pink-500/50 shadow-inner hover:bg-black/60 transition-colors"
+                                        className="w-full bg-black/40 border border-white/10 rounded-xl py-3 px-4 text-sm font-bold text-white appearance-none cursor-pointer focus:outline-none focus:border-mamba-green/50 shadow-inner hover:bg-black/60 transition-colors"
                                         style={{ backgroundImage: `url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%239ca3af' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e")`, backgroundPosition: 'right 1rem center', backgroundRepeat: 'no-repeat', backgroundSize: '1.5em 1.5em', paddingRight: '2.5rem' }}
                                     >
                                         {roleRows.map((r) => (
@@ -1437,13 +1714,13 @@ export function RoleManagementView() {
                             </div>
 
                             {selectedTenant?.type === 'seller' && sellerShopAccounts.length > 0 && (
-                                <div className="rounded-2xl border border-pink-500/20 bg-pink-500/5 p-4 space-y-4">
+                                <div className="rounded-2xl border border-mamba-green/20 bg-mamba-green/5 p-4 space-y-4">
                                     <label className="flex items-center gap-3 text-sm text-gray-200 cursor-pointer group">
-                                        <div className={`flex items-center justify-center w-5 h-5 rounded flex-shrink-0 transition-colors border ${assignLinkShopDashboard ? 'bg-pink-500 border-pink-400' : 'bg-black/40 border-white/20 group-hover:border-white/40'}`}>
+                                        <div className={`flex items-center justify-center w-5 h-5 rounded flex-shrink-0 transition-colors border ${assignLinkShopDashboard ? 'bg-mamba-green border-mamba-neon' : 'bg-black/40 border-white/20 group-hover:border-white/40'}`}>
                                             {assignLinkShopDashboard && <Check size={14} className="text-white" strokeWidth={3} />}
                                         </div>
                                         <span>
-                                            Also grant <strong className="text-pink-300">shop dashboard</strong> access
+                                            Also grant <strong className="text-mamba-neon">shop dashboard</strong> access
                                             <span className="text-[10px] text-gray-500 ml-2 font-mono bg-black/20 px-1 py-0.5 rounded border border-white/5">user_accounts</span>
                                         </span>
                                     </label>
@@ -1455,7 +1732,7 @@ export function RoleManagementView() {
                                                 <select
                                                     value={assignAccountId}
                                                     onChange={(e) => setAssignAccountId(e.target.value)}
-                                                    className="w-full bg-black/40 border border-white/10 rounded-xl py-2.5 px-4 text-sm font-bold text-white appearance-none cursor-pointer focus:outline-none focus:border-pink-500/50 hover:bg-black/60 transition-colors"
+                                                    className="w-full bg-black/40 border border-white/10 rounded-xl py-2.5 px-4 text-sm font-bold text-white appearance-none cursor-pointer focus:outline-none focus:border-mamba-green/50 hover:bg-black/60 transition-colors"
                                                     style={{ backgroundImage: `url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%239ca3af' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e")`, backgroundPosition: 'right 1rem center', backgroundRepeat: 'no-repeat', backgroundSize: '1.5em 1.5em', paddingRight: '2.5rem' }}
                                                 >
                                                     {sellerShopAccounts.map((a) => (
@@ -1483,10 +1760,10 @@ export function RoleManagementView() {
                                             setAssignSelectedUser(null);
                                         }}
                                         placeholder="Type at least 2 chars (email/name)..."
-                                        className="w-full bg-black/40 border border-white/10 rounded-2xl py-3 px-4 text-sm text-white focus:outline-none focus:border-pink-500/50 shadow-inner placeholder-gray-600"
+                                        className="w-full bg-black/40 border border-white/10 rounded-2xl py-3 px-4 text-sm text-white focus:outline-none focus:border-mamba-green/50 shadow-inner placeholder-gray-600"
                                     />
                                     {assignSearchLoading && (
-                                        <div className="mt-3 flex items-center gap-2 text-pink-400 text-xs font-bold uppercase tracking-wider pl-2">
+                                        <div className="mt-3 flex items-center gap-2 text-mamba-neon text-xs font-bold uppercase tracking-wider pl-2">
                                             <Loader2 className="w-3.5 h-3.5 animate-spin" /> Searching…
                                         </div>
                                     )}
@@ -1497,22 +1774,22 @@ export function RoleManagementView() {
                                                     <button
                                                         type="button"
                                                         onClick={() => setAssignSelectedUser(u)}
-                                                        className={`w-full text-left px-4 py-3 text-sm transition-colors flex items-center gap-3 ${assignSelectedUser?.id === u.id ? 'bg-pink-500/10 hover:bg-pink-500/20' : 'hover:bg-white/[0.04]'
+                                                        className={`w-full text-left px-4 py-3 text-sm transition-colors flex items-center gap-3 ${assignSelectedUser?.id === u.id ? 'bg-mamba-green/10 hover:bg-mamba-green/20' : 'hover:bg-white/[0.04]'
                                                             }`}
                                                     >
-                                                        <div className={`w-8 h-8 rounded-full flex items-center justify-center shrink-0 border ${assignSelectedUser?.id === u.id ? 'bg-pink-500/30 border-pink-400 text-pink-200' : 'bg-gray-800 border-white/10 text-gray-400'}`}>
+                                                        <div className={`w-8 h-8 rounded-full flex items-center justify-center shrink-0 border ${assignSelectedUser?.id === u.id ? 'bg-mamba-green/30 border-mamba-neon text-mamba-text' : 'bg-gray-800 border-white/10 text-gray-400'}`}>
                                                             <span className="font-bold text-xs">{(u.full_name || u.email || '?')[0].toUpperCase()}</span>
                                                         </div>
                                                         <div>
-                                                            <div className={`font-bold ${assignSelectedUser?.id === u.id ? 'text-pink-100' : 'text-gray-200'}`}>
+                                                            <div className={`font-bold ${assignSelectedUser?.id === u.id ? 'text-mamba-text' : 'text-gray-200'}`}>
                                                                 {u.full_name || u.email}
                                                             </div>
-                                                            <div className={`text-xs font-mono mt-0.5 ${assignSelectedUser?.id === u.id ? 'text-pink-300' : 'text-gray-500'}`}>
+                                                            <div className={`text-xs font-mono mt-0.5 ${assignSelectedUser?.id === u.id ? 'text-mamba-neon' : 'text-gray-500'}`}>
                                                                 {u.email}
                                                             </div>
                                                         </div>
                                                         {assignSelectedUser?.id === u.id && (
-                                                            <Check size={16} className="text-pink-400 ml-auto" strokeWidth={3} />
+                                                            <Check size={16} className="text-mamba-neon ml-auto" strokeWidth={3} />
                                                         )}
                                                     </button>
                                                 </li>
@@ -1532,7 +1809,7 @@ export function RoleManagementView() {
                                             value={assignInviteEmail}
                                             onChange={(e) => setAssignInviteEmail(e.target.value)}
                                             placeholder="new.person@company.com"
-                                            className="flex-1 bg-black/40 border border-white/10 rounded-2xl py-3 px-4 text-sm text-white focus:outline-none focus:border-pink-500/50 shadow-inner placeholder-gray-600"
+                                            className="flex-1 bg-black/40 border border-white/10 rounded-2xl py-3 px-4 text-sm text-white focus:outline-none focus:border-mamba-green/50 shadow-inner placeholder-gray-600"
                                         />
                                         <button
                                             type="button"
@@ -1553,9 +1830,9 @@ export function RoleManagementView() {
                                     <button
                                         type="button"
                                         onClick={() => setAssignShowAdvancedUuid((v) => !v)}
-                                        className="text-xs font-bold uppercase tracking-wider text-gray-500 hover:text-pink-400 transition-colors flex items-center gap-2"
+                                        className="text-xs font-bold uppercase tracking-wider text-gray-500 hover:text-mamba-neon transition-colors flex items-center gap-2"
                                     >
-                                        <ChevronRight size={14} className={`transition-transform duration-300 ${assignShowAdvancedUuid ? 'rotate-90 text-pink-400' : ''}`} />
+                                        <ChevronRight size={14} className={`transition-transform duration-300 ${assignShowAdvancedUuid ? 'rotate-90 text-mamba-neon' : ''}`} />
                                         Advanced (Paste User ID)
                                     </button>
                                     {assignShowAdvancedUuid && (
@@ -1564,7 +1841,7 @@ export function RoleManagementView() {
                                                 value={assignUserId}
                                                 onChange={(e) => setAssignUserId(e.target.value)}
                                                 placeholder="b9c8d7... (User UUID)"
-                                                className="w-full bg-black/40 border border-white/10 rounded-2xl py-3 px-4 text-sm font-mono text-white focus:outline-none focus:border-pink-500/50 shadow-inner placeholder-gray-600"
+                                                className="w-full bg-black/40 border border-white/10 rounded-2xl py-3 px-4 text-sm font-mono text-white focus:outline-none focus:border-mamba-green/50 shadow-inner placeholder-gray-600"
                                             />
                                         </div>
                                     )}
@@ -1583,7 +1860,7 @@ export function RoleManagementView() {
                                 type="button"
                                 disabled={!(assignSelectedUser || assignUserId.trim()) || !assignRoleId || busy === 'assign'}
                                 onClick={handleAssignMember}
-                                className="flex items-center gap-2 px-6 py-2.5 rounded-2xl bg-gradient-to-r from-pink-600 to-rose-600 hover:from-pink-500 hover:to-rose-500 text-white text-sm font-bold shadow-lg shadow-pink-500/20 transition-all hover:-translate-y-0.5 disabled:opacity-50 disabled:pointer-events-none disabled:transform-none"
+                                className="flex items-center gap-2 px-6 py-2.5 rounded-2xl bg-gradient-to-r from-mamba-green to-mamba-deep hover:from-mamba-deep hover:to-mamba-green text-mamba-dark text-sm font-bold shadow-lg shadow-mamba-green/20 transition-all hover:-translate-y-0.5 disabled:opacity-50 disabled:pointer-events-none disabled:transform-none"
                             >
                                 {busy === 'assign' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check size={16} strokeWidth={3} />}
                                 Assign Existing User
@@ -1674,9 +1951,9 @@ function CustomPermissionEditor({
         <div className="space-y-8 overflow-y-auto pr-4 pb-4 custom-scrollbar">
             {permGroups.map(([group, perms]) => (
                 <div key={group} className="bg-black/20 p-6 rounded-3xl border border-white/5">
-                    <h4 className="text-xs font-extrabold text-pink-400 uppercase tracking-widest mb-5 flex items-center gap-3">
-                        <div className="p-1.5 bg-pink-500/20 rounded-md">
-                            <Key size={14} className="text-pink-400" />
+                    <h4 className="text-xs font-extrabold text-mamba-neon uppercase tracking-widest mb-5 flex items-center gap-3">
+                        <div className="p-1.5 bg-mamba-green/20 rounded-md">
+                            <Key size={14} className="text-mamba-neon" />
                         </div>
                         {group}
                     </h4>
@@ -1730,7 +2007,7 @@ function CustomPermissionEditor({
                     type="button"
                     disabled={busy}
                     onClick={() => onSave(Array.from(local))}
-                    className="w-full flex items-center justify-center gap-2 px-6 py-4 rounded-2xl bg-gradient-to-r from-pink-600 to-rose-600 hover:from-pink-500 hover:to-rose-500 text-white text-base font-bold shadow-lg shadow-pink-500/20 transition-all hover:-translate-y-0.5 disabled:opacity-50 disabled:pointer-events-none mt-6"
+                    className="w-full flex items-center justify-center gap-2 px-6 py-4 rounded-2xl bg-gradient-to-r from-mamba-green to-mamba-deep hover:from-mamba-deep hover:to-mamba-green text-mamba-dark text-base font-bold shadow-lg shadow-mamba-green/20 transition-all hover:-translate-y-0.5 disabled:opacity-50 disabled:pointer-events-none mt-6"
                 >
                     {busy ? <Loader2 className="w-5 h-5 animate-spin" /> : <Shield size={18} strokeWidth={3} />}
                     Save Custom Permissions

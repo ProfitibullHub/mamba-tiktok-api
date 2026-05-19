@@ -4,7 +4,7 @@ const HEX6 = /^#([0-9a-f]{6})$/i;
 const HEX3 = /^#([0-9a-f]{3})$/i;
 const HEX8 = /^#([0-9a-f]{8})$/i;
 
-export function normalizeHex6(input: string | undefined | null, fallback = '#ec4899'): string {
+export function normalizeHex6(input: string | undefined | null, fallback = '#28D99E'): string {
     let s = (input || '').trim();
     if (s && !s.startsWith('#')) s = '#' + s;
     if (HEX6.test(s)) return s.toLowerCase();
@@ -18,7 +18,7 @@ export function normalizeHex6(input: string | undefined | null, fallback = '#ec4
     return fallback;
 }
 
-export function normalizeHexAlpha(input: string | undefined | null, fallback = '#ec4899'): string {
+export function normalizeHexAlpha(input: string | undefined | null, fallback = '#28D99E'): string {
     let s = (input || '').trim();
     if (s && !s.startsWith('#')) s = '#' + s;
     if (HEX8.test(s)) return s.toLowerCase();

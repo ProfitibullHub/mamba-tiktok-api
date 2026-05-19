@@ -104,7 +104,7 @@ function KanbanCard({ order, onClick }: { order: Order; onClick: () => void }) {
     return (
         <div
             onClick={onClick}
-            className="bg-gray-800 rounded-lg p-3 border border-gray-700 hover:border-pink-500/50 cursor-pointer transition-all group"
+            className="bg-gray-800 rounded-lg p-3 border border-gray-700 hover:border-mamba-green/50 cursor-pointer transition-all group"
         >
             {/* Header */}
             <div className="flex justify-between items-start mb-2">
@@ -146,7 +146,7 @@ function KanbanCard({ order, onClick }: { order: Order; onClick: () => void }) {
                 <div className="min-w-0 flex-1">
                     <p className="text-xs text-gray-400 truncate">{mainItem?.product_name || 'Unknown'}</p>
                     {itemsCount > 1 && (
-                        <p className="text-xs text-pink-400">+{itemsCount - 1} more</p>
+                        <p className="text-xs text-mamba-neon">+{itemsCount - 1} more</p>
                     )}
                 </div>
             </div>

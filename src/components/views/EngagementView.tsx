@@ -27,7 +27,7 @@ export function EngagementView({ account }: EngagementViewProps) {
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="animate-spin rounded-full h-12 w-12 border-4 border-pink-500 border-t-transparent"></div>
+        <div className="animate-spin rounded-full h-12 w-12 border-4 border-mamba-green border-t-transparent"></div>
       </div>
     );
   }
@@ -69,14 +69,14 @@ export function EngagementView({ account }: EngagementViewProps) {
           value={formatNumber(totalEngagement)}
           change={16.8}
           icon={TrendingUp}
-          iconColor="bg-gradient-to-r from-pink-500 to-red-500"
+          iconColor="bg-gradient-to-r from-mamba-green to-mamba-deep"
         />
         <StatCard
           title="Engagement Rate"
           value={`${engagementRate}%`}
           change={10.3}
           icon={Heart}
-          iconColor="bg-gradient-to-r from-purple-500 to-pink-500"
+          iconColor="bg-gradient-to-r from-purple-500 to-mamba-green"
         />
         <StatCard
           title="New Followers"
@@ -102,7 +102,7 @@ export function EngagementView({ account }: EngagementViewProps) {
             value={formatNumber(metrics?.likes || 0)}
             change={15.2}
             icon={Heart}
-            iconColor="bg-gradient-to-r from-pink-500 to-red-500"
+            iconColor="bg-gradient-to-r from-mamba-green to-mamba-deep"
           />
           <StatCard
             title="Total Comments"
@@ -129,7 +129,7 @@ export function EngagementView({ account }: EngagementViewProps) {
             value={formatNumber(avgLikesPerPost)}
             change={5.8}
             icon={Heart}
-            iconColor="bg-gradient-to-r from-pink-500 to-purple-500"
+            iconColor="bg-gradient-to-r from-mamba-green to-purple-500"
           />
           <StatCard
             title="Avg Comments"

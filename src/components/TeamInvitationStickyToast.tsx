@@ -69,7 +69,7 @@ export function TeamInvitationStickyToast({ activeTab, onOpenNotifications }: Pr
             style={{ top: '1.25rem', right: '1.25rem' }}
         >
             <div className="rounded-2xl border border-violet-500/35 bg-gray-950/95 backdrop-blur-xl shadow-2xl shadow-black/50 overflow-hidden">
-                <div className="absolute inset-0 bg-gradient-to-br from-violet-600/15 via-transparent to-pink-600/10 pointer-events-none" />
+                <div className="absolute inset-0 bg-gradient-to-br from-violet-600/15 via-transparent to-mamba-green/10 pointer-events-none" />
                 <div className="relative p-4">
                     <div className="flex gap-3">
                         <div className="shrink-0 p-2 rounded-xl bg-violet-500/20 border border-violet-500/30">
@@ -103,7 +103,7 @@ export function TeamInvitationStickyToast({ activeTab, onOpenNotifications }: Pr
                                 <button
                                     type="button"
                                     onClick={() => goAccept(primary.acceptPath)}
-                                    className="inline-flex items-center justify-center px-3.5 py-2 rounded-xl text-xs font-bold text-white bg-gradient-to-r from-violet-600 to-pink-600 hover:from-violet-500 hover:to-pink-500 shadow-lg shadow-violet-900/30 transition-all"
+                                    className="inline-flex items-center justify-center px-3.5 py-2 rounded-xl text-xs font-bold text-white bg-gradient-to-r from-violet-600 to-mamba-green hover:from-violet-500 hover:to-mamba-green shadow-lg shadow-violet-900/30 transition-all"
                                 >
                                     Accept invitation
                                 </button>

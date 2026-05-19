@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Account } from '../../lib/supabase';
 import { useTenantContext } from '../../contexts/TenantContext';
+import { useAuth } from '../../contexts/AuthContext';
 import {
     FINANCIAL_RESTRICTION_FIELD_OPTIONS,
     FINANCIAL_RESTRICTION_FIELD_ID_SET,
@@ -8,9 +9,11 @@ import {
     getSellerFinancialRestrictions,
     saveSellerFinancialRestrictions,
 } from '../../lib/financialVisibilityApi';
+import { fetchCustomPlLineItemCatalog, type CustomPlLineCatalogRow } from '../../lib/customPlFinanceApi';
 
 type FinancialRestrictionsViewProps = {
     account: Account;
+    shopId: string;
 };
 
 const PRINCIPAL_OPTIONS = [
@@ -23,31 +26,33 @@ const PRINCIPAL_OPTIONS = [
     { id: 'seller_user', label: 'Seller User' },
 ] as const;
 
-export function FinancialRestrictionsView({ account }: FinancialRestrictionsViewProps) {
-    const { memberships, isPlatformSuperAdmin } = useTenantContext();
+export function FinancialRestrictionsView({ account, shopId }: FinancialRestrictionsViewProps) {
+    const { isPlatformSuperAdmin, isSellerAdminOn } = useTenantContext();
+    const { profile } = useAuth();
+
+    const canManageRestrictions = useMemo(() => {
+        if (isPlatformSuperAdmin || profile?.role?.toLowerCase() === 'admin') return true;
+        const sellerTid = account.tenant_id;
+        if (!sellerTid) return false;
+        return isSellerAdminOn(sellerTid);
+    }, [isPlatformSuperAdmin, profile?.role, account.tenant_id, isSellerAdminOn]);
+
     const [loading, setLoading] = useState(true);
     const [saving, setSaving] = useState(false);
     const [message, setMessage] = useState<string | null>(null);
     const [targets, setTargets] = useState<Set<string>>(new Set(['all_agency']));
     const [fields, setFields] = useState<Set<FinancialRestrictionFieldId>>(new Set());
-
-    const canManageRestrictions = useMemo(() => {
-        if (isPlatformSuperAdmin) return true;
-        return memberships.some(
-            (m) =>
-                m.tenant_id === account.tenant_id &&
-                m.status === 'active' &&
-                (m.roles?.name === 'Seller Admin' ||
-                    (Array.isArray((m as any).membership_roles) &&
-                        (m as any).membership_roles.some((mr: any) => !mr?.revoked_at && mr?.roles?.name === 'Seller Admin')))
-        );
-    }, [memberships, account.tenant_id, isPlatformSuperAdmin]);
+    const [customPlCatalog, setCustomPlCatalog] = useState<CustomPlLineCatalogRow[]>([]);
+    const [restrictedCustomPlLineIds, setRestrictedCustomPlLineIds] = useState<Set<string>>(new Set());
 
     const load = useCallback(async () => {
         setLoading(true);
         setMessage(null);
         try {
-            const rule = await getSellerFinancialRestrictions(account.id);
+            const [rule, catalog] = await Promise.all([
+                getSellerFinancialRestrictions(account.id),
+                fetchCustomPlLineItemCatalog(account.id, shopId).catch(() => [] as CustomPlLineCatalogRow[]),
+            ]);
             setTargets(new Set(rule.restricted_principals?.length ? rule.restricted_principals : ['all_agency']));
             const hydratedFields = new Set<FinancialRestrictionFieldId>(
                 (rule.restricted_fields || []).filter((f): f is FinancialRestrictionFieldId =>
@@ -59,12 +64,15 @@ export function FinancialRestrictionsView({ account }: FinancialRestrictionsView
             if (rule.restrict_margin) hydratedFields.add('margin');
             if (rule.restrict_custom_line_items) hydratedFields.add('custom_line_items');
             setFields(hydratedFields);
+            setCustomPlCatalog(catalog);
+            const lineIds = Array.isArray(rule.restricted_custom_pl_line_item_ids) ? rule.restricted_custom_pl_line_item_ids : [];
+            setRestrictedCustomPlLineIds(new Set(lineIds.filter((x): x is string => typeof x === 'string' && x.length > 0)));
         } catch (e: any) {
             setMessage(e?.message || 'Failed to load restrictions');
         } finally {
             setLoading(false);
         }
-    }, [account.id]);
+    }, [account.id, shopId]);
 
     useEffect(() => {
         void load();
@@ -89,6 +97,15 @@ export function FinancialRestrictionsView({ account }: FinancialRestrictionsView
         });
     };
 
+    const toggleRestrictedCustomPlLine = (lineId: string) => {
+        setRestrictedCustomPlLineIds((prev) => {
+            const next = new Set(prev);
+            if (next.has(lineId)) next.delete(lineId);
+            else next.add(lineId);
+            return next;
+        });
+    };
+
     const handleSave = async () => {
         setSaving(true);
         setMessage(null);
@@ -100,6 +117,7 @@ export function FinancialRestrictionsView({ account }: FinancialRestrictionsView
                 restrict_custom_line_items: restrictedFields.includes('custom_line_items'),
                 restricted_principals: Array.from(targets),
                 restricted_fields: restrictedFields,
+                restricted_custom_pl_line_item_ids: Array.from(restrictedCustomPlLineIds),
             });
             setMessage('Restrictions saved successfully.');
         } catch (e: any) {
@@ -114,7 +132,7 @@ export function FinancialRestrictionsView({ account }: FinancialRestrictionsView
             <div className="space-y-4">
                 <h2 className="text-2xl font-bold text-white">Financial Restrictions</h2>
                 <div className="bg-gray-800/40 border border-gray-700 rounded-xl p-5 text-sm text-gray-300">
-                    You need Seller Admin access on this seller to manage financial restrictions.
+                    Only Seller Admins on this shop or platform operators may manage financial restrictions.
                 </div>
             </div>
         );
@@ -143,7 +161,9 @@ export function FinancialRestrictionsView({ account }: FinancialRestrictionsView
                             />
                             <span>
                                 {p.label}
-                                {p.hint ? <span className="block text-xs text-gray-500">{p.hint}</span> : null}
+                                {'hint' in p && p.hint ? (
+                                    <span className="block text-xs text-gray-500">{p.hint}</span>
+                                ) : null}
                             </span>
                         </label>
                     ))}
@@ -167,12 +187,41 @@ export function FinancialRestrictionsView({ account }: FinancialRestrictionsView
                 </div>
             </div>
 
+            <div className="bg-gray-800/40 border border-gray-700 rounded-xl p-5">
+                <h3 className="text-white font-semibold mb-2">Specific custom P&amp;L lines (this shop)</h3>
+                <p className="text-gray-500 text-xs mb-3">
+                    For users who can see custom P&amp;L, hide individual lines by id. Applies together with &quot;Custom line items&quot; above.
+                </p>
+                {customPlCatalog.length === 0 ? (
+                    <p className="text-sm text-gray-500">No custom P&amp;L lines configured for this shop yet.</p>
+                ) : (
+                    <div className="max-h-56 overflow-y-auto space-y-2 pr-1">
+                        {customPlCatalog.map((line) => (
+                            <label key={line.id} className="flex items-start gap-2 text-sm text-gray-200">
+                                <input
+                                    type="checkbox"
+                                    checked={restrictedCustomPlLineIds.has(line.id)}
+                                    onChange={() => toggleRestrictedCustomPlLine(line.id)}
+                                    disabled={loading || saving}
+                                    className="mt-0.5"
+                                />
+                                <span>
+                                    <span className="text-gray-100">{line.name}</span>
+                                    <span className="block text-xs text-gray-500 font-mono">{line.id}</span>
+                                    {!line.is_active ? <span className="text-xs text-amber-500"> (inactive)</span> : null}
+                                </span>
+                            </label>
+                        ))}
+                    </div>
+                )}
+            </div>
+
             <div className="flex items-center gap-3">
                 <button
                     type="button"
                     onClick={handleSave}
                     disabled={loading || saving}
-                    className="px-4 py-2 bg-pink-600 hover:bg-pink-500 disabled:opacity-50 text-white rounded-lg font-semibold"
+                    className="px-4 py-2 bg-mamba-green hover:bg-mamba-deep disabled:opacity-50 text-mamba-dark rounded-lg font-semibold"
                 >
                     {saving ? 'Saving...' : 'Save restrictions'}
                 </button>

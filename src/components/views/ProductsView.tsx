@@ -1,5 +1,6 @@
 import { useState, useMemo } from 'react';
 import { Search, Filter, RefreshCw, Settings, AlertTriangle, CheckCircle } from 'lucide-react';
+import { useShallow } from 'zustand/react/shallow';
 import { useShopStore, Product } from '../../store/useShopStore';
 import { Account } from '../../lib/supabase';
 import { ProductCard } from '../ProductCard';
@@ -14,7 +15,16 @@ interface ProductsViewProps {
 
 export function ProductsView({ account, shopId }: ProductsViewProps) {
     const { canMutateShop, canSyncShop } = useShopAccessFlags(account);
-    const { products, orders, isLoading, syncData, cacheMetadata, dataVersion } = useShopStore();
+    const { products, orders, isLoading, syncData, cacheMetadata, dataVersion } = useShopStore(
+        useShallow((s) => ({
+            products: s.products,
+            orders: s.orders,
+            isLoading: s.isLoading,
+            syncData: s.syncData,
+            cacheMetadata: s.cacheMetadata,
+            dataVersion: s.dataVersion,
+        })),
+    );
     const [searchTerm, setSearchTerm] = useState('');
     const [statusFilter, setStatusFilter] = useState('all');
     const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);

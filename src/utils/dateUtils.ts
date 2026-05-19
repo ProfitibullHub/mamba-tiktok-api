@@ -148,6 +148,34 @@ export function formatShopDateISO(date: number | Date | string, timezone: string
   return `${year}-${month}-${day}`;
 }
 
+/** Inclusive calendar-day count between two YYYY-MM-DD strings (noon anchors avoid DST edge cases). */
+export function inclusiveCalendarDaysInRange(startYmd: string, endYmd: string): number {
+  const start = new Date(`${startYmd}T12:00:00`);
+  const end = new Date(`${endYmd}T12:00:00`);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return 1;
+  if (end < start) return 1;
+  return Math.floor((end.getTime() - start.getTime()) / 86400000) + 1;
+}
+
+/** Distinct shop-calendar dates (in `timezone`) that have an order in `[rangeStartYmd, rangeEndYmd]`. */
+export function countDistinctShopCalendarDaysWithOrders<T extends { paid_time?: number; created_time?: number }>(
+  orders: T[],
+  rangeStartYmd: string,
+  rangeEndYmd: string,
+  timezone: string,
+): number {
+  const days = new Set<string>();
+  for (const o of orders) {
+    const ts = Number(o.paid_time || o.created_time);
+    if (!ts) continue;
+    const ymd = formatShopDateISO(ts, timezone);
+    if (ymd && ymd >= rangeStartYmd && ymd <= rangeEndYmd) {
+      days.add(ymd);
+    }
+  }
+  return days.size;
+}
+
 
 /**
  * Helper to get START of day in specified timezone for a given date string (YYYY-MM-DD).
@@ -229,14 +257,15 @@ export function getShopDayEndExclusiveTimestamp(dateStr: string, timezone: strin
 }
 
 /**
- * Previous comparison window aligned to shop calendar days.
- * `prevEndExclusive` matches server queries: paid_time < start of current period (no double-count at midnight).
+ * Previous comparison window: same count of inclusive shop-calendar days as [startDateISO..endDateISO],
+ * immediately before startDateISO. Boundaries use shop-local midnights (matches TikTok Seller Center date filters).
+ *
+ * `prevEndExclusive` is the Unix instant at the start of the current period — orders satisfy `paid_time >= prevStart && paid_time < prevEndExclusive` for the prior window.
  */
 export function getPreviousPeriodRange(
   startDateISO: string,
   endDateISO: string,
-  timezone: string,
-  useHybrid: boolean = true
+  timezone: string
 ): { prevStart: number; prevEndExclusive: number } {
   const prevEndExclusive = getShopDayStartTimestamp(startDateISO, timezone);
 
@@ -252,10 +281,7 @@ export function getPreviousPeriodRange(
     prevStartDate = previousCalendarDayISO(prevStartDate, timezone);
   }
 
-  let prevStart = getShopDayStartTimestamp(prevStartDate, timezone);
-  if (useHybrid && timezone === 'America/Los_Angeles') {
-    prevStart -= 8 * 3600;
-  }
+  const prevStart = getShopDayStartTimestamp(prevStartDate, timezone);
   return { prevStart, prevEndExclusive };
 }
 
@@ -321,9 +347,7 @@ export function getDateRangeFromPreset(
 
   switch (preset) {
     case 'yesterday': {
-      const d = new Date();
-      d.setDate(d.getDate() - 1);
-      const s = formatShopDateISO(d, timezone);
+      const s = previousCalendarDayISO(todayStr, timezone);
       return { startDate: s, endDate: s };
     }
     case 'last7': {

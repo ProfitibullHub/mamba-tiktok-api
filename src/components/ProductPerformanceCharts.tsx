@@ -232,7 +232,7 @@ export function ProductPerformanceCharts({ products }: ProductPerformanceChartsP
     };
 
     // Chart Colors
-    const COLORS = ['#EC4899', '#06B6D4', '#A855F7', '#EAB308', '#22C55E', '#EF4444', '#F97316', '#8B5CF6', '#14B8A6', '#F43F5E'];
+    const COLORS = ['#28D99E', '#06B6D4', '#49FFB7', '#EAB308', '#22C55E', '#EF4444', '#F97316', '#1FA97C', '#14B8A6', '#8B5CF6'];
     const INVENTORY_COLORS = ['#EF4444', '#F59E0B', '#22C55E', '#3B82F6'];
 
     // Custom Tooltip
@@ -256,7 +256,7 @@ export function ProductPerformanceCharts({ products }: ProductPerformanceChartsP
                     <div className="space-y-1 text-sm">
                         <div className="flex justify-between gap-4">
                             <span className="text-gray-400">GMV:</span>
-                            <span className="text-pink-400 font-medium">${data?.gmv?.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                            <span className="text-mamba-neon font-medium">${data?.gmv?.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                         </div>
                         <div className="flex justify-between gap-4">
                             <span className="text-gray-400">Sales:</span>
@@ -290,10 +290,10 @@ export function ProductPerformanceCharts({ products }: ProductPerformanceChartsP
 
     const getBarColor = () => {
         switch (selectedMetric) {
-            case 'gmv': return '#EC4899';
+            case 'gmv': return '#28D99E';
             case 'sales': return '#06B6D4';
             case 'inventory': return '#22C55E';
-            default: return '#EC4899';
+            default: return '#28D99E';
         }
     };
 
@@ -303,7 +303,7 @@ export function ProductPerformanceCharts({ products }: ProductPerformanceChartsP
             <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 mb-6">
                 <div>
                     <h3 className="text-lg font-semibold text-white flex items-center gap-2">
-                        {chartType === 'line' ? <LineChartIcon className="text-pink-500" size={20} /> :
+                        {chartType === 'line' ? <LineChartIcon className="text-mamba-green" size={20} /> :
                             chartType === 'bar' ? <BarChart2 className="text-cyan-500" size={20} /> :
                                 <PieChartIcon className="text-purple-500" size={20} />}
                         Product Performance
@@ -328,7 +328,7 @@ export function ProductPerformanceCharts({ products }: ProductPerformanceChartsP
                         </button>
                         <button
                             onClick={() => setChartType('line')}
-                            className={`p-2 rounded transition-colors ${chartType === 'line' ? 'bg-gray-600 text-pink-400' : 'text-gray-400 hover:text-white'}`}
+                            className={`p-2 rounded transition-colors ${chartType === 'line' ? 'bg-gray-600 text-mamba-neon' : 'text-gray-400 hover:text-white'}`}
                             title="Area Chart"
                         >
                             <LineChartIcon size={16} />
@@ -365,7 +365,7 @@ export function ProductPerformanceCharts({ products }: ProductPerformanceChartsP
                                             setShowDropdown(false);
                                         }}
                                         className={`w-full flex items-center gap-2 px-4 py-3 text-sm text-left transition-colors ${selectedMetric === metric.id
-                                            ? 'bg-pink-500/10 text-pink-400 border-l-2 border-pink-500'
+                                            ? 'bg-mamba-green/10 text-mamba-neon border-l-2 border-mamba-green'
                                             : 'text-gray-300 hover:bg-gray-700'
                                             }`}
                                     >
@@ -402,7 +402,7 @@ export function ProductPerformanceCharts({ products }: ProductPerformanceChartsP
                         <DollarSign size={14} />
                         GMV ({getDaysDifference()}d)
                     </div>
-                    <p className="text-xl font-bold text-pink-400">
+                    <p className="text-xl font-bold text-mamba-neon">
                         {formatShortValue(chartData.totals.gmv)}
                     </p>
                 </div>

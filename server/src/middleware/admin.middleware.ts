@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
+import { resolveUserIdFromBearerToken } from '../lib/jwt-session.js';
 
 dotenv.config();
 
@@ -21,17 +22,14 @@ export const adminMiddleware = async (req: Request, res: Response, next: NextFun
             return res.status(401).json({ success: false, error: 'No token provided' });
         }
 
-        let user: any = null;
-        let authError: any = null;
-        for (let attempt = 0; attempt < 2; attempt++) {
-            const result = await supabase.auth.getUser(token);
-            user = result.data?.user;
-            authError = result.error;
-            if (user || (authError && !authError.message?.includes('fetch failed'))) break;
-            if (attempt === 0) console.log('[Auth] Retrying getUser after transient error...');
+        const userId = await resolveUserIdFromBearerToken(token);
+        if (!userId) {
+            return res.status(401).json({ success: false, error: 'Invalid or expired session' });
         }
 
-        if (authError || !user) {
+        const { data: userData, error: userErr } = await supabase.auth.admin.getUserById(userId);
+        const user = userData?.user;
+        if (userErr || !user) {
             return res.status(401).json({ success: false, error: 'Invalid token' });
         }
 

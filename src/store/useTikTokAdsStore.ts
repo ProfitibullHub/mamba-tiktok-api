@@ -23,10 +23,13 @@ async function enqueueAndWaitAdsSync(
         throw new Error(enqueueJson.error || 'Failed to enqueue ads sync job');
     }
 
-    await apiFetch(`/api/tiktok-ads/sync/run-worker?limit=1`, {
-        method: 'POST',
-        signal,
-    }).catch(() => undefined);
+    await apiFetch(
+        `/api/tiktok-ads/sync/run-worker?limit=1&accountId=${encodeURIComponent(accountId)}&jobId=${encodeURIComponent(enqueueJson.jobId)}`,
+        {
+            method: 'POST',
+            signal,
+        },
+    ).catch(() => undefined);
 
     const startedAt = Date.now();
     while (Date.now() - startedAt < 900_000) {

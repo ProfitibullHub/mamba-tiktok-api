@@ -10,6 +10,11 @@ const VERSION_CONVERSATIONS = '2021-04-15';
 const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
 
 export type SendHtmlEmailOptions = {
+    /**
+     * When set, upsert this address as the LeadConnector contact.
+     * Defaults to the message recipient (`toEmail`). Bug reports pass the reporter here while To stays the reporter.
+     */
+    contactEmailForUpsert?: string;
     /** Overrides default from (REPORTS_FROM_EMAIL → INVITE_FROM_EMAIL → noreply@mamba.app). */
     from?: string;
     /**
@@ -17,11 +22,23 @@ export type SendHtmlEmailOptions = {
      * Inbox clients often show only the local part for bare addresses (e.g. "noreply").
      */
     fromDisplayName?: string;
+    /** BCC recipients (e.g. support inbox) — LeadConnector requires emailTo to match contact emails; bug reports use To=reporter + BCC support. */
+    emailBcc?: string[];
     /** Optional attachments (decoded to binary and uploaded to GHL — max 5 MB each). */
     attachments?: Array<{
         filename: string;
         contentBase64: string;
     }>;
+    /**
+     * When set, GHL continues the existing conversation thread (response may return the same conversationId).
+     * @see server/src/services/ghl-messaging-field-mapping.ts
+     */
+    ghlConversationId?: string;
+    /**
+     * When true, a LeadConnector HTTP success with neither messageId nor conversationId is treated as failure.
+     * Helps catch “accepted but not delivered” cases for bug reports.
+     */
+    requireConversationAck?: boolean;
 };
 
 async function sleep(ms: number): Promise<void> {
@@ -44,6 +61,11 @@ function loadGhlCredentials(): { pit: string; locationId: string } | null {
     const locationId = (process.env.GOHIGHLEVEL_LOCATION_ID ?? '').trim();
     if (!pit || !locationId) return null;
     return { pit, locationId };
+}
+
+/** Exposed for ticketing / health checks — same env as transactional email. */
+export function getGoHighLevelCredentials(): { pit: string; locationId: string } | null {
+    return loadGhlCredentials();
 }
 
 function sanitizeFromDisplayName(name: string): string {
@@ -204,7 +226,10 @@ async function sendGhlConversationEmail(params: {
     subject: string;
     html: string;
     attachmentUrls: string[];
-}): Promise<void> {
+    emailBcc?: string[];
+    /** Continue an existing GHL email conversation when non-null. */
+    conversationId?: string;
+}): Promise<{ messageId?: string; conversationId?: string }> {
     const body: Record<string, unknown> = {
         type: 'Email',
         contactId: params.contactId,
@@ -214,6 +239,12 @@ async function sendGhlConversationEmail(params: {
         html: params.html,
         message: truncatePlainFromHtml(params.html),
     };
+    if (params.conversationId) {
+        body.conversationId = params.conversationId;
+    }
+    if (params.emailBcc && params.emailBcc.length > 0) {
+        body.emailBcc = params.emailBcc;
+    }
     if (params.attachmentUrls.length > 0) {
         body.attachments = params.attachmentUrls;
     }
@@ -231,6 +262,50 @@ async function sendGhlConversationEmail(params: {
     const raw = await resp.text().catch(() => '');
     if (!resp.ok) {
         throw new Error(parseGhlError(resp.status, raw));
+    }
+    try {
+        const j = JSON.parse(raw) as Record<string, unknown>;
+
+        const pickId = (o: Record<string, unknown>): string | undefined => {
+            const v = o.id ?? o.messageId;
+            return typeof v === 'string' && v.length > 0 ? v : undefined;
+        };
+
+        let messageId = pickId(j);
+        let conversationId = typeof j.conversationId === 'string' && j.conversationId ? j.conversationId : undefined;
+
+        if (!conversationId && typeof j.conversation_id === 'string' && j.conversation_id) {
+            conversationId = j.conversation_id;
+        }
+
+        const data = j.data;
+        if (data && typeof data === 'object' && !Array.isArray(data)) {
+            const d = data as Record<string, unknown>;
+            messageId = messageId ?? pickId(d);
+            conversationId =
+                conversationId ??
+                (typeof d.conversationId === 'string' && d.conversationId
+                    ? d.conversationId
+                    : typeof d.conversation_id === 'string' && d.conversation_id
+                      ? d.conversation_id
+                      : undefined);
+            for (const key of ['message', 'conversationMessage', 'msg'] as const) {
+                const msg = d[key];
+                if (msg && typeof msg === 'object' && !Array.isArray(msg)) {
+                    messageId = messageId ?? pickId(msg as Record<string, unknown>);
+                }
+            }
+        }
+
+        const msgTop = j.message;
+        if (msgTop && typeof msgTop === 'object' && !Array.isArray(msgTop)) {
+            messageId = messageId ?? pickId(msgTop as Record<string, unknown>);
+        }
+
+        if (!messageId && !conversationId) return {};
+        return { messageId, conversationId };
+    } catch {
+        return {};
     }
 }
 
@@ -255,13 +330,14 @@ async function executeSendViaGoHighLevel(
     subject: string,
     html: string,
     options?: SendHtmlEmailOptions
-): Promise<void> {
+): Promise<{ messageId?: string; conversationId?: string }> {
     const { pit, locationId } = auth;
     const defaultFrom =
         process.env.REPORTS_FROM_EMAIL || process.env.INVITE_FROM_EMAIL || 'noreply@mamba.app';
     const fromEmail = formatEmailFromHeader(options?.from ?? defaultFrom, options?.fromDisplayName);
 
-    const contactId = await upsertContact(pit, locationId, toEmail.trim().toLowerCase());
+    const contactUpsert = (options?.contactEmailForUpsert ?? toEmail).trim().toLowerCase();
+    const contactId = await upsertContact(pit, locationId, contactUpsert);
 
     const rawAttachments = (options?.attachments || []).filter(
         (a) => a.filename && a.contentBase64
@@ -277,7 +353,12 @@ async function executeSendViaGoHighLevel(
         attachmentUrls.push(url);
     }
 
-    await sendGhlConversationEmail({
+    const bccList =
+        options?.emailBcc
+            ?.filter((e): e is string => typeof e === 'string' && e.includes('@'))
+            .map((e) => e.trim()) ?? [];
+
+    return sendGhlConversationEmail({
         pit,
         contactId,
         toEmail: toEmail.trim(),
@@ -285,6 +366,8 @@ async function executeSendViaGoHighLevel(
         subject,
         html,
         attachmentUrls,
+        emailBcc: bccList.length > 0 ? bccList : undefined,
+        conversationId: options?.ghlConversationId,
     });
 }
 
@@ -293,7 +376,7 @@ export async function sendHtmlEmail(
     subject: string,
     html: string,
     options?: SendHtmlEmailOptions
-): Promise<{ delivered: boolean }> {
+): Promise<{ delivered: boolean; messageId?: string; conversationId?: string }> {
     const auth = loadGhlCredentials();
     if (!auth) {
         console.warn('[email] GOHIGHLEVEL_PIT or GOHIGHLEVEL_LOCATION_ID not set — email not sent. To:', toEmail, 'Subject:', subject);
@@ -302,19 +385,47 @@ export async function sendHtmlEmail(
 
     try {
         try {
-            await executeSendViaGoHighLevel(auth, toEmail, subject, html, options);
+            const { messageId, conversationId } = await executeSendViaGoHighLevel(
+                auth,
+                toEmail,
+                subject,
+                html,
+                options
+            );
+            assertConversationAck(messageId, conversationId, options);
+            return { delivered: true, messageId, conversationId };
         } catch (firstErr) {
             if (!isTransientSendFailure(firstErr)) throw firstErr;
             await sleep(800);
-            await executeSendViaGoHighLevel(auth, toEmail, subject, html, options);
+            const { messageId, conversationId } = await executeSendViaGoHighLevel(
+                auth,
+                toEmail,
+                subject,
+                html,
+                options
+            );
+            assertConversationAck(messageId, conversationId, options);
             console.warn(
                 '[email] send retry succeeded after initial failure:',
                 (firstErr as Error)?.message
             );
+            return { delivered: true, messageId, conversationId };
         }
-        return { delivered: true };
     } catch (e: unknown) {
         console.error('[email] LeadConnector send failed:', e instanceof Error ? e.message : e);
         throw e;
+    }
+}
+
+function assertConversationAck(
+    messageId: string | undefined,
+    conversationId: string | undefined,
+    options?: SendHtmlEmailOptions
+): void {
+    if (!options?.requireConversationAck) return;
+    if (!messageId && !conversationId) {
+        throw new Error(
+            'LeadConnector returned no message or conversation id — the email may not have been queued. Check GHL Conversations email settings and Mailgun (or SMTP) for the location.'
+        );
     }
 }

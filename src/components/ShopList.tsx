@@ -104,19 +104,19 @@ function ShopCard({
             {/* Disconnect Prompt Overlay */}
             {disconnectingShopName && (
                 <div className="absolute inset-0 z-20 bg-gray-900/95 backdrop-blur-sm rounded-xl flex flex-col items-center justify-center p-6 text-center">
-                    <div className="p-3 bg-pink-500/20 rounded-full mb-3">
-                        <ExternalLink className="w-7 h-7 text-pink-400" />
+                    <div className="p-3 bg-mamba-green/20 rounded-full mb-3">
+                        <ExternalLink className="w-7 h-7 text-mamba-neon" />
                     </div>
                     <h4 className="text-white font-semibold mb-1 text-sm">To Remove This Shop</h4>
                     <p className="text-gray-400 text-xs leading-relaxed mb-4">
-                        You need to cancel the authorization<br />from your TikTok Seller Center.<br />Find <span className="text-pink-400 font-medium">Mamba</span> in the list and click <span className="text-white font-medium">"Cancel Authorization"</span>.
+                        You need to cancel the authorization<br />from your TikTok Seller Center.<br />Find <span className="text-mamba-neon font-medium">Mamba</span> in the list and click <span className="text-white font-medium">"Cancel Authorization"</span>.
                     </p>
                     <div className="flex gap-2">
                         <a
                             href="https://seller-us.tiktok.com/services/authorizations?shop_region=US&tab=apps"
                             target="_blank"
                             rel="noopener noreferrer"
-                            className="px-4 py-2 bg-pink-600 hover:bg-pink-500 text-white text-xs font-medium rounded-lg transition-colors flex items-center gap-1.5"
+                            className="px-4 py-2 bg-mamba-green hover:bg-mamba-deep text-mamba-dark text-xs font-medium rounded-lg transition-colors flex items-center gap-1.5"
                         >
                             <ExternalLink size={12} />
                             Open TikTok Seller Center
@@ -150,7 +150,7 @@ function ShopCard({
                                     onRefreshToken?.();
                                 }}
                                 disabled={isRefreshing || reviveStatus !== 'idle'}
-                                className="px-4 py-2 bg-pink-600 hover:bg-pink-700 text-white rounded-lg font-medium transition-colors flex items-center gap-2 disabled:opacity-70"
+                                className="px-4 py-2 bg-mamba-green hover:bg-mamba-deep text-mamba-dark rounded-lg font-medium transition-colors flex items-center gap-2 disabled:opacity-70"
                             >
                                 <RefreshCw size={18} className={(isRefreshing || reviveStatus !== 'idle') ? "animate-spin" : ""} />
                                 {reviveStatus === 'reauthorizing'
@@ -171,7 +171,7 @@ function ShopCard({
                     ? 'border-red-500/50 cursor-wait'
                     : isExpired
                         ? 'border-red-500/50 opacity-60 cursor-not-allowed filter blur-[1px]'
-                        : 'border-gray-700 hover:border-pink-500 cursor-pointer group'
+                        : 'border-gray-700 hover:border-mamba-green cursor-pointer group'
                     }`}
             >
                 {/* Full-card deletion overlay */}
@@ -199,11 +199,11 @@ function ShopCard({
                             )}
                         </button>
                     )}
-                    {!isExpired && <ExternalLink size={20} className="text-gray-400 group-hover:text-pink-500" />}
+                    {!isExpired && <ExternalLink size={20} className="text-gray-400 group-hover:text-mamba-green" />}
                 </div>
 
                 <div className="flex items-start space-x-4">
-                    <div className="p-3 bg-gray-700 rounded-lg group-hover:bg-pink-500/10 group-hover:text-pink-500 transition-colors">
+                    <div className="p-3 bg-gray-700 rounded-lg group-hover:bg-mamba-green/10 group-hover:text-mamba-green transition-colors">
                         <ShoppingBag size={24} />
                     </div>
                     <div className="flex-1 min-w-0">
@@ -375,7 +375,7 @@ export function ShopList({
                     </button>
                     <button
                         onClick={onAddShop}
-                        className="flex items-center space-x-2 px-4 py-2 bg-pink-600 hover:bg-pink-700 text-white rounded-lg transition-colors"
+                        className="flex items-center space-x-2 px-4 py-2 bg-mamba-green hover:bg-mamba-deep text-mamba-dark rounded-lg transition-colors"
                     >
                         <Plus size={20} />
                         <span>Add Shop</span>
@@ -397,14 +397,14 @@ export function ShopList({
                     {adminAccounts.filter(a => a.stores.length > 0).map((account) => (
                         <div key={account.id} className="space-y-6">
                             <div className="flex items-center gap-3 border-b border-gray-700 pb-4">
-                                <div className="p-2 bg-pink-500/10 rounded-lg">
-                                    <User className="w-5 h-5 text-pink-500" />
+                                <div className="p-2 bg-mamba-green/10 rounded-lg">
+                                    <User className="w-5 h-5 text-mamba-green" />
                                 </div>
                                 <div>
                                     <div className="flex items-center gap-2">
                                         <h3 className="text-xl font-bold text-white">{account.account_name}</h3>
                                         {(account as any).owner_role && (
-                                            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-pink-500/20 text-pink-400 border border-pink-500/30">
+                                            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-mamba-green/20 text-mamba-neon border border-mamba-green/30">
                                                 {(account as any).owner_role.toUpperCase()}
                                             </span>
                                         )}
@@ -454,9 +454,9 @@ export function ShopList({
                     {/* Add Shop Card (always visible at the end for regular users) */}
                     <button
                         onClick={onAddShop}
-                        className="flex flex-col items-center justify-center h-full min-h-[200px] bg-gray-800/50 rounded-xl border-2 border-dashed border-gray-700 hover:border-pink-500 hover:bg-gray-800 transition-all group"
+                        className="flex flex-col items-center justify-center h-full min-h-[200px] bg-gray-800/50 rounded-xl border-2 border-dashed border-gray-700 hover:border-mamba-green hover:bg-gray-800 transition-all group"
                     >
-                        <div className="p-4 bg-gray-700 rounded-full mb-4 group-hover:bg-pink-600 group-hover:text-white transition-colors">
+                        <div className="p-4 bg-gray-700 rounded-full mb-4 group-hover:bg-mamba-green group-hover:text-mamba-dark transition-colors">
                             <Plus size={32} />
                         </div>
                         <span className="text-lg font-medium text-gray-300 group-hover:text-white">Connect New Shop</span>

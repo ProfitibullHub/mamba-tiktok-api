@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useAuth } from '../contexts/AuthContext';
-import { Store, LogOut } from 'lucide-react';
+import { LogOut } from 'lucide-react';
+import { MAMBA_FULL_LOGO_SRC } from '../lib/brandAssets';
 
 interface WelcomeScreenProps {
     onConnect?: () => void;
@@ -39,7 +40,7 @@ export default function WelcomeScreen({ onConnect, onConnectAgency, onSkip, isCo
     const isLoading = isConnecting || localConnecting || localAgencyConnecting;
 
     return (
-        <div className="fixed inset-0 z-50 bg-gradient-to-br from-gray-900 via-purple-900 to-pink-900 flex items-center justify-center p-6 overflow-hidden">
+        <div className="fixed inset-0 z-50 bg-gradient-to-br from-gray-900 via-purple-900 to-mamba-dark flex items-center justify-center p-6 overflow-hidden">
             <div className="absolute top-6 right-6 z-10 flex gap-3">
                 {onSkip && (
                     <button
@@ -62,10 +63,14 @@ export default function WelcomeScreen({ onConnect, onConnectAgency, onSkip, isCo
             <div className="max-w-4xl w-full max-h-full overflow-y-auto custom-scrollbar">
                 {/* Welcome Header */}
                 <div className="text-center mb-8">
-                    <div className="inline-flex items-center justify-center w-20 h-20 bg-gradient-to-r from-pink-500 to-red-500 rounded-2xl mb-4 shadow-lg shadow-pink-500/20">
-                        <Store className="w-10 h-10 text-white" />
+                    <div className="flex justify-center mb-4">
+                        <img
+                            src={MAMBA_FULL_LOGO_SRC}
+                            alt="Mamba"
+                            className="h-28 w-auto max-w-[min(100%,360px)] object-contain drop-shadow-lg drop-shadow-mamba-green/20"
+                        />
                     </div>
-                    <h1 className="text-5xl font-bold text-white mb-4 tracking-tight">Welcome to Mamba</h1>
+                    <h1 className="text-5xl font-bold text-white mb-4 tracking-tight">Welcome</h1>
                     <p className="text-xl text-gray-300">
                         Hi {profile?.full_name || 'there'}! Let's connect your TikTok Shop to get started.
                     </p>
@@ -78,7 +83,7 @@ export default function WelcomeScreen({ onConnect, onConnectAgency, onSkip, isCo
                         <h2 className="text-2xl font-bold text-white mb-6">Quick Setup</h2>
                         <div className="space-y-6">
                             <div className="flex items-start gap-4">
-                                <div className="bg-pink-500 rounded-full w-8 h-8 flex items-center justify-center flex-shrink-0 text-white font-bold shadow-lg shadow-pink-500/30">
+                                <div className="bg-mamba-green rounded-full w-8 h-8 flex items-center justify-center flex-shrink-0 text-mamba-dark font-bold shadow-lg shadow-mamba-green/30">
                                     1
                                 </div>
                                 <div>
@@ -114,11 +119,11 @@ export default function WelcomeScreen({ onConnect, onConnectAgency, onSkip, isCo
                         <button
                             onClick={handleConnect}
                             disabled={isLoading}
-                            className="w-full bg-gradient-to-r from-pink-500 to-red-500 text-white px-6 py-4 rounded-xl font-semibold text-lg hover:from-pink-600 hover:to-red-600 transition-all shadow-lg hover:shadow-xl transform hover:scale-[1.02] disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none active:scale-[0.98]"
+                            className="w-full bg-gradient-to-r from-mamba-green to-mamba-deep text-mamba-dark px-6 py-4 rounded-xl font-semibold text-lg hover:from-mamba-neon hover:to-mamba-deep transition-all shadow-lg hover:shadow-xl transform hover:scale-[1.02] disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none active:scale-[0.98]"
                         >
                             {isLoading ? (
                                 <span className="flex items-center justify-center gap-2">
-                                    <div className="animate-spin rounded-full h-5 w-5 border-2 border-white border-t-transparent"></div>
+                                    <div className="animate-spin rounded-full h-5 w-5 border-2 border-mamba-dark border-t-transparent"></div>
                                     Connecting...
                                 </span>
                             ) : (

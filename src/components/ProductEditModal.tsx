@@ -3,6 +3,7 @@ import {
     X, Save, Loader2, Package, DollarSign, Layers, Image as ImageIcon,
     Plus, Trash2, AlertCircle, CheckCircle, Edit2, Box, Upload
 } from 'lucide-react';
+import { useShallow } from 'zustand/react/shallow';
 import { Product, useShopStore } from '../store/useShopStore';
 import { RichTextEditor } from './RichTextEditor';
 import { apiFetch } from '../lib/apiClient';
@@ -27,7 +28,15 @@ interface SKUEdit {
 }
 
 export function ProductEditModal({ product, accountId, onClose, onSave }: ProductEditModalProps) {
-    const { editProduct, updateProductPrices, updateProductInventory, fetchWarehouses, warehouses } = useShopStore();
+    const { editProduct, updateProductPrices, updateProductInventory, fetchWarehouses, warehouses } = useShopStore(
+        useShallow((s) => ({
+            editProduct: s.editProduct,
+            updateProductPrices: s.updateProductPrices,
+            updateProductInventory: s.updateProductInventory,
+            fetchWarehouses: s.fetchWarehouses,
+            warehouses: s.warehouses,
+        })),
+    );
 
     // Tab state
     const [activeTab, setActiveTab] = useState<EditTab>('basic');
@@ -388,7 +397,7 @@ export function ProductEditModal({ product, accountId, onClose, onSave }: Produc
                                 key={tab.id}
                                 onClick={() => setActiveTab(tab.id)}
                                 className={`flex items-center gap-2 px-4 py-3 text-sm font-medium transition-colors border-b-2 -mb-px ${activeTab === tab.id
-                                    ? 'text-pink-500 border-pink-500'
+                                    ? 'text-mamba-green border-mamba-green'
                                     : 'text-gray-400 border-transparent hover:text-white hover:border-gray-600'
                                     }`}
                             >
@@ -426,7 +435,7 @@ export function ProductEditModal({ product, accountId, onClose, onSave }: Produc
                                     type="text"
                                     value={title}
                                     onChange={(e) => setTitle(e.target.value)}
-                                    className="w-full bg-gray-800 border border-gray-700 text-white px-4 py-3 rounded-lg focus:outline-none focus:border-pink-500 transition-colors"
+                                    className="w-full bg-gray-800 border border-gray-700 text-white px-4 py-3 rounded-lg focus:outline-none focus:border-mamba-green transition-colors"
                                     placeholder="Enter product title"
                                 />
                                 <p className="text-xs text-gray-500 mt-1">
@@ -452,7 +461,7 @@ export function ProductEditModal({ product, accountId, onClose, onSave }: Produc
                                 <button
                                     onClick={handleSaveBasicInfo}
                                     disabled={isSaving || (!title.trim())}
-                                    className="flex items-center gap-2 px-6 py-2.5 bg-pink-600 hover:bg-pink-700 text-white rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                    className="flex items-center gap-2 px-6 py-2.5 bg-mamba-green hover:bg-mamba-deep text-mamba-dark rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                                 >
                                     {isSaving ? <Loader2 size={18} className="animate-spin" /> : <Save size={18} />}
                                     Save Basic Info
@@ -472,7 +481,7 @@ export function ProductEditModal({ product, accountId, onClose, onSave }: Produc
 
                             <div className="space-y-4">
                                 <h3 className="text-lg font-semibold text-white flex items-center gap-2">
-                                    <Layers className="text-pink-500" size={20} />
+                                    <Layers className="text-mamba-green" size={20} />
                                     SKU Prices ({skuEdits.length})
                                 </h3>
 
@@ -497,7 +506,7 @@ export function ProductEditModal({ product, accountId, onClose, onSave }: Produc
                                                     onChange={(e) => updateSkuEdit(sku.id, 'original_price', e.target.value)}
                                                     min="0"
                                                     step="0.01"
-                                                    className="w-full bg-gray-900 border border-gray-600 text-white px-3 py-2 rounded-lg focus:outline-none focus:border-pink-500"
+                                                    className="w-full bg-gray-900 border border-gray-600 text-white px-3 py-2 rounded-lg focus:outline-none focus:border-mamba-green"
                                                 />
                                             </div>
                                             <div>
@@ -511,7 +520,7 @@ export function ProductEditModal({ product, accountId, onClose, onSave }: Produc
                                                     min="0"
                                                     step="0.01"
                                                     placeholder="No sale"
-                                                    className="w-full bg-gray-900 border border-gray-600 text-white px-3 py-2 rounded-lg focus:outline-none focus:border-pink-500"
+                                                    className="w-full bg-gray-900 border border-gray-600 text-white px-3 py-2 rounded-lg focus:outline-none focus:border-mamba-green"
                                                 />
                                             </div>
                                         </div>
@@ -523,7 +532,7 @@ export function ProductEditModal({ product, accountId, onClose, onSave }: Produc
                                 <button
                                     onClick={handleSavePrices}
                                     disabled={isSaving || skuEdits.filter(s => s.id !== 'default').length === 0}
-                                    className="flex items-center gap-2 px-6 py-2.5 bg-pink-600 hover:bg-pink-700 text-white rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                    className="flex items-center gap-2 px-6 py-2.5 bg-mamba-green hover:bg-mamba-deep text-mamba-dark rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                                 >
                                     {isSaving ? <Loader2 size={18} className="animate-spin" /> : <Save size={18} />}
                                     Update Prices
@@ -563,7 +572,7 @@ export function ProductEditModal({ product, accountId, onClose, onSave }: Produc
 
                             <div className="space-y-4">
                                 <h3 className="text-lg font-semibold text-white flex items-center gap-2">
-                                    <Box className="text-pink-500" size={20} />
+                                    <Box className="text-mamba-green" size={20} />
                                     SKU Inventory ({skuEdits.length})
                                 </h3>
 
@@ -595,7 +604,7 @@ export function ProductEditModal({ product, accountId, onClose, onSave }: Produc
                                                     value={sku.quantity}
                                                     onChange={(e) => updateSkuEdit(sku.id, 'quantity', parseInt(e.target.value) || 0)}
                                                     min="0"
-                                                    className="w-full bg-gray-900 border border-gray-600 text-white px-3 py-2 rounded-lg focus:outline-none focus:border-pink-500"
+                                                    className="w-full bg-gray-900 border border-gray-600 text-white px-3 py-2 rounded-lg focus:outline-none focus:border-mamba-green"
                                                 />
                                             </div>
                                             <div>
@@ -605,7 +614,7 @@ export function ProductEditModal({ product, accountId, onClose, onSave }: Produc
                                                 <select
                                                     value={sku.warehouse_id || ''}
                                                     onChange={(e) => updateSkuEdit(sku.id, 'warehouse_id', e.target.value)}
-                                                    className="w-full bg-gray-900 border border-gray-600 text-white px-3 py-2 rounded-lg focus:outline-none focus:border-pink-500"
+                                                    className="w-full bg-gray-900 border border-gray-600 text-white px-3 py-2 rounded-lg focus:outline-none focus:border-mamba-green"
                                                 >
                                                     {warehouses.length === 0 ? (
                                                         <option value="">Loading warehouses...</option>
@@ -627,7 +636,7 @@ export function ProductEditModal({ product, accountId, onClose, onSave }: Produc
                                 <button
                                     onClick={handleSaveInventory}
                                     disabled={isSaving || skuEdits.filter(s => s.id !== 'default').length === 0}
-                                    className="flex items-center gap-2 px-6 py-2.5 bg-pink-600 hover:bg-pink-700 text-white rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                    className="flex items-center gap-2 px-6 py-2.5 bg-mamba-green hover:bg-mamba-deep text-mamba-dark rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                                 >
                                     {isSaving ? <Loader2 size={18} className="animate-spin" /> : <Save size={18} />}
                                     Update Inventory
@@ -657,7 +666,7 @@ export function ProductEditModal({ product, accountId, onClose, onSave }: Produc
                                                 alt="Main image"
                                                 className="w-full h-full object-cover"
                                             />
-                                            <span className="absolute bottom-2 left-2 px-2 py-1 bg-pink-500/80 text-white text-xs rounded">
+                                            <span className="absolute bottom-2 left-2 px-2 py-1 bg-mamba-green/80 text-mamba-dark text-xs rounded">
                                                 Main
                                             </span>
                                         </div>
@@ -715,14 +724,14 @@ export function ProductEditModal({ product, accountId, onClose, onSave }: Produc
                             {/* Image Upload Area */}
                             <div
                                 className={`bg-gray-800 rounded-xl p-6 border-2 border-dashed transition-colors ${isUploadingImage
-                                    ? 'border-pink-500/50 bg-pink-500/5'
+                                    ? 'border-mamba-green/50 bg-mamba-green/5'
                                     : 'border-gray-700 hover:border-gray-600'
                                     }`}
                             >
                                 <div className="text-center">
                                     {isUploadingImage ? (
                                         <>
-                                            <Loader2 size={48} className="mx-auto text-pink-500 mb-4 animate-spin" />
+                                            <Loader2 size={48} className="mx-auto text-mamba-green mb-4 animate-spin" />
                                             <p className="text-gray-300 font-medium mb-2">Uploading to TikTok...</p>
                                             <p className="text-gray-500 text-sm">
                                                 Please wait while your image is being processed.
@@ -746,7 +755,7 @@ export function ProductEditModal({ product, accountId, onClose, onSave }: Produc
                                             />
                                             <label
                                                 htmlFor="image-upload"
-                                                className="inline-flex items-center gap-2 px-6 py-2.5 bg-pink-600 hover:bg-pink-700 text-white rounded-lg transition-colors cursor-pointer"
+                                                className="inline-flex items-center gap-2 px-6 py-2.5 bg-mamba-green hover:bg-mamba-deep text-mamba-dark rounded-lg transition-colors cursor-pointer"
                                             >
                                                 <Upload size={18} />
                                                 Select Images

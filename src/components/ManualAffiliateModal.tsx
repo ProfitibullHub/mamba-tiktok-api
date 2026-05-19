@@ -74,7 +74,7 @@ export function ManualAffiliateModal({ isOpen, onClose, account, shopId }: Manua
                                 required
                                 value={formData.affiliate_name}
                                 onChange={e => setFormData({ ...formData, affiliate_name: e.target.value })}
-                                className="w-full bg-gray-800 border border-gray-700 text-white rounded-lg pl-10 pr-4 py-2 focus:ring-2 focus:ring-pink-500 focus:border-transparent outline-none"
+                                className="w-full bg-gray-800 border border-gray-700 text-white rounded-lg pl-10 pr-4 py-2 focus:ring-2 focus:ring-mamba-green focus:border-transparent outline-none"
                                 placeholder="e.g. Jane Doe"
                             />
                         </div>
@@ -93,7 +93,7 @@ export function ManualAffiliateModal({ isOpen, onClose, account, shopId }: Manua
                                 required
                                 value={formData.amount}
                                 onChange={e => setFormData({ ...formData, amount: e.target.value })}
-                                className="w-full bg-gray-800 border border-gray-700 text-white rounded-lg pl-10 pr-4 py-2 focus:ring-2 focus:ring-pink-500 focus:border-transparent outline-none"
+                                className="w-full bg-gray-800 border border-gray-700 text-white rounded-lg pl-10 pr-4 py-2 focus:ring-2 focus:ring-mamba-green focus:border-transparent outline-none"
                                 placeholder="0.00"
                             />
                         </div>
@@ -111,7 +111,7 @@ export function ManualAffiliateModal({ isOpen, onClose, account, shopId }: Manua
                                 required
                                 value={formData.date}
                                 onChange={e => setFormData({ ...formData, date: e.target.value })}
-                                className="w-full bg-gray-800 border border-gray-700 text-white rounded-lg pl-10 pr-4 py-2 focus:ring-2 focus:ring-pink-500 focus:border-transparent outline-none"
+                                className="w-full bg-gray-800 border border-gray-700 text-white rounded-lg pl-10 pr-4 py-2 focus:ring-2 focus:ring-mamba-green focus:border-transparent outline-none"
                             />
                         </div>
                     </div>
@@ -126,7 +126,7 @@ export function ManualAffiliateModal({ isOpen, onClose, account, shopId }: Manua
                             <textarea
                                 value={formData.description}
                                 onChange={e => setFormData({ ...formData, description: e.target.value })}
-                                className="w-full bg-gray-800 border border-gray-700 text-white rounded-lg pl-10 pr-4 py-2 focus:ring-2 focus:ring-pink-500 focus:border-transparent outline-none resize-none h-24"
+                                className="w-full bg-gray-800 border border-gray-700 text-white rounded-lg pl-10 pr-4 py-2 focus:ring-2 focus:ring-mamba-green focus:border-transparent outline-none resize-none h-24"
                                 placeholder="Notes about this retainer..."
                             />
                         </div>
@@ -143,7 +143,7 @@ export function ManualAffiliateModal({ isOpen, onClose, account, shopId }: Manua
                         <button
                             type="submit"
                             disabled={isSubmitting}
-                            className="flex-1 px-4 py-2 bg-pink-600 text-white rounded-lg hover:bg-pink-700 transition-colors flex items-center justify-center gap-2"
+                            className="flex-1 px-4 py-2 bg-mamba-green text-mamba-dark rounded-lg hover:bg-mamba-deep transition-colors flex items-center justify-center gap-2"
                         >
                             {isSubmitting ? (
                                 <>

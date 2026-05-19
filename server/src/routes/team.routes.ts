@@ -13,6 +13,75 @@ import { sendHtmlEmail } from '../services/email.js';
 const router = express.Router();
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/** Agency Admin, platform super admin, or custom role with agency.sellers.link. */
+async function actorMayInitiateAgencySellerLink(actorId: string, agencyTenantId: string): Promise<boolean> {
+    const [{ data: isAa, error: aaErr }, { data: isSa, error: saErr }, { data: permRows, error: permErr }] =
+        await Promise.all([
+            supabase.rpc('user_is_agency_admin', { p_agency_tenant_id: agencyTenantId, p_user_id: actorId }),
+            supabase.rpc('user_is_platform_super_admin', { p_user_id: actorId }),
+            supabase.rpc('get_user_effective_permissions_on_tenant', {
+                p_user_id: actorId,
+                p_tenant_id: agencyTenantId,
+            }),
+        ]);
+    if (aaErr || saErr) {
+        console.error('[team] agency seller link permission', aaErr?.message || saErr?.message);
+        return false;
+    }
+    if (isAa === true || isSa === true) return true;
+    if (permErr) {
+        console.error('[team] agency seller link perm rows', permErr.message);
+        return false;
+    }
+    const rows = Array.isArray(permRows) ? permRows : [];
+    return rows.some((r: { action?: string }) => r.action === 'agency.sellers.link');
+}
+
+/** Roster of seller–staff links for the agency console: active agency members, managers, or delegated link/unlink. */
+async function actorMayViewAgencySellerAssignments(actorId: string, agencyTenantId: string): Promise<boolean> {
+    if (await actorMayInitiateAgencySellerLink(actorId, agencyTenantId)) return true;
+    const { data: manage, error: manageErr } = await supabase.rpc('user_can_manage_tenant_members', {
+        p_tenant_id: agencyTenantId,
+        p_actor_id: actorId,
+    });
+    if (manageErr) {
+        console.error('[team] agency-seller-assignments manage check', manageErr.message);
+    } else if (manage === true) {
+        return true;
+    }
+    const { data: isAa } = await supabase.rpc('user_is_agency_admin', {
+        p_agency_tenant_id: agencyTenantId,
+        p_user_id: actorId,
+    });
+    if (isAa === true) return true;
+    const { data: isSa } = await supabase.rpc('user_is_platform_super_admin', { p_user_id: actorId });
+    if (isSa === true) return true;
+    const { data: profile } = await supabase.from('profiles').select('role').eq('id', actorId).maybeSingle();
+    if (profile?.role === 'admin') return true;
+    const { data: mem } = await supabase
+        .from('tenant_memberships')
+        .select('id')
+        .eq('tenant_id', agencyTenantId)
+        .eq('user_id', actorId)
+        .eq('status', 'active')
+        .maybeSingle();
+    return !!mem;
+}
+
+/** Seller tenant search for link flow — team managers or delegated link/unlink permission. */
+async function actorMaySearchSellersForAgency(actorId: string, agencyTenantId: string): Promise<boolean> {
+    const { data: manage, error } = await supabase.rpc('user_can_manage_tenant_members', {
+        p_tenant_id: agencyTenantId,
+        p_actor_id: actorId,
+    });
+    if (error) {
+        console.error('[team] seller-search manage check', error.message);
+        return false;
+    }
+    if (manage === true) return true;
+    return actorMayInitiateAgencySellerLink(actorId, agencyTenantId);
+}
 const FRONTEND_URL = (process.env.FRONTEND_URL || 'https://mamba.app').replace(/\/$/, '');
 
 function escapeHtml(value: string): string {
@@ -34,23 +103,23 @@ function buildTeamInviteEmailHtml(acceptUrl: string, tenantLabel?: string): stri
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>You have been invited</title>
   </head>
-  <body style="margin:0;padding:24px;background:#0b1020;font-family:Arial,Helvetica,sans-serif;">
+  <body style="margin:0;padding:24px;background:#06141A;font-family:Arial,Helvetica,sans-serif;">
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:620px;margin:0 auto;">
       <tr>
-        <td style="background:#121a31;border:1px solid #2a355b;border-radius:16px;padding:32px;">
-          <p style="margin:0 0 12px;color:#94a3b8;font-size:12px;letter-spacing:.4px;">MAMBA TEAM INVITE</p>
-          <h1 style="margin:0 0 12px;color:#f8fafc;font-size:28px;line-height:1.2;">You have been invited</h1>
-          <p style="margin:0 0 20px;color:#cbd5e1;font-size:16px;line-height:1.6;">
+        <td style="background:#13262E;border:1px solid #1F3A43;border-radius:16px;padding:32px;">
+          <p style="margin:0 0 12px;color:#8CAFB3;font-size:12px;letter-spacing:.4px;">MAMBA TEAM INVITE</p>
+          <h1 style="margin:0 0 12px;color:#E6F3F1;font-size:28px;line-height:1.2;">You have been invited</h1>
+          <p style="margin:0 0 20px;color:#8CAFB3;font-size:16px;line-height:1.6;">
             You have been invited${tenantText}. Use the button below to review and accept your invitation.
           </p>
           <p style="margin:0 0 20px;">
-            <a href="${safeUrl}" style="display:inline-block;padding:14px 24px;border-radius:10px;background:#ec4899;color:#ffffff;text-decoration:none;font-weight:700;">
+            <a href="${safeUrl}" style="display:inline-block;padding:14px 24px;border-radius:10px;background:#28D99E;color:#06141A;text-decoration:none;font-weight:700;">
               Accept Invitation
             </a>
           </p>
-          <p style="margin:0;color:#94a3b8;font-size:13px;line-height:1.6;">
+          <p style="margin:0;color:#8CAFB3;font-size:13px;line-height:1.6;">
             If the button doesn't work, copy this URL into your browser:<br />
-            <a href="${safeUrl}" style="color:#a78bfa;text-decoration:underline;word-break:break-all;">${safeUrl}</a>
+            <a href="${safeUrl}" style="color:#49FFB7;text-decoration:underline;word-break:break-all;">${safeUrl}</a>
           </p>
         </td>
       </tr>
@@ -59,34 +128,55 @@ function buildTeamInviteEmailHtml(acceptUrl: string, tenantLabel?: string): stri
 </html>`;
 }
 
-/**
- * Send team invitation email through Supabase Auth mailer.
- * - Prefer Invite template for new users.
- * - Fallback to OTP flow for already-registered users.
- */
-async function sendInvitationEmail(tenantId: string, toEmail: string, acceptUrl: string): Promise<void> {
-    const invite = await supabase.auth.admin.inviteUserByEmail(toEmail, {
-        redirectTo: acceptUrl,
-        data: { invitation_tenant_id: tenantId },
-    });
-
-    if (!invite.error) return;
-
-    // Existing users cannot be invited again via inviteUserByEmail; use OTP mailer fallback.
-    if (/already registered|already been registered|already exists/i.test(invite.error.message || '')) {
-        const otp = await supabase.auth.signInWithOtp({
-            email: toEmail,
-            options: {
-                shouldCreateUser: false,
-                emailRedirectTo: acceptUrl,
-                data: { invitation_tenant_id: tenantId },
-            },
-        });
-        if (!otp.error) return;
-        throw new Error(otp.error.message || 'Failed to send invitation email via Supabase OTP');
+/** Paginated auth.users lookup by email (service role). */
+async function findAuthUserIdByEmail(email: string): Promise<string | null> {
+    const normalized = email.trim().toLowerCase();
+    let page = 1;
+    const perPage = 200;
+    for (;;) {
+        const { data, error } = await supabase.auth.admin.listUsers({ page, perPage });
+        if (error) {
+            console.error('[team] listUsers', error.message);
+            return null;
+        }
+        const hit = data.users.find((u) => (u.email ?? '').toLowerCase() === normalized);
+        if (hit) return hit.id;
+        if (data.users.length < perPage) return null;
+        page += 1;
     }
+}
 
-    throw new Error(invite.error.message || 'Failed to send invitation email via Supabase invite');
+/**
+ * Ensure an auth user exists for a team invite without triggering Supabase invite/OTP mail.
+ * Returns the user id or null when creation and lookup both fail.
+ */
+async function ensureAuthUserForTeamInvite(email: string): Promise<string | null> {
+    const normEmail = email.trim().toLowerCase();
+    const created = await supabase.auth.admin.createUser({
+        email: normEmail,
+        email_confirm: false,
+        user_metadata: { full_name: normEmail.split('@')[0] || 'User' },
+    });
+    if (!created.error && created.data?.user?.id) return created.data.user.id;
+
+    const msg = created.error?.message || '';
+    if (/already registered|already been registered|already exists/i.test(msg)) {
+        return findAuthUserIdByEmail(normEmail);
+    }
+    console.error('[team] ensureAuthUserForTeamInvite', msg || 'createUser failed');
+    return null;
+}
+
+/** Single team-invite email with org name and accept-invitation deep link (no Supabase Auth mailer). */
+async function sendInvitationEmail(toEmail: string, acceptUrl: string, tenantLabel?: string): Promise<void> {
+    const org = tenantLabel?.trim() || 'your organization';
+    const html = buildTeamInviteEmailHtml(acceptUrl, org);
+    const result = await sendHtmlEmail(toEmail, `You've been invited to join ${org} on Mamba`, html, {
+        fromDisplayName: org,
+    });
+    if (!result.delivered) {
+        throw new Error('Team invitation email was not delivered');
+    }
 }
 
 function buildSellerLinkInviteEmailHtml(acceptUrl: string, agencyName?: string, sellerName?: string): string {
@@ -100,24 +190,24 @@ function buildSellerLinkInviteEmailHtml(acceptUrl: string, agencyName?: string, 
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Seller Link Request</title>
   </head>
-  <body style="margin:0;padding:24px;background:#0b1020;font-family:Arial,Helvetica,sans-serif;">
+  <body style="margin:0;padding:24px;background:#06141A;font-family:Arial,Helvetica,sans-serif;">
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:620px;margin:0 auto;">
       <tr>
-        <td style="background:#121a31;border:1px solid #2a355b;border-radius:16px;padding:32px;">
-          <p style="margin:0 0 12px;color:#94a3b8;font-size:12px;letter-spacing:.4px;">MAMBA SELLER LINK REQUEST</p>
-          <h1 style="margin:0 0 12px;color:#f8fafc;font-size:28px;line-height:1.2;">Agency Link Request</h1>
-          <p style="margin:0 0 20px;color:#cbd5e1;font-size:16px;line-height:1.6;">
+        <td style="background:#13262E;border:1px solid #1F3A43;border-radius:16px;padding:32px;">
+          <p style="margin:0 0 12px;color:#8CAFB3;font-size:12px;letter-spacing:.4px;">MAMBA SELLER LINK REQUEST</p>
+          <h1 style="margin:0 0 12px;color:#E6F3F1;font-size:28px;line-height:1.2;">Agency Link Request</h1>
+          <p style="margin:0 0 20px;color:#8CAFB3;font-size:16px;line-height:1.6;">
             <strong>${safeAgency}</strong> requested to link <strong>${safeSeller}</strong> to their agency.
             Review and accept or decline this request.
           </p>
           <p style="margin:0 0 20px;">
-            <a href="${safeUrl}" style="display:inline-block;padding:14px 24px;border-radius:10px;background:#ec4899;color:#ffffff;text-decoration:none;font-weight:700;">
+            <a href="${safeUrl}" style="display:inline-block;padding:14px 24px;border-radius:10px;background:#28D99E;color:#06141A;text-decoration:none;font-weight:700;">
               Review Request
             </a>
           </p>
-          <p style="margin:0;color:#94a3b8;font-size:13px;line-height:1.6;">
+          <p style="margin:0;color:#8CAFB3;font-size:13px;line-height:1.6;">
             If the button does not work, copy this URL into your browser:<br />
-            <a href="${safeUrl}" style="color:#a78bfa;text-decoration:underline;word-break:break-all;">${safeUrl}</a>
+            <a href="${safeUrl}" style="color:#49FFB7;text-decoration:underline;word-break:break-all;">${safeUrl}</a>
           </p>
         </td>
       </tr>
@@ -158,27 +248,10 @@ router.get('/agency-seller-assignments', async (req, res) => {
             return;
         }
 
-        let allowed = false;
-        const { data: isAgencyAdmin } = await supabase.rpc('user_is_agency_admin', {
-            p_agency_tenant_id: agencyTenantId,
-            p_user_id: actorId,
-        });
-        if (isAgencyAdmin === true) allowed = true;
+        let allowed = await actorMayViewAgencySellerAssignments(actorId, agencyTenantId);
 
         if (!allowed) {
-            const { data: isPlatformSa } = await supabase.rpc('user_is_platform_super_admin', {
-                p_user_id: actorId,
-            });
-            if (isPlatformSa === true) allowed = true;
-        }
-
-        if (!allowed) {
-            const { data: profile } = await supabase.from('profiles').select('role').eq('id', actorId).maybeSingle();
-            if (profile?.role === 'admin') allowed = true;
-        }
-
-        if (!allowed) {
-            res.status(403).json({ success: false, error: 'Agency Admin or Super Admin access required' });
+            res.status(403).json({ success: false, error: 'Agency membership or appropriate permissions required' });
             return;
         }
 
@@ -198,7 +271,7 @@ router.get('/agency-seller-assignments', async (req, res) => {
                 supabase.from('profiles').select('id,full_name,email').in('id', userIds),
                 supabase
                     .from('tenant_memberships')
-                    .select('user_id,roles(name)')
+                    .select('user_id, roles(name), membership_roles(revoked_at, roles(name))')
                     .eq('tenant_id', agencyTenantId)
                     .in('user_id', userIds)
                     .eq('status', 'active'),
@@ -213,7 +286,19 @@ router.get('/agency-seller-assignments', async (req, res) => {
                 });
             }
             for (const m of membershipRows || []) {
-                rolesById.set((m as any).user_id, (m as any).roles?.name ?? null);
+                const uid = (m as { user_id: string }).user_id;
+                const primaryName = (m as { roles?: { name?: string } | null }).roles?.name ?? null;
+                const mrList = ((m as { membership_roles?: Array<{ revoked_at: string | null; roles?: { name?: string } | null }> })
+                    .membership_roles || []
+                ).filter((mr) => !mr.revoked_at && mr.roles?.name);
+                const fromMr = mrList.map((mr) => mr.roles!.name as string);
+                const combined =
+                    fromMr.length > 0
+                        ? Array.from(new Set(fromMr))
+                              .sort((a, b) => a.localeCompare(b))
+                              .join(', ')
+                        : primaryName;
+                rolesById.set(uid, combined ?? null);
             }
         }
 
@@ -346,16 +431,8 @@ router.get('/seller-search', async (req, res) => {
             return;
         }
 
-        const { data: allowed, error: permErr } = await supabase.rpc('user_can_manage_tenant_members', {
-            p_tenant_id: agencyTenantId,
-            p_actor_id: actorId,
-        });
-        if (permErr) {
-            console.error('[team] seller-search permission', permErr.message);
-            res.status(500).json({ success: false, error: 'Permission check failed' });
-            return;
-        }
-        if (allowed !== true) {
+        const maySearch = await actorMaySearchSellersForAgency(actorId, agencyTenantId);
+        if (!maySearch) {
             res.status(403).json({ success: false, error: 'Access denied' });
             return;
         }
@@ -431,22 +508,12 @@ router.post('/link-seller', async (req, res) => {
             return;
         }
 
-        const [{ data: isAgencyAdmin, error: agencyAdminErr }, { data: isPlatformSa, error: saErr }] = await Promise.all([
-            supabase.rpc('user_is_agency_admin', {
-                p_agency_tenant_id: agencyTenantId,
-                p_user_id: actorId,
-            }),
-            supabase.rpc('user_is_platform_super_admin', {
-                p_user_id: actorId,
-            }),
-        ]);
-        if (agencyAdminErr || saErr) {
-            console.error('[team] link-seller permission check', agencyAdminErr?.message || saErr?.message);
-            res.status(500).json({ success: false, error: 'Permission check failed' });
-            return;
-        }
-        if (isAgencyAdmin !== true && isPlatformSa !== true) {
-            res.status(403).json({ success: false, error: 'Only Agency Admin or Super Admin can link sellers' });
+        const mayLink = await actorMayInitiateAgencySellerLink(actorId, agencyTenantId);
+        if (!mayLink) {
+            res.status(403).json({
+                success: false,
+                error: 'You need Agency Admin access or the “link/unlink sellers” permission for this agency',
+            });
             return;
         }
 
@@ -708,8 +775,6 @@ router.post('/invite-member', async (req, res) => {
             return;
         }
 
-        let sentNewInvite = false;
-
         if (!targetUserId && normEmail) {
             const { data: existingProfile } = await supabase
                 .from('profiles')
@@ -720,30 +785,10 @@ router.post('/invite-member', async (req, res) => {
             if (existingProfile?.id) {
                 targetUserId = existingProfile.id;
             } else {
-                const redirectTo = `${FRONTEND_URL}/`;
-
-                const inv = await supabase.auth.admin.inviteUserByEmail(normEmail, {
-                    redirectTo,
-                });
-
-                if (inv.error) {
-                    const msg = inv.error.message || '';
-                    if (/already registered|already been registered/i.test(msg)) {
-                        const list = await supabase.auth.admin.listUsers({ page: 1, perPage: 200 });
-                        const found = list.data?.users?.find(
-                            (u) => (u.email || '').toLowerCase() === normEmail
-                        );
-                        if (found?.id) {
-                            targetUserId = found.id;
-                        }
-                    }
-                    if (!targetUserId) {
-                        res.status(400).json({ success: false, error: inv.error.message || 'Invite failed' });
-                        return;
-                    }
-                } else if (inv.data?.user?.id) {
-                    targetUserId = inv.data.user.id;
-                    sentNewInvite = true;
+                targetUserId = await ensureAuthUserForTeamInvite(normEmail);
+                if (!targetUserId) {
+                    res.status(400).json({ success: false, error: 'Could not create or resolve user for this email' });
+                    return;
                 }
             }
         }
@@ -852,7 +897,7 @@ router.post('/invite-member', async (req, res) => {
 
                 // 1. Email notification (skip if we have no address — in-app notification still fires)
                 if (emailForInvite) {
-                    await sendInvitationEmail(tenantId, emailForInvite, acceptUrl).catch((e: Error) => {
+                    await sendInvitationEmail(emailForInvite, acceptUrl, tenantLabel).catch((e: Error) => {
                         console.error('[team] send invitation email', e?.message);
                     });
                 }
@@ -1091,11 +1136,9 @@ router.post('/unlink-seller', async (req, res) => {
         }
 
         let allowed = false;
-        const { data: isAgencyAdmin } = await supabase.rpc('user_is_agency_admin', {
-            p_agency_tenant_id: agencyTenantId,
-            p_user_id: actorId,
-        });
-        if (isAgencyAdmin === true) allowed = true;
+
+        const mayAgencyUnlink = await actorMayInitiateAgencySellerLink(actorId, agencyTenantId);
+        if (mayAgencyUnlink) allowed = true;
 
         if (!allowed) {
             const { data: isSellerAdmin } = await supabase.rpc('user_can_manage_tenant_members', {
@@ -1119,7 +1162,11 @@ router.post('/unlink-seller', async (req, res) => {
         }
 
         if (!allowed) {
-            res.status(403).json({ success: false, error: 'Agency Admin, Seller Admin, or Super Admin access required' });
+            res.status(403).json({
+                success: false,
+                error:
+                    'Agency unlink requires Agency Admin, delegated “link/unlink sellers”, Seller Admin on the seller, or Super Admin',
+            });
             return;
         }
 
@@ -1379,6 +1426,22 @@ router.get('/tenant-member-roles', async (req, res) => {
         if (!allowed) {
             const { data: profile } = await supabase.from('profiles').select('role').eq('id', actorId).maybeSingle();
             if (profile?.role === 'admin') allowed = true;
+        }
+        /**
+         * Read-only aggregate of member roles: anyone who can *see* the tenant (Agency Admin,
+         * Seller Admin, AM/AC with assignments, Super Admin, legacy admin) may load it for the
+         * Teams UI — not only users who can *manage* memberships.
+         */
+        if (!allowed) {
+            const { data: canSee, error: visErr } = await supabase.rpc('tenant_is_visible_to_user', {
+                p_tenant_id: tenantId,
+                p_user_id: actorId,
+            });
+            if (!visErr && canSee === true) {
+                allowed = true;
+            } else if (visErr) {
+                console.warn('[team] tenant-member-roles tenant_is_visible_to_user', visErr.message);
+            }
         }
         if (!allowed) {
             res.status(403).json({ success: false, error: 'Access denied' });

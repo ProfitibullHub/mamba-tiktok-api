@@ -23,3 +23,12 @@ dist-ssr
 .env
 .env.local
 .env.production
+
+# Vitest
+coverage
+
+# Playwright
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/

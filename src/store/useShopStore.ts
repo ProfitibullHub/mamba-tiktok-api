@@ -4,10 +4,14 @@ import { DEFAULT_SYNC_DAYS, getInitialLoadDaysWithBuffer, DEFAULT_LOAD_DAYS } fr
 import { supabase, AffiliateSettlement, AgencyFee } from '../lib/supabase';
 import { getAccessTokenForApi, getApiOrigin } from '../lib/apiClient';
 import { reportClientError } from '../lib/observability';
-import { getUtcCalendarRangeExclusiveUnix, nextCalendarDayISO, previousCalendarDayISO } from '../utils/dateUtils';
+import { countDistinctShopCalendarDaysWithOrders, getUtcCalendarRangeExclusiveUnix, nextCalendarDayISO, previousCalendarDayISO } from '../utils/dateUtils';
 import { mapDbOrderToStore } from '../utils/mapDbOrderToStore';
+import { clearShopTabMountBootstrapFingerprints } from '../utils/shopTabBootstrap';
 
 const API_BASE_URL = getApiOrigin();
+
+/** Wait for durable ingestion job — align with serverless maxDuration (see server/vercel.json builds.config.maxDuration). */
+const SHOP_SYNC_JOB_POLL_TIMEOUT_MS = 310_000;
 
 async function sleep(ms: number): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, ms));
@@ -37,13 +41,16 @@ async function enqueueAndWaitSync(
     }
 
     // Trigger worker immediately in interactive flows (cron still runs independently in production).
-    await shopApi(`${API_BASE_URL}/api/tiktok-shop/sync/run-worker?limit=1`, {
-        method: 'POST',
-        signal,
-    }).catch(() => undefined);
+    await shopApi(
+        `${API_BASE_URL}/api/tiktok-shop/sync/run-worker?limit=1&accountId=${encodeURIComponent(accountId)}&jobId=${encodeURIComponent(enqueueJson.jobId)}`,
+        {
+            method: 'POST',
+            signal,
+        },
+    ).catch(() => undefined);
 
     const startedAt = Date.now();
-    while (Date.now() - startedAt < 180_000) {
+    while (Date.now() - startedAt < SHOP_SYNC_JOB_POLL_TIMEOUT_MS) {
         if (signal?.aborted) {
             throw new DOMException('Sync polling aborted', 'AbortError');
         }
@@ -87,7 +94,7 @@ async function enqueueAndWaitSync(
         source: 'useShopStore.enqueueAndWaitSync',
         accountId,
         metadata: {
-            timeoutMs: 180000,
+            timeoutMs: SHOP_SYNC_JOB_POLL_TIMEOUT_MS,
             jobId: enqueueJson.jobId,
         },
     });
@@ -117,14 +124,131 @@ const lastPlNetworkSuccessAtMs = new Map<string, number>();
 /** Concurrent P&L HTTP requests — replaces a single boolean so one shop finishing does not clear `plFetchInFlight` for another. */
 let plDataHttpInflightDepth = 0;
 
-/** Civil calendar add for YYYY-MM-DD (avoids UTC/local drift from `new Date('YYYY-MM-DD')` in gap-fetch math). */
-function addDaysToISODate(iso: string, deltaDays: number): string {
-    const parts = iso.split('-').map(Number);
-    if (parts.length !== 3 || parts.some(Number.isNaN)) return iso;
-    const [y, m, d] = parts;
-    const utc = Date.UTC(y, m - 1, d + deltaDays);
-    const dt = new Date(utc);
-    return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}-${String(dt.getUTCDate()).padStart(2, '0')}`;
+/** Lexicographic min/max for YYYY-MM-DD ISO calendar strings. */
+function isoDateMin(a: string, b: string): string {
+    return a <= b ? a : b;
+}
+function isoDateMax(a: string, b: string): string {
+    return a >= b ? a : b;
+}
+
+/** Large uncovered gap fetches exceed DB statement limits if we query ~60d at once; slab into ~2 week windows. */
+const GAP_FETCH_SLAB_THRESHOLD_DAYS = 21;
+const GAP_FETCH_SLAB_MAX_INCLUSIVE_DAYS = 14;
+
+function countInclusiveShopCalendarDays(fromISO: string, toInclusiveISO: string, timezone: string): number {
+    if (fromISO > toInclusiveISO) return 0;
+    let d = fromISO;
+    let n = 1;
+    while (d < toInclusiveISO) {
+        d = nextCalendarDayISO(d, timezone);
+        n++;
+    }
+    return n;
+}
+
+function splitInclusiveGapIntoCalendarSlabs(
+    gapStartInclusive: string,
+    gapEndInclusive: string,
+    timezone: string,
+    maxInclusiveDaysPerSlab = GAP_FETCH_SLAB_MAX_INCLUSIVE_DAYS,
+): { startDate: string; endDate: string }[] {
+    const slabs: { startDate: string; endDate: string }[] = [];
+    let slabStart = gapStartInclusive;
+    while (slabStart <= gapEndInclusive) {
+        let slabEnd = slabStart;
+        let daysInSlab = 1;
+        while (daysInSlab < maxInclusiveDaysPerSlab && slabEnd < gapEndInclusive) {
+            const candidate = nextCalendarDayISO(slabEnd, timezone);
+            if (candidate > gapEndInclusive) {
+                slabEnd = gapEndInclusive;
+                break;
+            }
+            slabEnd = candidate;
+            daysInSlab++;
+        }
+        slabs.push({ startDate: slabStart, endDate: slabEnd });
+        if (slabEnd >= gapEndInclusive) break;
+        slabStart = nextCalendarDayISO(slabEnd, timezone);
+    }
+    return slabs;
+}
+
+/** One contiguous slice of calendar days we have fully fetched into `orders` (shop-local YYYY-MM-DD). */
+type LoadedCoverageSpan = { startDate: string; endDate: string };
+
+/** True iff every calendar day in [covStart, covEnd] lies inside at least one loaded span (shop TZ). */
+function coverageWithinLoadedSpans(spans: LoadedCoverageSpan[], covStart: string, covEnd: string, timezone: string): boolean {
+    if (!spans.length || !covStart || !covEnd) return false;
+    let d = covStart;
+    for (;;) {
+        const hit = spans.find((s) => d >= s.startDate && d <= s.endDate);
+        if (!hit) return false;
+        if (hit.endDate >= covEnd) return true;
+        d = nextCalendarDayISO(hit.endDate, timezone);
+        if (d > covEnd) return true;
+    }
+}
+
+/** Merge overlapping / calendar-adjacent spans (shop TZ). */
+function mergeLoadedCoverageSpans(spans: LoadedCoverageSpan[], timezone: string): LoadedCoverageSpan[] {
+    if (!spans.length) return [];
+    const sorted = [...spans].sort((a, b) => a.startDate.localeCompare(b.startDate));
+    const out: LoadedCoverageSpan[] = [];
+    for (const cur of sorted) {
+        const prev = out[out.length - 1];
+        if (!prev) {
+            out.push(cur);
+            continue;
+        }
+        const adjacentBridge = nextCalendarDayISO(prev.endDate, timezone);
+        const overlapsOrAdjacent = cur.startDate <= prev.endDate || cur.startDate <= adjacentBridge;
+        if (overlapsOrAdjacent) {
+            out[out.length - 1] = {
+                startDate: isoDateMin(prev.startDate, cur.startDate),
+                endDate: isoDateMax(prev.endDate, cur.endDate),
+            };
+        } else {
+            out.push(cur);
+        }
+    }
+    return out;
+}
+
+/** Sub-ranges inside [covStart, covEnd] not covered by any span (inclusive calendar days). */
+function uncoveredRangesInCoverage(
+    spans: LoadedCoverageSpan[],
+    covStart: string,
+    covEnd: string,
+    timezone: string
+): Array<{ start: string; end: string }> {
+    const missing: Array<{ start: string; end: string }> = [];
+    let gapOpen: string | null = null;
+    let d = covStart;
+    for (;;) {
+        const covered = spans.some((s) => d >= s.startDate && d <= s.endDate);
+        if (!covered) {
+            if (!gapOpen) gapOpen = d;
+        } else if (gapOpen) {
+            missing.push({ start: gapOpen, end: previousCalendarDayISO(d, timezone) });
+            gapOpen = null;
+        }
+        if (d >= covEnd) break;
+        d = nextCalendarDayISO(d, timezone);
+    }
+    if (gapOpen) missing.push({ start: gapOpen, end: covEnd });
+    return missing;
+}
+
+function boundingHole(holes: Array<{ start: string; end: string }>): { start: string; end: string } | null {
+    if (!holes.length) return null;
+    let lo = holes[0].start;
+    let hi = holes[0].end;
+    for (let i = 1; i < holes.length; i++) {
+        lo = isoDateMin(lo, holes[i].start);
+        hi = isoDateMax(hi, holes[i].end);
+    }
+    return { start: lo, end: hi };
 }
 
 /** Calendar span for Performance Comparison (phase-2 fetch) — same logic as the `previousChunk` block in fetchShopData. */
@@ -349,6 +473,10 @@ interface SyncProgress {
     productsTotal?: number;
     settlementsFetched: number;
     settlementsTotal?: number;
+    /** Inclusive calendar days in the active date-range load (user selection for this fetch). */
+    rangeDaysTotal?: number;
+    /** Distinct calendar days in that range that already have at least one loaded order (shop TZ). */
+    rangeDaysLoaded?: number;
 }
 
 /** Reset baseline — avoids stale TikTok/order-batch UI bleeding across shops (single global syncProgress). */
@@ -366,6 +494,8 @@ const IDLE_SYNC_PROGRESS: SyncProgress = {
     productsTotal: undefined,
     settlementsFetched: 0,
     settlementsTotal: undefined,
+    rangeDaysTotal: undefined,
+    rangeDaysLoaded: undefined,
 };
 
 export interface Warehouse {
@@ -425,6 +555,12 @@ interface ShopState {
         startDate: string | null;
         endDate: string | null;
     };
+    /**
+     * Disjoint calendar slices we have fully loaded (pagination-complete for each slice).
+     * `loadedDateRange` remains a hull (min/max) for backwards compat; cache + gaps use spans
+     * so a March gap merged with April–May does not falsely imply mid-March…early-April is loaded.
+     */
+    loadedCoverageSpans: LoadedCoverageSpan[];
     syncProgress: SyncProgress;
     /** Shop whose sync/order-batch progress `syncProgress` describes (null when idle). */
     syncProgressShopId: string | null;
@@ -440,6 +576,8 @@ interface ShopState {
 
     // Actions
     fetchShopData: (accountId: string, shopId?: string, options?: { forceRefresh?: boolean; showCached?: boolean; skipSyncCheck?: boolean; includePreviousPeriod?: boolean; initialLoadDays?: number; timezone?: string; silentRefresh?: boolean; /** @internal second phase of split trend load */ _skipPreviousChunk?: boolean; /** @internal allow nested call while outer fetch is in progress (trends previous period) */ _trendsNestedFetch?: boolean }, startDate?: string, endDate?: string) => Promise<void>;
+    /** When user opens a non-data tab (Financial Restrictions, Products, …): hide sync progress UI only; do not cancel in-flight Overview/P&L fetches. */
+    releaseShopDataFetchForAuxiliaryTab: () => void;
     setProducts: (products: Product[]) => void;
     setOrders: (orders: Order[]) => void;
     setMetrics: (metrics: Partial<ShopMetrics>) => void;
@@ -497,6 +635,14 @@ interface ShopState {
     plFetchInFlight: boolean;
     plError: string | null;
     fetchPLData: (accountId: string, shopId: string, startDate: string, endDate: string, forceRefresh?: boolean, timezone?: string) => Promise<void>;
+    /** Merges `custom_line_items` from a lightweight endpoint (fast path after custom P&L edits). */
+    refreshPlDataCustomLineItems: (
+        accountId: string,
+        shopId: string,
+        startDate: string,
+        endDate: string,
+        timezone?: string,
+    ) => Promise<void>;
     memoryCache: Record<string, {
         products: Product[];
         orders: Order[];
@@ -515,6 +661,7 @@ interface ShopState {
         plDataKey?: string;
         plDataCache?: Record<string, any>;
         loadedDateRange?: { startDate: string | null; endDate: string | null };
+        loadedCoverageSpans?: LoadedCoverageSpan[];
         currentDateRange?: { startDate: string | null; endDate: string | null };
         fetchDateRange?: { startDate: string | null; endDate: string | null };
         dataLoadIncomplete?: boolean;
@@ -547,6 +694,17 @@ async function fetchWithTimeout(url: string, timeoutMs = 30000): Promise<Respons
     }
 }
 
+/** Postgres statement timeouts and similar errors will not heal by retrying the same query. */
+function isNonRetryableDbTimeoutMessage(msg: string): boolean {
+    const m = (msg || '').toLowerCase();
+    return (
+        m.includes('statement timeout') ||
+        m.includes('canceling statement due to statement timeout') ||
+        m.includes('query canceled') ||
+        m.includes('query has timed out')
+    );
+}
+
 /** True if HTTP status is worth retrying (transient server/gateway issues). */
 function isRetryableHttpStatus(status: number): boolean {
     return status === 408 || status === 429 || status === 502 || status === 503 || status === 504 || status === 520 || status === 521 || status === 522 || status === 524 || status >= 500;
@@ -559,7 +717,10 @@ function isRetryableHttpStatus(status: number): boolean {
 async function fetchOrdersBatchPage(
     url: string,
     options?: { maxAttempts?: number; timeoutMs?: number }
-): Promise<{ ok: true; data: { orders: any[]; hasMore: boolean; nextCursor: string | null } } | { ok: false }> {
+): Promise<
+    | { ok: true; data: { orders: any[]; hasMore: boolean; nextCursor: string | null } }
+    | { ok: false; timedOut?: boolean }
+> {
     const maxAttempts = options?.maxAttempts ?? 12;
     const timeoutMs = options?.timeoutMs ?? 58000;
 
@@ -591,6 +752,10 @@ async function fetchOrdersBatchPage(
                 console.warn(
                     `[Store] Batch HTTP ${response.status} (attempt ${attempt + 1}/${maxAttempts})${parsed.error ? `: ${parsed.error}` : ''}`
                 );
+                if (parsed.error && isNonRetryableDbTimeoutMessage(parsed.error)) {
+                    console.warn('[Store] Batch failed due to DB timeout — retries will not help; aborting pagination for this cursor.');
+                    return { ok: false, timedOut: true };
+                }
                 if (response.status === 401 || response.status === 403 || response.status === 404) {
                     return { ok: false };
                 }
@@ -602,6 +767,10 @@ async function fetchOrdersBatchPage(
 
             if (!parsed.success || !parsed.data) {
                 console.warn(`[Store] Batch API success=false (attempt ${attempt + 1}/${maxAttempts})`, parsed.error);
+                if (parsed.error && isNonRetryableDbTimeoutMessage(String(parsed.error))) {
+                    console.warn('[Store] Batch timeout in success=false payload — aborting retries.');
+                    return { ok: false, timedOut: true };
+                }
                 continue;
             }
 
@@ -619,6 +788,47 @@ async function fetchOrdersBatchPage(
         }
     }
     return { ok: false };
+}
+
+function setBatchUrlLimit(batchUrl: string, limit: number): string {
+    try {
+        const u = new URL(batchUrl);
+        u.searchParams.set('limit', String(limit));
+        return u.toString();
+    } catch {
+        return batchUrl.includes('limit=')
+            ? batchUrl.replace(/([?&])limit=\d+/g, (_, prefix: string) => `${prefix}limit=${limit}`)
+            : `${batchUrl}${batchUrl.includes('?') ? '&' : '?'}limit=${limit}`;
+    }
+}
+
+/** Max orders per progressive batch request (server caps via `TIKTOK_ORDERS_BATCH_MAX`, defaults to 1000). */
+const SHOP_ORDERS_BATCH_PAGE_SIZE = 1000;
+
+/** Cascade smaller page sizes on statement_timeout so deep historical windows still complete without skipping. */
+async function fetchOrdersBatchAdaptive(
+    batchUrlTemplate: string,
+    options?: { timeoutMs?: number },
+): Promise<
+    | { ok: true; data: { orders: any[]; hasMore: boolean; nextCursor: string | null } }
+    | { ok: false; timedOut?: boolean }
+> {
+    const limits = [SHOP_ORDERS_BATCH_PAGE_SIZE, 500, 220, 140, 90, 55, 35];
+    const timeoutMs = options?.timeoutMs ?? 120000;
+    for (const lim of limits) {
+        const url = setBatchUrlLimit(batchUrlTemplate, lim);
+        const outcome = await fetchOrdersBatchPage(url, {
+            maxAttempts: 2,
+            timeoutMs,
+        });
+        if (outcome.ok) return outcome;
+        if (outcome.timedOut) {
+            console.warn(`[Store] Batch timed out at limit=${lim} — retrying with smaller limit...`);
+            continue;
+        }
+        return outcome;
+    }
+    return { ok: false, timedOut: true };
 }
 
 export const useShopStore = create<ShopState>((set, get) => ({
@@ -669,6 +879,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
         startDate: null,
         endDate: null
     },
+    loadedCoverageSpans: [],
     syncProgress: { ...IDLE_SYNC_PROGRESS },
     syncProgressShopId: null,
     dateRangeFetchShopId: null,
@@ -739,6 +950,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
                     plDataKey: st.plDataKey,
                     plDataCache: st.plDataCache,
                     loadedDateRange: st.loadedDateRange,
+                    loadedCoverageSpans: st.loadedCoverageSpans,
                     currentDateRange: st.currentDateRange,
                     fetchDateRange: st.fetchDateRange,
                     dataLoadIncomplete: st.dataLoadIncomplete,
@@ -754,6 +966,14 @@ export const useShopStore = create<ShopState>((set, get) => ({
                 const isModeratelyStale = cacheAge >= 5 * 60 * 1000 && cacheAge < 30 * 60 * 1000;
                 const isStale = cacheAge >= 30 * 60 * 1000;
 
+                const hull = cached.loadedDateRange || { startDate: null, endDate: null };
+                const migratedSpans =
+                    cached.loadedCoverageSpans && cached.loadedCoverageSpans.length > 0
+                        ? cached.loadedCoverageSpans
+                        : hull.startDate && hull.endDate
+                          ? [{ startDate: hull.startDate, endDate: hull.endDate }]
+                          : [];
+
                 set({
                     products: cached.products,
                     orders: cached.orders,
@@ -764,7 +984,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
                     plData: cached.plData || null,
                     plDataKey: cached.plDataKey || '',
                     plDataCache: cached.plDataCache || {},
-                    loadedDateRange: cached.loadedDateRange || { startDate: null, endDate: null },
+                    loadedDateRange: hull,
+                    loadedCoverageSpans: migratedSpans,
                     currentDateRange: cached.currentDateRange ?? { startDate: null, endDate: null },
                     fetchDateRange: cached.fetchDateRange ?? { startDate: null, endDate: null },
                     dataLoadIncomplete: cached.dataLoadIncomplete ?? false,
@@ -839,6 +1060,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
                     ordersComplete: false,
                     productsComplete: false,
                     settlementsComplete: false,
+                    rangeDaysTotal: undefined,
+                    rangeDaysLoaded: undefined,
                 },
                 syncProgressShopId: shopId,
                 cacheMetadata: {
@@ -847,6 +1070,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
                     accountId,
                 },
                 loadedDateRange: { startDate: null, endDate: null },
+                loadedCoverageSpans: [],
                 shopDataFetchQueued: false,
                 queuedShopDataRequestRange: { startDate: null, endDate: null },
                 queuedShopDataRequestShopId: null,
@@ -874,12 +1098,50 @@ export const useShopStore = create<ShopState>((set, get) => ({
         if (switchingShop) {
             const switchOutcome = hydrateShopSwitchForFetch();
             state = get();
-            if (switchOutcome === 'memory-done') return;
+            // Memory hydration restores the prior shop snapshot; callers that pass an explicit calendar
+            // selection (Overview mount, etc.) still need work if spans don't cover that range (+ trends).
+            if (switchOutcome === 'memory-done' && !forceRefresh) {
+                if (startDate == null || endDate == null) {
+                    return;
+                }
+
+                const tzMem = options.timezone || 'America/Los_Angeles';
+                const stMem = get();
+                const spansMem =
+                    stMem.loadedCoverageSpans.length > 0
+                        ? stMem.loadedCoverageSpans
+                        : stMem.loadedDateRange.startDate && stMem.loadedDateRange.endDate
+                          ? [{ startDate: stMem.loadedDateRange.startDate, endDate: stMem.loadedDateRange.endDate }]
+                          : [];
+
+                const primaryCov =
+                    !stMem.dataLoadIncomplete &&
+                    spansMem.length > 0 &&
+                    coverageWithinLoadedSpans(spansMem, startDate, endDate, tzMem);
+
+                const trendsCov =
+                    !includePreviousPeriod ||
+                    (() => {
+                        const pc = getTrendsPreviousChunk(startDate, endDate, tzMem);
+                        return coverageWithinLoadedSpans(spansMem, pc.start, pc.end, tzMem);
+                    })();
+
+                if (primaryCov && trendsCov) {
+                    set({
+                        currentDateRange: { startDate, endDate },
+                        error: null,
+                        fetchInProgress: false,
+                    });
+                    return;
+                }
+
+                // Fall through: fetch/merge requested range despite warm memory cache.
+            }
         }
 
         state = get();
 
-        // Fast path: same calendar selection as last fetch — skip network if loadedDateRange already covers
+        // Fast path: same calendar selection as last fetch — skip network if loaded spans cover
         // the selected days plus the trends comparison window (when includePreviousPeriod is on).
         if (
             shopId &&
@@ -891,21 +1153,26 @@ export const useShopStore = create<ShopState>((set, get) => ({
             startDate === state.currentDateRange.startDate &&
             endDate === state.currentDateRange.endDate
         ) {
-            const loadedFast = get().loadedDateRange;
+            const spansFast = get().loadedCoverageSpans;
             const incompleteFast = get().dataLoadIncomplete;
+            const tzFast = options.timezone || 'America/Los_Angeles';
+            const loadedHullFast = get().loadedDateRange;
+            const spansOrHullFast =
+                spansFast.length > 0
+                    ? spansFast
+                    : loadedHullFast.startDate && loadedHullFast.endDate
+                      ? [{ startDate: loadedHullFast.startDate!, endDate: loadedHullFast.endDate! }]
+                      : [];
             if (
                 !incompleteFast &&
-                loadedFast.startDate &&
-                loadedFast.endDate &&
-                startDate >= loadedFast.startDate &&
-                endDate <= loadedFast.endDate
+                spansOrHullFast.length > 0 &&
+                coverageWithinLoadedSpans(spansOrHullFast, startDate, endDate, tzFast)
             ) {
-                const tzFast = options.timezone || 'America/Los_Angeles';
                 const trendsCoveredFast =
                     !includePreviousPeriod ||
                     (() => {
                         const pc = getTrendsPreviousChunk(startDate, endDate, tzFast);
-                        return pc.start >= loadedFast.startDate! && pc.end <= loadedFast.endDate!;
+                        return coverageWithinLoadedSpans(spansOrHullFast, pc.start, pc.end, tzFast);
                     })();
                 if (trendsCoveredFast) {
                     console.log('[Store] Selection already fully loaded (incl. trends window when needed) — skipping fetch.');
@@ -926,7 +1193,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
                 isLoading: false,
                 error: null,
                 fetchInProgress: silentRefresh ? false : true, // Mark fetch as in progress unless silent
-                ...(skipSyncCheck ? {} : { loadedDateRange: { startDate: null, endDate: null } }),
+                ...(skipSyncCheck ? {} : { loadedDateRange: { startDate: null, endDate: null }, loadedCoverageSpans: [] }),
                 ...(silentRefresh ? {} : {
                     syncProgress: {
                         ...IDLE_SYNC_PROGRESS,
@@ -1053,50 +1320,88 @@ export const useShopStore = create<ShopState>((set, get) => ({
                 console.log(`[Store] Using default ${defaultDays}-day range (${shopTimezone}): ${effectiveStartDate} to ${effectiveEndDate}`);
             }
 
-            // Trends: need previous period for charts, but loading [prev+current] in one request doubles rows and often hits API timeouts (520).
-            // Phase 1 = user's range only; phase 2 = previous period (merged as a gap fetch after phase 1 completes).
-            if (includePreviousPeriod && effectiveStartDate && effectiveEndDate && !_skipPreviousChunk) {
-                const shopTz = options.timezone || 'America/Los_Angeles';
-                previousChunk = getTrendsPreviousChunk(effectiveStartDate, effectiveEndDate, shopTz);
-                console.log(
-                    `[Store] Trends: phase 1 = selected range ${effectiveStartDate}..${effectiveEndDate}; phase 2 will load previous ${previousChunk.start}..${previousChunk.end} (${shopTz})`
-                );
+            const shopTzForCoverage = options.timezone || 'America/Los_Angeles';
+
+            /**
+             * Widen the DB fetch window when the UI sends a short range (e.g. "Today") but the user chose
+             * N days in Customize → pulls N inclusive calendar days ending at effectiveEndDate.
+             * Trends comparison still uses the narrow {startDate,endDate} from the caller (see below).
+             * Skip for nested phase-2 fetches to avoid re-widening the comparison slice.
+             */
+            if (effectiveStartDate && effectiveEndDate && !_trendsNestedFetch) {
+                const prefDays = initialLoadDays ?? DEFAULT_LOAD_DAYS;
+                if (prefDays > 0) {
+                    const inclusive = countInclusiveShopCalendarDays(effectiveStartDate, effectiveEndDate, shopTzForCoverage);
+                    if (inclusive < prefDays) {
+                        let anchor = effectiveEndDate;
+                        for (let i = 1; i < prefDays; i++) {
+                            anchor = previousCalendarDayISO(anchor, shopTzForCoverage);
+                        }
+                        effectiveStartDate = isoDateMin(effectiveStartDate, anchor);
+                    }
+                }
+            }
+
+            // Trends: derive comparison window from the UI's visible period (narrow), not the widened fetch.
+            // Phase 1 = widened orders load; phase 2 = previous calendar period (e.g. yesterday when viewing Today).
+            if (includePreviousPeriod && !_skipPreviousChunk) {
+                const baseStart = startDate && endDate ? startDate : effectiveStartDate;
+                const baseEnd = startDate && endDate ? endDate : effectiveEndDate;
+                if (baseStart && baseEnd) {
+                    previousChunk = getTrendsPreviousChunk(baseStart, baseEnd, shopTzForCoverage);
+                    console.log(
+                        `[Store] Trends: phase 1 fetch ends ${effectiveEndDate} (from ${effectiveStartDate}); comparison ${previousChunk.start}..${previousChunk.end} (${shopTzForCoverage})`,
+                    );
+                }
             }
 
             // ============================================================
-            // SMART DATE RANGE CACHE: Check if requested range is already loaded
-            // If the data pool already covers the requested range, skip the API call
-            // and just update currentDateRange — the UI filters client-side via useMemo
+            // SMART DATE RANGE CACHE + GAP FETCH
+            // Overview uses includePreviousPeriod: charts need [previousChunk ∪ user range], one contiguous strip.
+            // Gap/cache must use that union — using only the user's dates misses earlier comparison days already
+            // partially covered by loaded data → false MISS → full refetch instead of a narrow gap (e.g. +2 days).
             // ============================================================
             const loaded = get().loadedDateRange;
             const incomplete = get().dataLoadIncomplete;
+            const loadedSpansState = get().loadedCoverageSpans;
 
-            // Overview "Yesterday" uses includePreviousPeriod so Performance Comparison has Mar 24 vs Mar 25.
-            // Do NOT cache-hit if loadedDateRange never included the previous calendar window — otherwise we
-            // skip the network entirely and prev period stays 0 until the user manually picks that day.
-            const trendsPreviousPeriodCovered =
-                !includePreviousPeriod ||
-                !previousChunk ||
-                !loaded.startDate ||
-                !loaded.endDate ||
-                (previousChunk.start >= loaded.startDate && previousChunk.end <= loaded.endDate);
+            /** Strip that must be cached before we skip work entirely (primary ∪ comparison when trends are on). */
+            const fullCoverageStart =
+                previousChunk && includePreviousPeriod && !_skipPreviousChunk
+                    ? isoDateMin(previousChunk.start, effectiveStartDate!)
+                    : effectiveStartDate!;
+            const fullCoverageEnd = effectiveEndDate!;
 
-            // `dataLoadIncomplete` + deferred loadedDateRange ensure we only cache-hit when pagination
-            // finished; switching back to a range that is already in memory should hit cache (no
-            // `dateRangeUnchanged` guard — that blocked re-selecting e.g. Mar 15 after Mar 14).
+            /**
+             * Holes filled in THIS pass only — always the requested API window (selected range, or phase-2 previous chunk).
+             * Widening gap detection to include the comparison strip made us fetch older calendar slabs before finishing the primary range.
+             */
+            const gapCoverageStart = effectiveStartDate!;
+            const gapCoverageEnd = effectiveEndDate!;
 
-            if (!forceRefresh && showCached && shopId && shopId === state.lastFetchShopId &&
+            const spansForCache =
+                loadedSpansState.length > 0
+                    ? loadedSpansState
+                    : loaded.startDate && loaded.endDate
+                      ? [{ startDate: loaded.startDate, endDate: loaded.endDate }]
+                      : [];
+
+            if (
+                !forceRefresh &&
+                showCached &&
+                shopId &&
+                shopId === state.lastFetchShopId &&
                 !incomplete &&
-                loaded.startDate && loaded.endDate &&
-                effectiveStartDate && effectiveEndDate &&
-                effectiveStartDate >= loaded.startDate &&
-                effectiveEndDate <= loaded.endDate &&
-                trendsPreviousPeriodCovered) {
-                console.log(`[Store] ✅ Date range cache HIT: requested ${effectiveStartDate}..${effectiveEndDate} is within loaded ${loaded.startDate}..${loaded.endDate}. Skipping fetch.`);
+                spansForCache.length > 0 &&
+                coverageWithinLoadedSpans(spansForCache, fullCoverageStart, fullCoverageEnd, shopTzForCoverage)
+            ) {
+                console.log(
+                    `[Store] ✅ Date range cache HIT: coverage ${fullCoverageStart}..${fullCoverageEnd} within loaded spans (${spansForCache.map((s) => `${s.startDate}–${s.endDate}`).join(' · ')}). Skipping fetch.`
+                );
                 set({
                     currentDateRange: {
                         startDate: startDate || effectiveStartDate,
-                        endDate: endDate || effectiveEndDate
+                        endDate: endDate || effectiveEndDate,
                     },
                     fetchInProgress: false,
                     error: null,
@@ -1104,54 +1409,90 @@ export const useShopStore = create<ShopState>((set, get) => ({
                 return;
             }
 
-            // Determine if we can do a partial/gap fetch (only fetch missing date ranges)
+            // Overview may request trends (includePreviousPeriod) after another tab loaded only the primary
+            // slice (e.g. P&L). Avoid re-fetching the primary slab — merge comparison orders like phase-2.
+            if (
+                !_trendsNestedFetch &&
+                !forceRefresh &&
+                showCached &&
+                shopId &&
+                shopId === get().lastFetchShopId &&
+                !incomplete &&
+                includePreviousPeriod &&
+                previousChunk &&
+                !_skipPreviousChunk &&
+                startDate &&
+                endDate &&
+                spansForCache.length > 0 &&
+                coverageWithinLoadedSpans(spansForCache, startDate, endDate, shopTzForCoverage) &&
+                !coverageWithinLoadedSpans(spansForCache, previousChunk.start, previousChunk.end, shopTzForCoverage)
+            ) {
+                console.log(
+                    `[Store] Primary range already cached; fetching trends slice only (${previousChunk.start}..${previousChunk.end}).`,
+                );
+                set({
+                    currentDateRange: { startDate, endDate },
+                    error: null,
+                    fetchInProgress: false,
+                });
+                await get().fetchShopData(
+                    accountId,
+                    shopId,
+                    {
+                        ...options,
+                        includePreviousPeriod: false,
+                        _skipPreviousChunk: true,
+                        _trendsNestedFetch: true,
+                    },
+                    previousChunk.start,
+                    previousChunk.end,
+                );
+                return;
+            }
+
             let gapStartDate: string | undefined;
             let gapEndDate: string | undefined;
             let isGapFetch = false;
 
-            if (!forceRefresh && showCached && shopId && shopId === state.lastFetchShopId &&
-                loaded.startDate && loaded.endDate &&
-                effectiveStartDate && effectiveEndDate) {
-                // Case 1: Need earlier data (requested start is before loaded start)
-                if (effectiveStartDate < loaded.startDate) {
-                    if (effectiveEndDate >= loaded.startDate) {
-                        gapStartDate = effectiveStartDate;
-                        gapEndDate = addDaysToISODate(loaded.startDate, -1);
-                        isGapFetch = true;
-                        console.log(`[Store] 🔄 Date range cache PARTIAL HIT: need earlier data ${gapStartDate}..${gapEndDate}`);
-                    } else {
-                        // Wholly before loaded range (trends phase 2: previous period ends the day before current period starts)
-                        gapStartDate = effectiveStartDate;
-                        gapEndDate = effectiveEndDate;
-                        isGapFetch = true;
-                        console.log(
-                            `[Store] 🔄 Date range cache PARTIAL HIT: need earlier data (non-overlapping) ${gapStartDate}..${gapEndDate}`
-                        );
-                    }
+            if (
+                !forceRefresh &&
+                showCached &&
+                shopId &&
+                shopId === state.lastFetchShopId &&
+                (loadedSpansState.length > 0 || (loaded.startDate && loaded.endDate))
+            ) {
+                const spansForGap =
+                    loadedSpansState.length > 0
+                        ? loadedSpansState
+                        : loaded.startDate && loaded.endDate
+                          ? [{ startDate: loaded.startDate, endDate: loaded.endDate }]
+                          : [];
+                const holes = uncoveredRangesInCoverage(spansForGap, gapCoverageStart, gapCoverageEnd, shopTzForCoverage);
+                const bbox = boundingHole(holes);
+                if (bbox) {
+                    gapStartDate = bbox.start;
+                    gapEndDate = bbox.end;
+                    isGapFetch = true;
+                    console.log(`[Store] 🔄 Date range gap (uncovered slice in coverage): ${gapStartDate}..${gapEndDate}`);
                 }
-                // Case 2: Need later data (requested end is after loaded end)
-                else if (effectiveEndDate > loaded.endDate) {
-                    if (effectiveStartDate <= loaded.endDate) {
-                        // Overlap: fetch from day after loaded end through requested end
-                        gapStartDate = addDaysToISODate(loaded.endDate, 1);
-                        gapEndDate = effectiveEndDate;
-                        isGapFetch = true;
-                        console.log(`[Store] 🔄 Date range cache PARTIAL HIT: need later data ${gapStartDate}..${gapEndDate}`);
-                    } else {
-                        // Entire selection is after the loaded window (e.g. loaded through Mar 15, user picks Mar 16 only).
-                        // Without this branch, isGapFetch stayed false → full fetch replaced all orders and trends phase-2 could desync.
-                        gapStartDate = effectiveStartDate;
-                        gapEndDate = effectiveEndDate;
-                        isGapFetch = true;
-                        console.log(
-                            `[Store] 🔄 Date range cache PARTIAL HIT: need later data (after loaded window) ${gapStartDate}..${gapEndDate}`
-                        );
-                    }
-                }
-                // Fallback: no gap rule matched — full fetch for this range (e.g. edge overlap with incomplete cache)
-                else {
-                    console.log(`[Store] ❌ Date range cache MISS: requested ${effectiveStartDate}..${effectiveEndDate} vs loaded ${loaded.startDate}..${loaded.endDate}`);
-                }
+            }
+
+            let gapLoadedUnion: { start: string; end: string } | null = null;
+            if (isGapFetch && gapStartDate && gapEndDate && loaded.startDate && loaded.endDate) {
+                gapLoadedUnion = {
+                    start: isoDateMin(loaded.startDate, gapStartDate),
+                    end: isoDateMax(loaded.endDate, gapEndDate),
+                };
+            }
+
+            let newLoadedStart: string | null;
+            let newLoadedEnd: string | null;
+            if (isGapFetch && gapLoadedUnion) {
+                newLoadedStart = gapLoadedUnion.start;
+                newLoadedEnd = gapLoadedUnion.end;
+            } else {
+                newLoadedStart = effectiveStartDate ?? null;
+                newLoadedEnd = effectiveEndDate ?? null;
             }
 
             if (showCached && shopId) {
@@ -1195,15 +1536,43 @@ export const useShopStore = create<ShopState>((set, get) => ({
                     });
                 }
 
-                // Determine the actual fetch range (gap or full)
-                const fetchStartDate = isGapFetch ? gapStartDate! : effectiveStartDate;
-                const fetchEndDate = isGapFetch ? gapEndDate! : effectiveEndDate;
+                const fetchBoundsStart = isGapFetch ? gapStartDate! : effectiveStartDate!;
+                const fetchBoundsEnd = isGapFetch ? gapEndDate! : effectiveEndDate!;
 
-                // STEP 1: Load initial batch (products + settlements + first 1000 orders)
-                // Use fetchStartDate/fetchEndDate for the API call (may be a gap fetch)
+                /** Wide gaps (~60d) hit Postgres timeouts on order batch JSON; sequential ~14d slabs keep each scan bounded without skipping orders. */
+                let shopDataSlabs: { startDate: string; endDate: string }[] =
+                    isGapFetch &&
+                    gapStartDate &&
+                    gapEndDate &&
+                    countInclusiveShopCalendarDays(gapStartDate, gapEndDate, shopTzForCoverage) >
+                        GAP_FETCH_SLAB_THRESHOLD_DAYS
+                        ? splitInclusiveGapIntoCalendarSlabs(gapStartDate, gapEndDate, shopTzForCoverage)
+                        : [{ startDate: fetchBoundsStart, endDate: fetchBoundsEnd }];
+
+                if (shopDataSlabs.length > 1) {
+                    // splitInclusiveGapIntoCalendarSlabs walks oldest→newest; fetch recent window first so UI matches "newest data first".
+                    shopDataSlabs = [...shopDataSlabs].reverse();
+                    console.log(
+                        `[Store] Large gap → ${shopDataSlabs.length} sequential slabs (≤${GAP_FETCH_SLAB_MAX_INCLUSIVE_DAYS}d each, newest slab first, ${shopTzForCoverage})`,
+                    );
+                }
+
+                let aggregatedBatchEarlyExit = false;
+                let deferLoadedRangeUntilPagination = shopDataSlabs.length > 1;
+                let lastTotalOrderCountForFooter: number | null = null;
+
+                for (let slabIdx = 0; slabIdx < shopDataSlabs.length; slabIdx++) {
+                    const fetchChunkStart = shopDataSlabs[slabIdx].startDate;
+                    const fetchChunkEnd = shopDataSlabs[slabIdx].endDate;
+
+                // STEP 1: Load initial batch (products + settlements + first page of orders)
+                // Use fetchChunkStart/fetchChunkEnd for the API call (slabbed on large gap fetches)
                 let shopDataUrl = `${API_BASE_URL}/api/tiktok-shop/shop-data/${accountId}?shopId=${shopId}`;
-                shopDataUrl += `&startDate=${fetchStartDate}&endDate=${fetchEndDate}`;
-                console.log(`[Store] Fetching shop data: ${fetchStartDate} to ${fetchEndDate}${isGapFetch ? ' (GAP FETCH)' : ''}`);
+                shopDataUrl += `&startDate=${fetchChunkStart}&endDate=${fetchChunkEnd}`;
+                console.log(
+                    `[Store] Fetching shop data: ${fetchChunkStart} to ${fetchChunkEnd}${isGapFetch ? ' (GAP FETCH)' : ''}` +
+                        (shopDataSlabs.length > 1 ? ` [slab ${slabIdx + 1}/${shopDataSlabs.length}]` : ''),
+                );
                 const shopDataResponse = await shopApi(shopDataUrl);
                 if (epochAtStart !== shopDataFetchEpoch) {
                     console.log('[Store] Discarding shop-data response — shop switched mid-fetch');
@@ -1225,8 +1594,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
 
                 const { orders: rawOrders, products: rawProducts, settlements: rawSettlements, metrics: serverMetrics, cache_status: cacheStatus, hasMoreOrders, totalOrders: totalOrderCount, nextCursor: serverNextCursor } = result.data;
 
-                /** Set true when we must finish cursor pagination before claiming loadedDateRange for this request. */
-                let deferLoadedRangeUntilPagination = false;
+                lastTotalOrderCountForFooter = totalOrderCount ?? lastTotalOrderCountForFooter;
 
                 shouldSync = (cacheStatus?.should_prompt_user || forceRefresh) && !skipSyncCheck;
 
@@ -1264,13 +1632,13 @@ export const useShopStore = create<ShopState>((set, get) => ({
 
                 // On-demand historical sync: if gap-fetch returned 0 orders for a range
                 // older than the default sync window, fetch from TikTok API first
-                if (isGapFetch && orders.length === 0 && fetchStartDate && fetchEndDate) {
+                if (isGapFetch && orders.length === 0 && fetchChunkStart && fetchChunkEnd) {
                     const defaultSyncCutoff = new Date();
                     defaultSyncCutoff.setDate(defaultSyncCutoff.getDate() - DEFAULT_SYNC_DAYS);
                     const cutoffStr = defaultSyncCutoff.toISOString().split('T')[0];
 
-                    if (fetchStartDate < cutoffStr) {
-                        console.log(`[Store] Gap fetch returned 0 orders for ${fetchStartDate}..${fetchEndDate} (beyond ${DEFAULT_SYNC_DAYS}-day window). Triggering on-demand TikTok sync...`);
+                    if (fetchChunkStart < cutoffStr) {
+                        console.log(`[Store] Gap fetch returned 0 orders for ${fetchChunkStart}..${fetchChunkEnd} (beyond ${DEFAULT_SYNC_DAYS}-day window). Triggering on-demand TikTok sync...`);
 
                         // Show syncing indicator
                         if (!suppressShopFetchProgressUi) {
@@ -1279,7 +1647,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
                                     ...s.syncProgress,
                                     isActive: true,
                                     currentStep: 'orders',
-                                    message: `Fetching historical data (${fetchStartDate} to ${fetchEndDate})...`,
+                                    message: `Fetching historical data (${fetchChunkStart} to ${fetchChunkEnd})...`,
                                     ordersComplete: false,
                                 },
                             }));
@@ -1290,8 +1658,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
                             const syncResult = await enqueueAndWaitSync(accountId, {
                                 shopId,
                                 syncType: 'orders',
-                                startDate: fetchStartDate,
-                                endDate: fetchEndDate
+                                startDate: fetchChunkStart,
+                                endDate: fetchChunkEnd
                             }, undefined);
                             if (epochAtStart !== shopDataFetchEpoch) {
                                 console.log('[Store] Discarding historical sync follow-up — shop switched mid-fetch');
@@ -1408,27 +1776,23 @@ export const useShopStore = create<ShopState>((set, get) => ({
                 };
 
                 // Full fetch: loaded range is exactly this request's effective range (replaces orders for that slice).
-                // Gap fetch: union with previous — only in that case may prev extend beyond effective.
-                // (Old bug: unioning prev.endDate forward kept e.g. Mar 26 after a Mar 14–15-only fetch → false cache HIT for Mar 16.)
-                const prevLoaded = get().loadedDateRange;
-                let newLoadedStart: string | null;
-                let newLoadedEnd: string | null;
-                if (isGapFetch) {
-                    newLoadedStart =
-                        prevLoaded.startDate && prevLoaded.startDate < (effectiveStartDate || '')
-                            ? prevLoaded.startDate
-                            : effectiveStartDate || null;
-                    newLoadedEnd =
-                        prevLoaded.endDate && prevLoaded.endDate > (effectiveEndDate || '')
-                            ? prevLoaded.endDate
-                            : effectiveEndDate || null;
-                } else {
-                    newLoadedStart = effectiveStartDate || null;
-                    newLoadedEnd = effectiveEndDate || null;
-                }
+                // Gap fetch: union computed above as gapLoadedUnion → newLoadedStart/newLoadedEnd.
+                /** Do not expand loadedDateRange / loadedCoverageSpans until all paginated orders for this request are in memory — otherwise cache HIT skips fetches while charts still miss days. When the server cannot return an exact count (null) but returned a full first page, it sets hasMoreOrders=true; we must still defer. */
+                deferLoadedRangeUntilPagination =
+                    deferLoadedRangeUntilPagination ||
+                    Boolean(hasMoreOrders && (totalOrderCount == null || totalOrderCount > orders.length));
 
-                /** Do not expand loadedDateRange until all paginated orders for this request are in memory — otherwise cache HIT skips fetches while charts still miss early days. */
-                deferLoadedRangeUntilPagination = Boolean(hasMoreOrders && totalOrderCount > orders.length);
+                const freezeCoverageUi =
+                    shopDataSlabs.length > 1
+                        ? slabIdx < shopDataSlabs.length - 1 || deferLoadedRangeUntilPagination
+                        : deferLoadedRangeUntilPagination;
+
+                const progressRangeStart = effectiveStartDate!;
+                const progressRangeEnd = effectiveEndDate!;
+                const rangeDaysTotal = countInclusiveShopCalendarDays(progressRangeStart, progressRangeEnd, shopTzForCoverage);
+                const rangeDaysLoaded = countDistinctShopCalendarDaysWithOrders(mergedOrders, progressRangeStart, progressRangeEnd, shopTzForCoverage);
+                const dayProgressMessage = (loading: boolean, loaded: number, total: number) =>
+                    total > 0 ? (loading ? `Loading ${loaded}/${total} days…` : `Loaded ${loaded}/${total} days`) : loading ? 'Loading data…' : 'Data loaded';
 
                 // Show dashboard immediately with first batch
                 set({
@@ -1459,10 +1823,10 @@ export const useShopStore = create<ShopState>((set, get) => ({
                                   ordersComplete: !hasMoreOrders,
                                   ordersFetched: mergedOrders.length,
                                   ordersTotal: totalOrderCount || mergedOrders.length,
+                                  rangeDaysTotal,
+                                  rangeDaysLoaded,
                                   currentStep: hasMoreOrders ? 'orders' : 'complete',
-                                  message: hasMoreOrders
-                                      ? (totalOrderCount ? `Loading data: ${mergedOrders.length}/${totalOrderCount}...` : `Loading data: ${mergedOrders.length}...`)
-                                      : `Loaded ${mergedOrders.length} orders`,
+                                  message: dayProgressMessage(hasMoreOrders, rangeDaysLoaded, rangeDaysTotal),
                                   isActive: hasMoreOrders,
                               },
                               syncProgressShopId: shopId,
@@ -1488,13 +1852,25 @@ export const useShopStore = create<ShopState>((set, get) => ({
                               },
                           }
                         : {}),
-                    ...(deferLoadedRangeUntilPagination
+                    ...(freezeCoverageUi
                         ? { dataLoadIncomplete: true }
                         : {
                             loadedDateRange: {
                                 startDate: newLoadedStart,
                                 endDate: newLoadedEnd
                             },
+                            loadedCoverageSpans:
+                                isGapFetch && gapStartDate && gapEndDate
+                                    ? mergeLoadedCoverageSpans(
+                                          [...get().loadedCoverageSpans, { startDate: gapStartDate, endDate: gapEndDate }],
+                                          shopTzForCoverage
+                                      )
+                                    : newLoadedStart && newLoadedEnd
+                                      ? mergeLoadedCoverageSpans(
+                                            [{ startDate: newLoadedStart, endDate: newLoadedEnd }],
+                                            shopTzForCoverage
+                                        )
+                                      : [],
                             dataLoadIncomplete: false
                         }),
                     dataVersion: get().dataVersion + 1 // Increment to force UI re-render
@@ -1503,10 +1879,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
 
                 console.log(`[Store] Initial load complete (${result.timing?.total_ms || '?'}ms). Orders: ${orders.length}/${totalOrderCount}, Products: ${products.length}`);
 
-                // STEP 2: If there are more orders, progressively load them in background batches
-                if (hasMoreOrders && totalOrderCount > orders.length) {
-                    // Smaller batches = smaller JSON payloads; reduces Vercel/edge 520s on heavy shops
-                    const BATCH_SIZE = 500;
+                // STEP 2: When the first batch may be partial — exact count known, or unknown but server signaled hasMore (full 1000-row batch).
+                if (hasMoreOrders && (totalOrderCount == null || totalOrderCount > orders.length)) {
                     let hasMore = true;
                     // Initialize local accumulator with ALL orders (merged if gap-fetch, raw if full-fetch).
                     // CRITICAL: For gap-fetches, we must start from mergedOrders to preserve existing
@@ -1527,65 +1901,48 @@ export const useShopStore = create<ShopState>((set, get) => ({
                         }
                     }
 
-                    console.log(`[Store] Progressive loading: ${totalOrderCount - accumulatedOrders.length} more orders to load (cursor: ${nextCursor})...`);
+                    console.log(
+                        `[Store] Progressive loading: ${
+                            totalOrderCount != null
+                                ? totalOrderCount - accumulatedOrders.length
+                                : 'unknown (no exact count)'
+                        } more orders to load (cursor: ${nextCursor})...`
+                    );
 
                     /** True if we stopped pagination due to errors (not "no more orders") — avoid marking loadedDateRange complete. */
                     let batchLoopExitedEarly = false;
 
+                    let lastPaginationProgressUiMs = 0;
+                    const PAGINATION_PROGRESS_UI_MS = 150;
+
                     while (hasMore) {
                         // Safety break: prevent truly runaway loops (e.g. if API always returns hasMore=true).
                         // We use a hardcoded high-water mark instead of totalOrderCount which may be a sentinel.
-                        const RUNAWAY_LIMIT = Math.max(totalOrderCount * 2, 100000);
+                        const runawayBaseline = totalOrderCount != null ? totalOrderCount * 2 : 100_000;
+                        const RUNAWAY_LIMIT = Math.max(runawayBaseline, 100_000);
                         if (accumulatedOrders.length > RUNAWAY_LIMIT) {
                             console.warn(`[Store] Aborting fetch: Loaded ${accumulatedOrders.length} orders which exceeds safety limit of ${RUNAWAY_LIMIT}.`);
                             batchLoopExitedEarly = true;
                             break;
                         }
 
-                        // Use cursor-based pagination instead of offset
-                        let batchUrl = `${API_BASE_URL}/api/tiktok-shop/orders/synced/${accountId}/batch?shopId=${shopId}&limit=${BATCH_SIZE}&startDate=${fetchStartDate}&endDate=${fetchEndDate}`;
-                        if (nextCursor) {
-                            batchUrl += `&cursor=${encodeURIComponent(nextCursor)}`;
-                        }
-                        console.log(`[Store] Fetching batch: cursor=${nextCursor}, limit=${BATCH_SIZE}`);
+                        // Use cursor-based pagination (adaptive limit handles statement_timeout on heavy JSON rows)
+                        const batchUrlBase = `${API_BASE_URL}/api/tiktok-shop/orders/synced/${accountId}/batch?shopId=${shopId}&limit=${SHOP_ORDERS_BATCH_PAGE_SIZE}&startDate=${fetchChunkStart}&endDate=${fetchChunkEnd}${
+                            nextCursor ? `&cursor=${encodeURIComponent(nextCursor)}` : ''
+                        }`;
+                        console.log(`[Store] Fetching batch: cursor=${nextCursor} (adaptive limit)`);
 
-                        // Inner: many retries per HTTP call. Outer: same cursor, fresh rounds after long pause (gateway cold / transient 520).
-                        const MAX_CURSOR_ROUNDS = 8;
-                        let page: { orders: any[]; hasMore: boolean; nextCursor: string | null } | null = null;
-                        for (let round = 0; round < MAX_CURSOR_ROUNDS; round++) {
-                            if (round > 0) {
-                                const pause = Math.min(8000 * round, 120000);
-                                console.warn(
-                                    `[Store] Re-fetching same batch cursor (round ${round + 1}/${MAX_CURSOR_ROUNDS}) after ${pause}ms pause...`
-                                );
-                                await new Promise((r) => setTimeout(r, pause));
-                                if (epochAtStart !== shopDataFetchEpoch) {
-                                    batchLoopExitedEarly = true;
-                                    break;
-                                }
-                            }
-                            const outcome = await fetchOrdersBatchPage(batchUrl);
-                            if (epochAtStart !== shopDataFetchEpoch) {
-                                batchLoopExitedEarly = true;
-                                page = null;
-                                break;
-                            }
-                            if (outcome.ok) {
-                                page = outcome.data;
-                                break;
-                            }
-                        }
-
+                        const outcome = await fetchOrdersBatchAdaptive(batchUrlBase);
                         if (epochAtStart !== shopDataFetchEpoch) {
                             batchLoopExitedEarly = true;
                             break;
                         }
 
-                        if (!page) {
-                            console.error('[Store] Batch failed after all retry rounds — stopping pagination (will retry on next full refresh).');
+                        if (!outcome.ok) {
                             batchLoopExitedEarly = true;
                             break;
                         }
+                        const page = outcome.data;
 
                         if (!page.orders.length) {
                             console.log(`[Store] No more orders in batch response`);
@@ -1638,32 +1995,47 @@ export const useShopStore = create<ShopState>((set, get) => ({
                             break;
                         }
 
+                        const rangeDaysLoadedBatch = countDistinctShopCalendarDaysWithOrders(
+                            accumulatedOrders,
+                            progressRangeStart,
+                            progressRangeEnd,
+                            shopTzForCoverage,
+                        );
+
+                        const flushProgressUi =
+                            !hasMore || Date.now() - lastPaginationProgressUiMs >= PAGINATION_PROGRESS_UI_MS;
+                        if (flushProgressUi) {
+                            lastPaginationProgressUiMs = Date.now();
+                        }
+
                         // Functional set to ensure we don't accidentally wipe out other changes
                         set(s => ({
                             orders: accumulatedOrders,
                             metrics: {
                                 ...s.metrics,
-                                totalOrders: totalOrderCount,
+                                totalOrders: totalOrderCount ?? accumulatedOrders.length,
                                 totalRevenue: updatedRevenue,
                                 avgOrderValue: updatedAvg
                             },
-                            ...(suppressShopFetchProgressUi ? {} : {
-                                syncProgress: {
-                                    ...s.syncProgress,
-                                    ordersFetched: accumulatedOrders.length,
-                                    ordersTotal: totalOrderCount || accumulatedOrders.length,
-                                    message: hasMore
-                                        ? (totalOrderCount ? `Loading data: ${accumulatedOrders.length}/${totalOrderCount}...` : `Loading data: ${accumulatedOrders.length}...`)
-                                        : `Loaded all ${accumulatedOrders.length} orders`,
-                                    currentStep: hasMore ? 'orders' : 'complete',
-                                    ordersComplete: !hasMore,
-                                    isActive: hasMore
-                                },
-                                syncProgressShopId: shopId,
-                            })
+                            ...(suppressShopFetchProgressUi || !flushProgressUi
+                                ? {}
+                                : {
+                                      syncProgress: {
+                                          ...s.syncProgress,
+                                          ordersFetched: accumulatedOrders.length,
+                                          ordersTotal: totalOrderCount || accumulatedOrders.length,
+                                          rangeDaysTotal,
+                                          rangeDaysLoaded: rangeDaysLoadedBatch,
+                                          message: dayProgressMessage(hasMore, rangeDaysLoadedBatch, rangeDaysTotal),
+                                          currentStep: hasMore ? 'orders' : 'complete',
+                                          ordersComplete: !hasMore,
+                                          isActive: hasMore
+                                      },
+                                      syncProgressShopId: shopId,
+                                  }),
                         }));
 
-                        console.log(`[Store] Progressive load: ${accumulatedOrders.length}/${totalOrderCount} orders`);
+                        console.log(`[Store] Progressive load: ${accumulatedOrders.length}/${totalOrderCount ?? '?'} orders`);
                     }
 
                     if (epochAtStart !== shopDataFetchEpoch) {
@@ -1671,66 +2043,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
                         return;
                     }
 
-                    // After the loop, check if we loaded fewer orders than the server reported.
-                    // This covers BOTH network failures AND silent empty responses (e.g. Supabase range returning 0).
-                    const finalLoaded = get().orders.length;
-                    if (finalLoaded < totalOrderCount || batchLoopExitedEarly) {
-                        console.warn(
-                            `[Store] Incomplete load: ${finalLoaded}/${totalOrderCount} orders.${batchLoopExitedEarly ? ' (stopped after batch errors)' : ''}`
-                        );
-                        set(s => ({
-                            dataLoadIncomplete: true,
-                            ...(suppressShopFetchProgressUi
-                                ? {}
-                                : {
-                                      syncProgress: {
-                                          ...s.syncProgress,
-                                          isActive: false,
-                                          ordersComplete: false,
-                                          ordersTotal: totalOrderCount,
-                                          currentStep: 'complete',
-                                          message: `Loaded ${finalLoaded} of ${totalOrderCount} orders`,
-                                      },
-                                      syncProgressShopId: shopId,
-                                  }),
-                        }));
-                    } else {
-                        // Pagination finished — now safe to extend loadedDateRange (cache HIT was deferred until this point)
-                        if (deferLoadedRangeUntilPagination) {
-                            let nls: string | null;
-                            let nle: string | null;
-                            if (isGapFetch) {
-                                const pl = get().loadedDateRange;
-                                nls =
-                                    pl.startDate && pl.startDate < (effectiveStartDate || '')
-                                        ? pl.startDate
-                                        : effectiveStartDate || null;
-                                nle =
-                                    pl.endDate && pl.endDate > (effectiveEndDate || '')
-                                        ? pl.endDate
-                                        : effectiveEndDate || null;
-                            } else {
-                                nls = effectiveStartDate || null;
-                                nle = effectiveEndDate || null;
-                            }
-                            console.log(`[Store] Pagination complete — updating loadedDateRange to ${nls}..${nle}`);
-                            set(s => ({
-                                loadedDateRange: { startDate: nls, endDate: nle },
-                                dataLoadIncomplete: false,
-                                dataVersion: s.dataVersion + 1
-                            }));
-                        }
-                        // All orders loaded — dismiss progress bar
-                        if (!suppressShopFetchProgressUi) {
-                            setTimeout(() => {
-                                if (epochAtStart !== shopDataFetchEpoch) return;
-                                set(s => ({
-                                    syncProgress: { ...s.syncProgress, isActive: false, message: '' },
-                                    syncProgressShopId: null,
-                                }));
-                            }, 2000);
-                        }
-                    }
+                    aggregatedBatchEarlyExit = aggregatedBatchEarlyExit || batchLoopExitedEarly;
                 } else {
                     // All data loaded in first batch — dismiss progress bar
                     if (!suppressShopFetchProgressUi) {
@@ -1742,6 +2055,86 @@ export const useShopStore = create<ShopState>((set, get) => ({
                             }));
                         }, 1500);
                     }
+                }
+
+                if (aggregatedBatchEarlyExit) {
+                    console.warn('[Store] Historical slab load stopped early (batch/API error); remaining slabs skipped until retry.');
+                    break;
+                }
+                }
+
+                if (epochAtStart !== shopDataFetchEpoch) {
+                    return;
+                }
+
+                const finalLoadedAfterSlabs = get().orders.length;
+                const shortOfServerCountAfterSlabs =
+                    shopDataSlabs.length === 1 &&
+                    lastTotalOrderCountForFooter != null &&
+                    finalLoadedAfterSlabs < lastTotalOrderCountForFooter;
+                if (shortOfServerCountAfterSlabs || aggregatedBatchEarlyExit) {
+                    console.warn(
+                        `[Store] Incomplete load: ${finalLoadedAfterSlabs}/${lastTotalOrderCountForFooter ?? '?' } orders.${aggregatedBatchEarlyExit ? ' (stopped after batch errors)' : ''}`,
+                    );
+                    set((s) => ({
+                        dataLoadIncomplete: true,
+                        ...(suppressShopFetchProgressUi
+                            ? {}
+                            : {
+                                  syncProgress: {
+                                      ...s.syncProgress,
+                                      isActive: false,
+                                      ordersComplete: false,
+                                      ordersTotal: lastTotalOrderCountForFooter ?? finalLoadedAfterSlabs,
+                                      currentStep: 'complete',
+                                      message:
+                                          'Could not finish loading this date range. Try refreshing or running a sync.',
+                                  },
+                                  syncProgressShopId: shopId,
+                              }),
+                    }));
+                } else if (deferLoadedRangeUntilPagination) {
+                    let nls: string | null;
+                    let nle: string | null;
+                    if (isGapFetch && gapLoadedUnion) {
+                        nls = gapLoadedUnion.start;
+                        nle = gapLoadedUnion.end;
+                    } else {
+                        nls = effectiveStartDate || null;
+                        nle = effectiveEndDate || null;
+                    }
+                    console.log(`[Store] Pagination complete — updating loadedDateRange to ${nls}..${nle}`);
+                    set((s) => ({
+                        loadedDateRange: { startDate: nls, endDate: nle },
+                        loadedCoverageSpans:
+                            isGapFetch && gapStartDate && gapEndDate
+                                ? mergeLoadedCoverageSpans(
+                                      [...s.loadedCoverageSpans, { startDate: gapStartDate, endDate: gapEndDate }],
+                                      shopTzForCoverage,
+                                  )
+                                : nls && nle
+                                  ? mergeLoadedCoverageSpans([{ startDate: nls, endDate: nle }], shopTzForCoverage)
+                                  : s.loadedCoverageSpans,
+                        dataLoadIncomplete: false,
+                        dataVersion: s.dataVersion + 1,
+                    }));
+                    if (!suppressShopFetchProgressUi) {
+                        setTimeout(() => {
+                            if (epochAtStart !== shopDataFetchEpoch) return;
+                            set((s) => ({
+                                syncProgress: { ...s.syncProgress, isActive: false, message: '' },
+                                syncProgressShopId: null,
+                            }));
+                        }, 2000);
+                    }
+                } else if (!suppressShopFetchProgressUi) {
+                    setTimeout(() => {
+                        if (epochAtStart !== shopDataFetchEpoch) return;
+                        set((s) => ({
+                            syncProgress: { ...s.syncProgress, isActive: false, message: '' },
+                            syncProgressShopId: null,
+                        }));
+                    }, 1500);
                 }
 
                 // Phase 2: previous calendar period for Performance Comparison — after phase-1 pagination so the
@@ -1826,9 +2219,28 @@ export const useShopStore = create<ShopState>((set, get) => ({
         }
     },
 
+    releaseShopDataFetchForAuxiliaryTab: () => {
+        const state = get();
+        const hasVisibleProgress =
+            state.syncProgress.isActive ||
+            Boolean(state.syncProgress.message) ||
+            state.isFetchingDateRange;
+        if (!hasVisibleProgress) return;
+
+        // Do not bump shopDataFetchEpoch or clear pendingShopDataRequest — Overview / P&L /
+        // Orders loads should finish in the background while the user is on another tab.
+        set({
+            syncProgress: { ...IDLE_SYNC_PROGRESS },
+            syncProgressShopId: null,
+            isFetchingDateRange: false,
+            dateRangeFetchShopId: null,
+        });
+    },
+
     clearData: () => {
         lastPlNetworkSuccessAtMs.clear();
         plDataHttpInflightDepth = 0;
+        clearShopTabMountBootstrapFingerprints();
         set({
         products: [],
         orders: [],
@@ -1852,6 +2264,7 @@ export const useShopStore = create<ShopState>((set, get) => ({
         lastFetchTime: null,
         lastFetchShopId: null,
         loadedDateRange: { startDate: null, endDate: null },
+        loadedCoverageSpans: [],
         syncProgress: { ...IDLE_SYNC_PROGRESS },
         syncProgressShopId: null,
         isFetchingDateRange: false,
@@ -2003,7 +2416,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
                     plData: s.plData,
                     plDataKey: s.plDataKey,
                     plDataCache: s.plDataCache,
-                    loadedDateRange: s.loadedDateRange
+                    loadedDateRange: s.loadedDateRange,
+                    loadedCoverageSpans: s.loadedCoverageSpans
                 };
 
                 return {
@@ -2371,7 +2785,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
                     plData: s.plData,
                     plDataKey: s.plDataKey,
                     plDataCache: s.plDataCache,
-                    loadedDateRange: s.loadedDateRange
+                    loadedDateRange: s.loadedDateRange,
+                    loadedCoverageSpans: s.loadedCoverageSpans
                 };
                 return { memoryCache: newMemoryCache };
             });
@@ -2442,7 +2857,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
                     plData: s.plData,
                     plDataKey: s.plDataKey,
                     plDataCache: s.plDataCache,
-                    loadedDateRange: s.loadedDateRange
+                    loadedDateRange: s.loadedDateRange,
+                    loadedCoverageSpans: s.loadedCoverageSpans
                 };
                 return { memoryCache: newMemoryCache };
             });
@@ -2515,7 +2931,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
                     plData: s.plData,
                     plDataKey: s.plDataKey,
                     plDataCache: s.plDataCache,
-                    loadedDateRange: s.loadedDateRange
+                    loadedDateRange: s.loadedDateRange,
+                    loadedCoverageSpans: s.loadedCoverageSpans
                 };
                 return { memoryCache: newMemoryCache };
             });
@@ -2712,7 +3129,8 @@ export const useShopStore = create<ShopState>((set, get) => ({
                     plData: s.plData,
                     plDataKey: s.plDataKey,
                     plDataCache: s.plDataCache,
-                    loadedDateRange: s.loadedDateRange
+                    loadedDateRange: s.loadedDateRange,
+                    loadedCoverageSpans: s.loadedCoverageSpans
                 };
                 return { memoryCache: newMemoryCache };
             });
@@ -3369,5 +3787,46 @@ export const useShopStore = create<ShopState>((set, get) => ({
             plDataHttpInflightDepth = Math.max(0, plDataHttpInflightDepth - 1);
             set({ plFetchInFlight: plDataHttpInflightDepth > 0 });
         }
-    }
+    },
+
+    refreshPlDataCustomLineItems: async (
+        accountId: string,
+        shopId: string,
+        startDate: string,
+        endDate: string,
+        timezone: string = 'America/Los_Angeles',
+    ) => {
+        const key = `${accountId}:${shopId}:${startDate}:${endDate}`;
+        const range = getUtcCalendarRangeExclusiveUnix(startDate, endDate);
+        if (!range) return;
+
+        const url = `${API_BASE_URL}/api/tiktok-shop/finance/custom-pl/${accountId}/amounts-in-range?shopId=${encodeURIComponent(shopId)}&startDate=${range.start}&endDate=${range.endExclusive}`;
+
+        const mergeBlock = (customLineItems: unknown) => {
+            const patch = (data: any) =>
+                data != null && typeof data === 'object' ? { ...data, custom_line_items: customLineItems } : data;
+            set((s) => {
+                const nextCache = { ...s.plDataCache };
+                if (nextCache[key]) {
+                    nextCache[key] = patch(nextCache[key]);
+                }
+                const nextPl =
+                    s.lastFetchShopId === shopId && s.plDataKey === key ? patch(s.plData) : s.plData;
+                return { plDataCache: nextCache, plData: nextPl };
+            });
+        };
+
+        try {
+            const response = await shopApi(url);
+            const result = await response.json();
+            if (result.success && result.data) {
+                lastPlNetworkSuccessAtMs.set(key, Date.now());
+                mergeBlock(result.data);
+                return;
+            }
+        } catch (err) {
+            console.warn('[Store] refreshPlDataCustomLineItems failed, falling back to full P&L fetch', err);
+        }
+        await get().fetchPLData(accountId, shopId, startDate, endDate, true, timezone);
+    },
 }));

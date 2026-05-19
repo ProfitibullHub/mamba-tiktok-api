@@ -23,7 +23,7 @@ export function ViewToggle({ currentView, onViewChange, showKanban = true }: Vie
                     key={view.id}
                     onClick={() => onViewChange(view.id)}
                     className={`flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-medium transition-all ${currentView === view.id
-                        ? 'bg-pink-600 text-white'
+                        ? 'bg-mamba-green text-mamba-dark'
                         : 'text-gray-400 hover:text-white hover:bg-gray-700'
                         }`}
                     title={view.label}

@@ -33,7 +33,7 @@ export function UnauthorizedShopAccess({ attemptedLabel, title, message }: Props
                     <Link
                         to="/"
                         replace
-                        className="inline-flex items-center justify-center gap-2 rounded-xl bg-pink-600 px-5 py-2.5 text-sm font-medium text-white transition hover:bg-pink-500"
+                        className="inline-flex items-center justify-center gap-2 rounded-xl bg-mamba-green px-5 py-2.5 text-sm font-medium text-mamba-dark transition hover:bg-mamba-deep"
                     >
                         <Store className="h-4 w-4" />
                         Back to console

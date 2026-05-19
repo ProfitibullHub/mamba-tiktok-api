@@ -1,10 +1,9 @@
 import { createContext, useContext, useMemo, type ReactNode } from 'react';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQueries, useQuery } from '@tanstack/react-query';
 import { supabase } from '../lib/supabase';
-import { fetchBranding } from '../lib/brandingApi';
+import { fetchMyEffectivePermissionsOnTenant, effectiveAllowsRoleManagementSurface } from '../hooks/useMyEffectivePermissions';
 import { useAuth } from './AuthContext';
-
-const SELLER_FACING_BRANDING_QUERY_KEY = 'seller-facing-branding';
+/** @see ../lib/tenantModel.ts — `parent_tenant_id` = agency→seller link, not permission inheritance */
 
 export type MembershipRow = {
     id: string;
@@ -119,7 +118,7 @@ export function computePrimaryRoleBadge(memberships: MembershipRow[]): PrimaryRo
 export function primaryRoleBadgeClassName(variant: PrimaryRoleBadgeVariant): string {
     switch (variant) {
         case 'super':
-            return 'bg-pink-500/20 text-pink-400 border-pink-500/30';
+            return 'bg-mamba-green/20 text-mamba-neon border-mamba-green/30';
         case 'agency':
             return 'bg-violet-500/20 text-violet-300 border-violet-500/30';
         case 'account_mgr':
@@ -172,67 +171,28 @@ type TenantContextValue = {
 const TenantContext = createContext<TenantContextValue | null>(null);
 
 export function TenantProvider({ children }: { children: ReactNode }) {
-    const { user } = useAuth();
-    const queryClient = useQueryClient();
+    const { user, profile, loading: authLoading } = useAuth();
 
-    const { data: profileContext, isLoading: loadingProfileTenant } = useQuery({
-        queryKey: ['profile-tenant', user?.id],
+    const profileTenantId = profile?.tenant_id ?? null;
+
+    const { data: tenantMeta, isLoading: loadingTenantMeta } = useQuery({
+        queryKey: ['tenant-meta', profileTenantId],
         queryFn: async () => {
             const { data, error } = await supabase
-                .from('profiles')
-                .select('tenant_id, tenants(type,status,parent_tenant_id)')
-                .eq('id', user!.id)
+                .from('tenants')
+                .select('type, status, parent_tenant_id')
+                .eq('id', profileTenantId!)
                 .maybeSingle();
             if (error) throw error;
-            const tenantId = (data?.tenant_id ?? null) as string | null;
-            const t = data?.tenants as
-                | { type?: string; status?: string; parent_tenant_id?: string | null }
-                | { type?: string; status?: string; parent_tenant_id?: string | null }[]
-                | null
-                | undefined;
-            const row = Array.isArray(t) ? t[0] : t;
-            let tenantType = row?.type ?? null;
-            let tenantStatus = row?.status ?? null;
-            let tenantParentId = (row?.parent_tenant_id ?? null) as string | null;
-            if (tenantId && (!tenantType || !tenantStatus)) {
-                const { data: trow, error: tErr } = await supabase
-                    .from('tenants')
-                    .select('type, status, parent_tenant_id')
-                    .eq('id', tenantId)
-                    .maybeSingle();
-                if (!tErr && trow?.type) tenantType = trow.type as string;
-                if (!tErr && trow?.status) tenantStatus = trow.status as string;
-                if (!tErr && trow && 'parent_tenant_id' in trow) {
-                    tenantParentId = (trow.parent_tenant_id ?? null) as string | null;
-                }
-            }
-
-            const brandingEligible =
-                Boolean(tenantId && tenantType) &&
-                (tenantType === 'agency' || (tenantType === 'seller' && tenantParentId != null));
-
-            if (brandingEligible && tenantId) {
-                try {
-                    await queryClient.prefetchQuery({
-                        queryKey: [SELLER_FACING_BRANDING_QUERY_KEY, tenantId],
-                        queryFn: () => fetchBranding(),
-                        staleTime: 30 * 60 * 1000,
-                        gcTime: 60 * 60 * 1000,
-                    });
-                } catch (e) {
-                    console.warn('[TenantProvider] branding prefetch failed', e);
-                }
-            }
-
-            return { tenantId, tenantType, tenantStatus, tenantParentId };
+            return data;
         },
-        enabled: !!user?.id,
+        enabled: Boolean(profileTenantId),
     });
 
-    const profileTenantId = profileContext?.tenantId ?? null;
-    const profileTenantType = profileContext?.tenantType ?? null;
-    const profileTenantStatus = profileContext?.tenantStatus ?? null;
-    const profileTenantParentId = profileContext?.tenantParentId ?? null;
+    const profileTenantType = (tenantMeta?.type as string | undefined) ?? null;
+    const profileTenantStatus = (tenantMeta?.status as string | undefined) ?? null;
+    const profileTenantParentId = (tenantMeta?.parent_tenant_id as string | null | undefined) ?? null;
+    const loadingProfileTenant = authLoading || (Boolean(profileTenantId) && loadingTenantMeta);
 
     const sellerFacingBrandingEligible = useMemo(() => {
         if (!profileTenantId || !profileTenantType) return false;
@@ -324,6 +284,25 @@ export function TenantProvider({ children }: { children: ReactNode }) {
         enabled: !!user?.id && agencyMembershipIds.length > 0,
     });
 
+    const membershipTenantIds = useMemo(() => {
+        const ids = new Set<string>();
+        for (const m of memberships) {
+            if (m.status !== 'active') continue;
+            if (m.tenants?.type === 'platform') continue;
+            ids.add(m.tenant_id);
+        }
+        return Array.from(ids);
+    }, [memberships]);
+
+    const effectivePermQueries = useQueries({
+        queries: membershipTenantIds.map((tid) => ({
+            queryKey: ['my-effective-permissions', user?.id, tid],
+            queryFn: () => fetchMyEffectivePermissionsOnTenant(tid),
+            enabled: Boolean(user?.id && tid && !isLoading),
+            staleTime: 60_000,
+        })),
+    });
+
     const value = useMemo(() => {
         const agencyMemberships = memberships.filter((m) => m.tenants?.type === 'agency');
         const isAgencyAdminOn = (agencyTenantId: string) =>
@@ -380,6 +359,18 @@ export function TenantProvider({ children }: { children: ReactNode }) {
                 manageableAdminTenants.push({ id: seller.id, name: seller.name, type: 'seller' });
             }
         }
+        for (let i = 0; i < membershipTenantIds.length; i++) {
+            const tid = membershipTenantIds[i];
+            const perms = effectivePermQueries[i]?.data;
+            if (!perms || !effectiveAllowsRoleManagementSurface(perms)) continue;
+            if (seen.has(tid)) continue;
+            const m = memberships.find((x) => x.tenant_id === tid && x.status === 'active');
+            const t = m?.tenants;
+            if (!t || t.type === 'platform') continue;
+            if (t.type !== 'agency' && t.type !== 'seller') continue;
+            seen.add(tid);
+            manageableAdminTenants.push({ id: tid, name: t.name, type: t.type });
+        }
         // Strictly AM-only: assignment alone is not enough (AC assignments must not enable AM-only actions).
         const assignedSellerIds = new Set(
             amAssignedSellerTenants
@@ -430,6 +421,8 @@ export function TenantProvider({ children }: { children: ReactNode }) {
         refetch,
         linkedSellerTenants,
         amAssignedSellerTenants,
+        membershipTenantIds,
+        effectivePermQueries,
     ]);
 
     return <TenantContext.Provider value={value}>{children}</TenantContext.Provider>;

@@ -3,10 +3,11 @@ import { supabase } from '../config/supabase.js';
 import { resolveRequestUserId } from '../middleware/account-access.middleware.js';
 import { sendHtmlEmail } from '../services/email.js';
 import { auditLog } from '../services/audit-logger.js';
-import { authorize } from '../services/authorization.service.js';
+import { authorize, permissionSatisfied } from '../services/authorization.service.js';
 import { buildBrandedFromAddress, resolveTenantBranding } from '../services/tenant-branding.service.js';
 import { applyFinancialFieldFiltering, getFinancialFieldAccess } from '../services/financial-visibility.service.js';
 import { buildDashboardExportPdfBuffer } from '../services/report-pdf.service.js';
+import { computeEmailDashboardPlSummary } from '../services/email-dashboard-pl-summary.service.js';
 import { calculateOrderGMV } from '../utils/gmvCalculations.js';
 import { isCancelledOrRefunded } from '../utils/orderFinancials.js';
 import {
@@ -15,7 +16,11 @@ import {
     getShopDayStartTimestamp,
     previousCalendarDayISO,
 } from '../utils/dateUtils.js';
-import { ACTION_TIKTOK_SHOP_DATA, FEATURE_TIKTOK_SHOP } from '../constants/tiktok-entitlements.js';
+import {
+    ACTION_TIKTOK_SHOP_DATA,
+    ACTION_DASHBOARD_EXPORT_EMAIL,
+    FEATURE_TIKTOK_SHOP,
+} from '../constants/tiktok-entitlements.js';
 
 const router = express.Router();
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -68,26 +73,57 @@ async function getSellerTenantIdForAccount(accountId: string): Promise<string | 
 }
 
 /**
- * Dashboard report email (order and/or P&L snapshot) uses the same bar as reading synced shop data.
- * P&L figures are overview-style numbers with the same financial-visibility filtering as the UI — not the separate `export_pnl` CSV/export product gate.
+ * Dashboard email: requires `dashboard.export_email` (AM assignment path per RBAC).
+ * Order section additionally requires `tiktok.shop.data`. P&L-only requires `view_pnl` (or financials aliases).
  */
 async function assertCanEmailDashboard(
     req: express.Request,
-    accountId: string
+    accountId: string,
+    reportTypes: ReportType[]
 ): Promise<{ ok: boolean; userId: string | null; reason?: string }> {
     const userId = await resolveRequestUserId(req);
     if (!userId) return { ok: false, userId: null, reason: 'Authorization required' };
 
-    const shopAuth = await authorize(req, {
-        action: ACTION_TIKTOK_SHOP_DATA,
-        accountId,
+    const exportGate = await authorize(req, {
+        action: ACTION_DASHBOARD_EXPORT_EMAIL,
         featureKey: FEATURE_TIKTOK_SHOP,
+        accountId,
         denyAction: 'export.dashboard_email_denied',
     });
-    if (!shopAuth.allowed) {
-        return { ok: false, userId, reason: shopAuth.reason };
+    if (!exportGate.allowed) {
+        return { ok: false, userId, reason: exportGate.reason };
     }
-    return { ok: true, userId: shopAuth.context.userId };
+
+    const needsOrder = reportTypes.includes('order');
+    const needsPl = reportTypes.includes('pl');
+
+    if (needsOrder) {
+        const shopAuth = await authorize(req, {
+            action: ACTION_TIKTOK_SHOP_DATA,
+            featureKey: FEATURE_TIKTOK_SHOP,
+            accountId,
+            denyAction: 'export.dashboard_email_denied',
+        });
+        if (!shopAuth.allowed) {
+            return { ok: false, userId, reason: shopAuth.reason };
+        }
+        return { ok: true, userId: shopAuth.context.userId };
+    }
+
+    if (needsPl) {
+        const plAuth = await authorize(req, {
+            action: 'view_pnl',
+            featureKey: FEATURE_TIKTOK_SHOP,
+            accountId,
+            denyAction: 'export.dashboard_email_denied',
+        });
+        if (!plAuth.allowed) {
+            return { ok: false, userId, reason: plAuth.reason };
+        }
+        return { ok: true, userId: plAuth.context.userId };
+    }
+
+    return { ok: false, userId, reason: 'No report types selected' };
 }
 
 /**
@@ -161,16 +197,41 @@ async function loadOrdersInPaidRange(
     return all;
 }
 
-function summarizeOrders(orders: ShopOrderRow[], startSec: number, endSec: number) {
+/** Mirrors `OverviewView` rawOverviewMetricsBundle: count vs GMV can diverge when cancelled handling differs. */
+type DashboardOrderSummarizeOptions = {
+    /** When true, count all non-sample paid-time orders in range, including later-cancelled (Overview hardcodes true). */
+    includeCancelledInCount: boolean;
+    /** When true, GMV sums gross for cancelled+active in range; when false, only non-cancelled (matches Overview financials toggle). */
+    includeCancelledInFinancials: boolean;
+};
+
+const DEFAULT_DASHBOARD_ORDER_SUMMARY: DashboardOrderSummarizeOptions = {
+    includeCancelledInCount: true,
+    includeCancelledInFinancials: true,
+};
+
+function summarizeOrders(
+    orders: ShopOrderRow[],
+    startSec: number,
+    endSec: number,
+    opts: Partial<DashboardOrderSummarizeOptions> = {}
+) {
+    const includeCancelledInCount = opts.includeCancelledInCount ?? DEFAULT_DASHBOARD_ORDER_SUMMARY.includeCancelledInCount;
+    const includeCancelledInFinancials =
+        opts.includeCancelledInFinancials ?? DEFAULT_DASHBOARD_ORDER_SUMMARY.includeCancelledInFinancials;
+
     const inRange = orders.filter((o) => {
         const ts = orderPaidTs(o);
         return ts >= startSec && ts < endSec;
     });
 
     const nonSample = inRange.filter((o) => !o.is_sample_order);
-    const forMetrics = nonSample.filter((o) => !isCancelledOrRefunded(o));
-    const orderCount = forMetrics.length;
-    const gmv = forMetrics.reduce((sum, o) => sum + calculateOrderGMV(o), 0);
+    const activeOnly = nonSample.filter((o) => !isCancelledOrRefunded(o));
+
+    const forCount = includeCancelledInCount ? nonSample : activeOnly;
+    const forGmv = includeCancelledInFinancials ? nonSample : activeOnly;
+    const orderCount = forCount.length;
+    const gmv = forGmv.reduce((sum, o) => sum + calculateOrderGMV(o), 0);
     return { orderCount, gmv, totalPaidInRange: inRange.length };
 }
 
@@ -189,6 +250,12 @@ type PlSummary = {
 
 function money(n: number): string {
     return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n);
+}
+
+function parseIncludeCancelledFinancials(body: Record<string, unknown> | null | undefined): boolean {
+    const v = body?.includeCancelledFinancials;
+    if (typeof v === 'boolean') return v;
+    return DEFAULT_DASHBOARD_ORDER_SUMMARY.includeCancelledInFinancials;
 }
 
 function parseReportTypes(body: Record<string, unknown> | null | undefined): ReportType[] {
@@ -288,29 +355,6 @@ function shouldSendScheduleNow(
     return { shouldSend: matches, localDateKey };
 }
 
-function parsePlSummary(body: Record<string, unknown> | null | undefined): PlSummary | null {
-    const p = body?.plSummary;
-    if (!p || typeof p !== 'object') return null;
-    const o = p as Record<string, unknown>;
-    const keys = ['gmv', 'totalOrders', 'totalRevenue', 'netSales', 'grossProfit', 'netProfit'] as const;
-    for (const k of keys) {
-        const v = o[k];
-        if (typeof v !== 'number' || !Number.isFinite(v)) return null;
-    }
-    const adRaw = o.adSpend;
-    const adSpend =
-        typeof adRaw === 'number' && Number.isFinite(adRaw) ? adRaw : undefined;
-    return {
-        gmv: o.gmv as number,
-        totalOrders: o.totalOrders as number,
-        totalRevenue: o.totalRevenue as number,
-        netSales: o.netSales as number,
-        grossProfit: o.grossProfit as number,
-        netProfit: o.netProfit as number,
-        adSpend,
-    };
-}
-
 function buildEmailShell(
     accountName: string,
     shopLabel: string,
@@ -343,15 +387,19 @@ function buildOrderSectionHtml(opts: {
     orderCount: number;
     gmv: number;
     note?: string;
+    rulesNote?: string;
 }): string {
     const gmvStr = money(opts.gmv);
+    const rules =
+        opts.rulesNote ||
+        'Non-sample orders in the selected shop period; same inclusion rules as the Overview (order count includes cancelled paid in range; GMV follows your cancelled-in-financials setting).';
     return `
   <div style="margin-bottom:28px;padding-bottom:20px;border-bottom:1px solid #27272a;">
     <h2 style="font-size:15px;margin:0 0 12px;color:#fafafa;">Order-based summary</h2>
-    <p style="margin:0 0 12px;font-size:12px;color:#737373;">Computed from paid orders in the database (same GMV rules as the live dashboard).</p>
+    <p style="margin:0 0 12px;font-size:12px;color:#737373;">${escapeHtml(rules)}</p>
     <table style="width:100%;border-collapse:collapse;font-size:14px;">
       <tr>
-        <td style="padding:10px 0;border-bottom:1px solid #27272a;color:#a3a3a3;">Paid orders (excl. cancelled / sample)</td>
+        <td style="padding:10px 0;border-bottom:1px solid #27272a;color:#a3a3a3;">Orders (excl. sample)</td>
         <td style="padding:10px 0;border-bottom:1px solid #27272a;text-align:right;font-weight:600;color:#fff;">${
             opts.orderCount
         }</td>
@@ -369,10 +417,10 @@ function buildOrderSectionHtml(opts: {
   </div>`;
 }
 
-function buildPlSectionHtml(pl: PlSummary): string {
+function buildPlSectionHtml(pl: PlSummary, opts?: { reconciledWithOrderBlock?: boolean }): string {
     const rows: [string, string][] = [
-        ['GMV (dashboard)', money(pl.gmv)],
-        ['Orders (dashboard count)', String(pl.totalOrders)],
+        ['GMV', money(pl.gmv)],
+        ['Orders', String(pl.totalOrders)],
         ['Total revenue', money(pl.totalRevenue)],
         ['TikTok settlement net sales (reference)', money(pl.netSales)],
         ['Gross profit', money(pl.grossProfit)],
@@ -390,18 +438,21 @@ function buildPlSectionHtml(pl: PlSummary): string {
     </tr>`
         )
         .join('');
+    const note = opts?.reconciledWithOrderBlock
+        ? 'GMV and order count match the order-based summary above. Revenue, settlement, and profit lines reflect your dashboard at send time.'
+        : 'Figures match what you had on screen when sending (Overview / P&amp;L date range).';
     return `
   <div style="margin-bottom:8px;">
     <h2 style="font-size:15px;margin:0 0 12px;color:#fafafa;">P&amp;L-style summary</h2>
-    <p style="margin:0 0 12px;font-size:12px;color:#737373;">Figures match what you had on screen when sending (Overview / P&amp;L date range).</p>
+    <p style="margin:0 0 12px;font-size:12px;color:#737373;">${note}</p>
     <table style="width:100%;border-collapse:collapse;font-size:14px;">${tableRows}</table>
   </div>`;
 }
 
 /**
  * POST /api/reports/email-dashboard
- * body: { accountId, shopId, startDate, endDate, to, timezone?, reportTypes?: ('order'|'pl')[], plSummary?: {...} }
- * plSummary required when reportTypes includes 'pl' (validated numbers from client Overview/P&L).
+ * body: { accountId, shopId, startDate, endDate, to, timezone?, reportTypes?, includeCancelledFinancials? }
+ * P&amp;L figures are computed on the server (same filtered settlement pipeline as `GET /pl-data` plus dashboard order math).
  */
 router.post('/email-dashboard', async (req, res) => {
     try {
@@ -432,16 +483,8 @@ router.post('/email-dashboard', async (req, res) => {
         }
 
         const needsPl = reportTypes.includes('pl');
-        const plParsed = needsPl ? parsePlSummary(body) : null;
-        if (needsPl && !plParsed) {
-            res.status(400).json({
-                success: false,
-                error: 'plSummary with numeric gmv, totalOrders, totalRevenue, netSales, grossProfit, netProfit is required when including P&L',
-            });
-            return;
-        }
 
-        const can = await assertCanEmailDashboard(req, accountId as string);
+        const can = await assertCanEmailDashboard(req, accountId as string, reportTypes);
         if (!can.ok || !can.userId) {
             res.status(403).json({
                 success: false,
@@ -471,9 +514,17 @@ router.post('/email-dashboard', async (req, res) => {
         const timezone =
             (typeof tzBody === 'string' && tzBody.trim()) || shop.timezone || 'America/Los_Angeles';
         const periodLabel = `${startDate} → ${endDate} (${timezone})`;
+        const includeCancelledFinancials = parseIncludeCancelledFinancials(body);
+        const orderSummarizeOpts: DashboardOrderSummarizeOptions = {
+            includeCancelledInCount: true,
+            includeCancelledInFinancials: includeCancelledFinancials,
+        };
         const branding = await resolveTenantBranding((account.tenant_id as string | null | undefined) || null);
         const brandName = branding.displayName || 'Mamba';
         const brandedFrom = buildBrandedFromAddress(branding);
+
+        const startUnix = getShopDayStartTimestamp(startDate, timezone);
+        const endUnixExclusive = getShopDayEndExclusiveTimestamp(endDate, timezone);
 
         const parts: string[] = [];
         let orderCount = 0;
@@ -482,48 +533,85 @@ router.post('/email-dashboard', async (req, res) => {
         let restrictionNotice: string | null = null;
 
         if (reportTypes.includes('order')) {
-            const startUnix = getShopDayStartTimestamp(startDate, timezone);
-            const endUnix = getShopDayEndExclusiveTimestamp(endDate, timezone);
             const startIso = new Date(startUnix * 1000).toISOString();
-            const endIso = new Date(endUnix * 1000).toISOString();
+            const endIso = new Date(endUnixExclusive * 1000).toISOString();
             const orders = await loadOrdersInPaidRange(internalShopId, startIso, endIso);
-            const sum = summarizeOrders(orders, startUnix, endUnix);
+            const sum = summarizeOrders(orders, startUnix, endUnixExclusive, orderSummarizeOpts);
             orderCount = sum.orderCount;
             gmv = sum.gmv;
             const note =
                 orders.length >= 20000
                     ? 'Summary capped at 20k orders loaded; totals may be incomplete.'
                     : undefined;
-            parts.push(buildOrderSectionHtml({ orderCount, gmv, note }));
+            const rulesNote = includeCancelledFinancials
+                ? undefined
+                : 'Non-sample orders in the selected shop period; order count includes cancelled paid in range; GMV excludes cancelled/refunded orders (matches Overview with "cancelled in financials" off).';
+            parts.push(buildOrderSectionHtml({ orderCount, gmv, note, rulesNote }));
         }
 
-        if (needsPl && plParsed) {
+        let serverPlSummary: PlSummary | null = null;
+        if (needsPl) {
+            serverPlSummary = await computeEmailDashboardPlSummary({
+                accountId: accountId as string,
+                shopCipher: shopKey,
+                internalShopId,
+                startDateYmd: startDate,
+                endDateYmd: endDate,
+                timezone,
+                userId,
+                startUnix,
+                endUnixExclusive,
+                includeCancelledFinancials,
+            });
+            if (!serverPlSummary) {
+                res.status(500).json({ success: false, error: 'Unable to compute P&L summary for email' });
+                return;
+            }
+        }
+
+        const reconcilePlWithOrders = reportTypes.includes('order') && needsPl && serverPlSummary;
+        const plAfterReconcile: PlSummary | null =
+            needsPl && serverPlSummary
+                ? reconcilePlWithOrders
+                    ? {
+                          ...serverPlSummary,
+                          gmv,
+                          totalOrders: orderCount,
+                          totalRevenue: gmv,
+                      }
+                    : { ...serverPlSummary }
+                : null;
+
+        if (needsPl && plAfterReconcile) {
             const sellerTenantId = await getSellerTenantIdForAccount(accountId as string);
             if (sellerTenantId) {
                 const fieldAccess = await getFinancialFieldAccess(userId, sellerTenantId);
                 const filtered = applyFinancialFieldFiltering(
                     {
-                        gmv: plParsed.gmv,
-                        totalOrders: plParsed.totalOrders,
-                        totalRevenue: plParsed.totalRevenue,
-                        netSales: plParsed.netSales,
-                        grossProfit: plParsed.grossProfit,
-                        netProfit: plParsed.netProfit,
-                        adSpend: plParsed.adSpend,
-                        margin: plParsed.totalRevenue !== 0 ? (plParsed.netProfit / plParsed.totalRevenue) * 100 : 0,
+                        gmv: plAfterReconcile.gmv,
+                        totalOrders: plAfterReconcile.totalOrders,
+                        totalRevenue: plAfterReconcile.totalRevenue,
+                        netSales: plAfterReconcile.netSales,
+                        grossProfit: plAfterReconcile.grossProfit,
+                        netProfit: plAfterReconcile.netProfit,
+                        adSpend: plAfterReconcile.adSpend,
+                        margin:
+                            plAfterReconcile.totalRevenue !== 0
+                                ? (plAfterReconcile.netProfit / plAfterReconcile.totalRevenue) * 100
+                                : 0,
                     },
                     fieldAccess
                 ) as Record<string, unknown>;
                 finalPlSummary = {
-                    gmv: Number(filtered.gmv ?? plParsed.gmv),
-                    totalOrders: Number(filtered.totalOrders ?? plParsed.totalOrders),
-                    totalRevenue: Number(filtered.totalRevenue ?? plParsed.totalRevenue),
-                    netSales: Number(filtered.netSales ?? plParsed.netSales),
-                    grossProfit: Number(filtered.grossProfit ?? plParsed.grossProfit),
-                    netProfit: Number(filtered.netProfit ?? plParsed.netProfit),
+                    gmv: Number(filtered.gmv ?? plAfterReconcile.gmv),
+                    totalOrders: Number(filtered.totalOrders ?? plAfterReconcile.totalOrders),
+                    totalRevenue: Number(filtered.totalRevenue ?? plAfterReconcile.totalRevenue),
+                    netSales: Number(filtered.netSales ?? plAfterReconcile.netSales),
+                    grossProfit: Number(filtered.grossProfit ?? plAfterReconcile.grossProfit),
+                    netProfit: Number(filtered.netProfit ?? plAfterReconcile.netProfit),
                     adSpend: typeof filtered.adSpend === 'number' ? filtered.adSpend : undefined,
                 };
-                parts.push(buildPlSectionHtml(finalPlSummary));
+                parts.push(buildPlSectionHtml(finalPlSummary, { reconciledWithOrderBlock: Boolean(reconcilePlWithOrders) }));
                 if (typeof filtered.restriction_notice === 'string') {
                     restrictionNotice = filtered.restriction_notice;
                     parts.push(
@@ -531,8 +619,8 @@ router.post('/email-dashboard', async (req, res) => {
                     );
                 }
             } else {
-                finalPlSummary = plParsed;
-                parts.push(buildPlSectionHtml(finalPlSummary));
+                finalPlSummary = plAfterReconcile;
+                parts.push(buildPlSectionHtml(finalPlSummary, { reconciledWithOrderBlock: Boolean(reconcilePlWithOrders) }));
             }
         }
 
@@ -648,7 +736,7 @@ router.post('/schedules', async (req, res) => {
             return;
         }
         const selectedReportTypes = parseReportTypesArray(reportTypes);
-        const canExport = await assertCanEmailDashboard(req, accountId);
+        const canExport = await assertCanEmailDashboard(req, accountId, selectedReportTypes);
         if (!canExport.ok || !canExport.userId) {
             res.status(403).json({ success: false, error: canExport.reason || 'Permission denied for this account' });
             return;
@@ -831,8 +919,16 @@ router.get('/cron-dashboard-digests', async (req, res) => {
                     const planTenantId =
                         typeof sellerAcc?.tenant_id === 'string' ? sellerAcc.tenant_id : profile.tenant_id;
 
-                    const hasShop = permRows.some((r: any) => r?.action === ACTION_TIKTOK_SHOP_DATA);
-                    if (!hasShop) return false;
+                    const eff = new Set<string>();
+                    for (const r of permRows) {
+                        const a = (r as { action?: string })?.action;
+                        if (typeof a === 'string' && a) eff.add(a);
+                    }
+                    const rowTypes = parseReportTypesArray(row.report_types);
+                    const needsOrder = rowTypes.includes('order');
+                    const needsPl = rowTypes.includes('pl');
+                    if (needsOrder && !eff.has(ACTION_TIKTOK_SHOP_DATA)) return false;
+                    if (needsPl && !permissionSatisfied(eff, 'view_pnl')) return false;
                     const { data: entShop } = await supabase.rpc('tenant_feature_allowed', {
                         p_tenant_id: planTenantId,
                         p_feature_key: FEATURE_TIKTOK_SHOP,
@@ -866,7 +962,7 @@ router.get('/cron-dashboard-digests', async (req, res) => {
             const rowReportTypes = parseReportTypesArray(row.report_types);
             try {
                 const orders = await loadOrdersInPaidRange(shopId, startIso, endIso);
-                const { orderCount, gmv } = summarizeOrders(orders, startUnix, endUnix);
+                const { orderCount, gmv } = summarizeOrders(orders, startUnix, endUnix, DEFAULT_DASHBOARD_ORDER_SUMMARY);
                 const periodLabel = `${yStr} (${tz}, previous shop day)`;
                 const innerParts: string[] = [];
                 if (rowReportTypes.includes('order')) {

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { MAMBA_REPO_ROOT } from './repo-root.js';
 import {
     statusDisablesTenantAccess,
     tenantStatusTriggersLifecycle,
@@ -31,7 +32,7 @@ test('tenantStatusTriggersLifecycle applies agency and seller cleanup only when 
 
 test('PRD migration contains last-admin and unlink cleanup guards', () => {
     const sql = readFileSync(
-        resolve(process.cwd(), 'supabase/migrations/20260416120000_prd_tenancy_alignment.sql'),
+        resolve(MAMBA_REPO_ROOT, 'supabase/migrations/20260416120000_prd_tenancy_alignment.sql'),
         'utf8'
     );
 
@@ -43,7 +44,7 @@ test('PRD migration contains last-admin and unlink cleanup guards', () => {
 
 test('PRD invariants migration enforces type immutability and tenancy audits', () => {
     const sql = readFileSync(
-        resolve(process.cwd(), 'supabase/migrations/20260416150000_tenant_invariants_audit_and_account_path.sql'),
+        resolve(MAMBA_REPO_ROOT, 'supabase/migrations/20260416150000_tenant_invariants_audit_and_account_path.sql'),
         'utf8'
     );
 

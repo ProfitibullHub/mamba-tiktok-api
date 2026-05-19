@@ -9,9 +9,20 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.app.json",
-    "generate:sow-pdf": "node scripts/generate-sow-implementation-pdf.mjs"
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "test:server": "npm run test --prefix server",
+    "test:all": "npm run test && npm run test:server",
+    "generate:sow-pdf": "node scripts/generate-sow-implementation-pdf.mjs",
+    "permissions:catalog": "node scripts/dump-permissions-catalog.mjs"
   },
   "dependencies": {
+    "@dnd-kit/core": "^6.3.1",
+    "@dnd-kit/sortable": "^10.0.0",
+    "@dnd-kit/utilities": "^3.2.2",
     "@supabase/supabase-js": "^2.57.4",
     "@tanstack/react-query": "^5.90.12",
     "@types/pdfkit": "^0.17.6",
@@ -32,18 +43,25 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.9.1",
+    "@playwright/test": "^1.50.1",
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.2.0",
+    "@testing-library/user-event": "^14.6.1",
     "@types/react": "^18.3.5",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
+    "@vitest/coverage-v8": "^3.0.5",
     "autoprefixer": "^10.4.18",
     "eslint": "^9.9.1",
     "eslint-plugin-react-hooks": "^5.1.0-rc.0",
     "eslint-plugin-react-refresh": "^0.4.11",
     "globals": "^15.9.0",
+    "jsdom": "^26.0.0",
     "postcss": "^8.4.35",
     "tailwindcss": "^3.4.1",
     "typescript": "^5.5.3",
     "typescript-eslint": "^8.3.0",
-    "vite": "^5.4.2"
+    "vite": "^5.4.2",
+    "vitest": "^3.0.5"
   }
 }

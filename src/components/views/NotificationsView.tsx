@@ -283,9 +283,9 @@ export function NotificationsView() {
                                             <span className="font-medium brand-text">{formatShopDateTime(notif.created_at, tz)}</span>
                                         </div>
                                         {notif.raw_payload?.data?.update_time && (
-                                            <div className="flex items-center gap-1 text-[10px] px-2 py-0.5 rounded brand-primary-card">
+                                            <div className="flex items-center gap-1 text-[10px] brand-muted px-2 py-0.5 rounded brand-primary-card">
                                                 <span>Event Time:</span>
-                                                <span className="font-semibold">{formatShopDateTime(notif.raw_payload.data.update_time * 1000, tz)}</span>
+                                                <span className="font-semibold brand-text">{formatShopDateTime(notif.raw_payload.data.update_time * 1000, tz)}</span>
                                             </div>
                                         )}
                                     </div>

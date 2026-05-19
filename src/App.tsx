@@ -1,15 +1,39 @@
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
-import { TenantProvider } from './contexts/TenantContext';
+import { TenantProvider, useTenantContext } from './contexts/TenantContext';
+import { SellerBrandingProvider } from './contexts/SellerBrandingContext';
 import { Login } from './components/Login';
 import { ConsolePage } from './components/ConsolePage';
 import { ShopPage } from './components/ShopPage';
 import { ResetPassword } from './components/ResetPassword';
 import { TikTokAdsCallback } from './components/TikTokAdsCallback';
 import { AcceptInvitationView } from './components/views/AcceptInvitationView';
+import { SupportBugReportsPage } from './components/views/SupportBugReportsPage';
+import { SupportBugReportDetailPage } from './components/views/SupportBugReportDetailPage';
+import { MessagingInboxPage } from './components/views/MessagingInboxPage';
 import { useEffect, useState } from 'react';
 import { reportClientError } from './lib/observability';
 import { AppToastHost } from './components/AppToastHost';
+
+function SupportBrandedLayout({ children }: { children: React.ReactNode }) {
+    const { profileTenantId, sellerFacingBrandingEligible, loading: tenantLoading } = useTenantContext();
+    if (tenantLoading) {
+        return (
+            <div className="min-h-screen bg-mamba-dark flex items-center justify-center">
+                <div className="animate-spin rounded-full h-16 w-16 border-4 border-mamba-green border-t-transparent" />
+            </div>
+        );
+    }
+    return (
+        <SellerBrandingProvider
+            enabled={sellerFacingBrandingEligible}
+            brandingCacheKey={profileTenantId || '_'}
+            documentTitle={null}
+        >
+            {children}
+        </SellerBrandingProvider>
+    );
+}
 
 function detectPasswordFlow(): 'reset' | 'invite' | null {
     const hash = window.location.hash;
@@ -63,8 +87,8 @@ function AppContent() {
 
     if (loading) {
         return (
-            <div className="min-h-screen bg-gray-900 flex items-center justify-center">
-                <div className="animate-spin rounded-full h-16 w-16 border-4 border-pink-500 border-t-transparent" />
+            <div className="min-h-screen bg-mamba-dark flex items-center justify-center">
+                <div className="animate-spin rounded-full h-16 w-16 border-4 border-mamba-green border-t-transparent" />
             </div>
         );
     }
@@ -84,8 +108,8 @@ function AppContent() {
 
     if (isResetPasswordPath && !user) {
         return (
-            <div className="min-h-screen bg-gray-900 flex items-center justify-center">
-                <div className="animate-spin rounded-full h-16 w-16 border-4 border-pink-500 border-t-transparent" />
+            <div className="min-h-screen bg-mamba-dark flex items-center justify-center">
+                <div className="animate-spin rounded-full h-16 w-16 border-4 border-mamba-green border-t-transparent" />
             </div>
         );
     }
@@ -102,6 +126,38 @@ function AppContent() {
         <TenantProvider>
             <Routes>
                 <Route path="/" element={<ConsolePage />} />
+                <Route
+                    path="/support"
+                    element={
+                        <SupportBrandedLayout>
+                            <SupportBugReportsPage />
+                        </SupportBrandedLayout>
+                    }
+                />
+                <Route
+                    path="/support/:submissionId"
+                    element={
+                        <SupportBrandedLayout>
+                            <SupportBugReportDetailPage />
+                        </SupportBrandedLayout>
+                    }
+                />
+                <Route
+                    path="/messages"
+                    element={
+                        <SupportBrandedLayout>
+                            <MessagingInboxPage />
+                        </SupportBrandedLayout>
+                    }
+                />
+                <Route
+                    path="/messages/:conversationId"
+                    element={
+                        <SupportBrandedLayout>
+                            <MessagingInboxPage />
+                        </SupportBrandedLayout>
+                    }
+                />
                 <Route path="/shop/:shopSlug" element={<ShopPage />} />
                 <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>

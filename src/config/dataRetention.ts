@@ -35,6 +35,20 @@ export const LOAD_DAY_OPTIONS = [
 // Default selection for new users (7 days)
 export const DEFAULT_LOAD_DAYS = 3;
 
+/** Read persisted "Default Load Days" from localStorage (same key as Overview Customize). */
+export function readDefaultLoadDaysFromStorage(shopId: string | undefined): number {
+    try {
+        const saved = localStorage.getItem(`mamba:default_load_days:${shopId || 'default'}`);
+        if (saved) {
+            const parsed = parseInt(saved, 10);
+            if (LOAD_DAY_OPTIONS.some((o) => o.value === parsed)) return parsed;
+        }
+    } catch {
+        /* ignore */
+    }
+    return DEFAULT_LOAD_DAYS;
+}
+
 /**
  * Calculate the actual number of days to load from Supabase, with buffer.
  * Formula: selectedDays * 2 + 2  (selected range + equal comparison period + 2-day buffer)

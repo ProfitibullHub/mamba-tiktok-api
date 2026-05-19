@@ -1,5 +1,5 @@
 
-import { TrendingUp, Star, RefreshCw, AlertCircle, Trash2, Calendar, Settings2, X, Plus, Zap, Bell, Mail, CheckCircle } from 'lucide-react';
+import { TrendingUp, TrendingDown, Star, RefreshCw, AlertCircle, Trash2, Calendar, Settings2, X, Plus, Zap, Bell, Mail, CheckCircle } from 'lucide-react';
 import { TimezoneSelector } from '../TimezoneSelector';
 import { AffiliateCommissionCard } from '../AffiliateCommissionCard';
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
@@ -16,6 +16,11 @@ import { calculateOrderGMV } from '../../utils/gmvCalculations';
 import { LOAD_DAY_OPTIONS, DEFAULT_LOAD_DAYS } from '../../config/dataRetention';
 import { useNotificationStore } from '../../store/useNotificationStore';
 import { useShopAccessFlags } from '../../hooks/useShopMutationAccess';
+import {
+  useMergedShopEffectivePermissions,
+  effectiveAllowsOperationalDashboardEmail,
+  effectiveHasTiktokShopData,
+} from '../../hooks/useMyEffectivePermissions';
 import { isCancelledOrRefunded } from '../../utils/orderFinancials';
 import {
   affiliateCogsFeeKeys,
@@ -31,6 +36,7 @@ import {
   feesBaseFromStatements,
 } from '../../utils/plFeeAggregation';
 import { scopedPlDataFromCache } from '../../utils/plDataRangeGuard';
+import { shouldSkipShopTabMountBootstrap } from '../../utils/shopTabBootstrap';
 
 // Use paid_time for filtering (matches backend which loads by paid_time)
 const getOrderTs = (o: Order): number => Number(o.paid_time || o.created_time);
@@ -50,7 +56,7 @@ function normalizeDashboardMetricIds(ids: string[]): string[] {
 
 import { DateRangePicker, DateRange } from '../DateRangePicker';
 import { TokenExpirationWarning } from '../TokenExpirationWarning';
-import { parseLocalDate, getShopDayStartTimestamp, getShopDayEndExclusiveTimestamp, formatShopDateISO, formatShopTimeOnly } from '../../utils/dateUtils';
+import { parseLocalDate, getShopDayStartTimestamp, getShopDayEndExclusiveTimestamp, formatShopDateISO, formatShopTimeOnly, getDateRangeFromPreset } from '../../utils/dateUtils';
 import { ComparisonCharts } from '../ComparisonCharts';
 
 interface OverviewViewProps {
@@ -59,18 +65,11 @@ interface OverviewViewProps {
   timezone?: string; // Shop timezone for date calculations
   onTimezoneChange?: (timezone: string) => void;
   onTabChange?: (tab: string) => void;
+  /** SPA session snapshot for Overview only (lost on refresh). */
+  sessionDateRange?: DateRange;
+  onSessionDateRangeChange?: (range: DateRange) => void;
 }
 
-const getDefaultDateRange = (timezone: string): DateRange => {
-  const today = new Date();
-  const todayStr = formatShopDateISO(today, timezone);
-  return {
-    startDate: todayStr,
-    endDate: todayStr
-  };
-};
-
-// Date Presets
 const DATE_PRESETS = [
   { id: 'today', label: 'Today' },
   { id: 'yesterday', label: 'Yesterday' },
@@ -149,14 +148,40 @@ function validateDashboardRecipientEmail(raw: string): { ok: true; email: string
   return { ok: true, email };
 }
 
-export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles', onTimezoneChange, onTabChange }: OverviewViewProps) {
+function readOverviewBootstrapDateRange(shopId: string | undefined, timezone: string): DateRange {
+  try {
+    const preset = localStorage.getItem(`mamba:default_date_preset:${shopId || 'default'}`) || 'today';
+    return getDateRangeFromPreset(preset, timezone);
+  } catch {
+    return getDateRangeFromPreset('today', timezone);
+  }
+}
+
+export function OverviewView({
+  account,
+  shopId,
+  timezone = 'America/Los_Angeles',
+  onTimezoneChange,
+  onTabChange,
+  sessionDateRange,
+  onSessionDateRangeChange,
+}: OverviewViewProps) {
   const { user } = useAuth();
-  const { loading: tenantCtxLoading, isAccountManagerAssignedToSeller } = useTenantContext();
+  const { loading: tenantCtxLoading, isPlatformSuperAdmin } = useTenantContext();
+  const { data: mergedSellerPerms, isLoading: loadingSellerPerms } = useMergedShopEffectivePermissions(
+    account.tenant_id,
+    account.id,
+    { enabled: Boolean(shopId && account.tenant_id && account.id) },
+  );
+  const bypassShopPermissionCeiling = isPlatformSuperAdmin || user?.role?.toLowerCase() === 'admin';
+  const operationalShopDataAllowed =
+    bypassShopPermissionCeiling || effectiveHasTiktokShopData(mergedSellerPerms);
   const canEmailDashboardExport =
     !tenantCtxLoading &&
+    (bypassShopPermissionCeiling || !loadingSellerPerms) &&
     !!shopId &&
     !!account.tenant_id &&
-    isAccountManagerAssignedToSeller(account.tenant_id);
+    (bypassShopPermissionCeiling || effectiveAllowsOperationalDashboardEmail(mergedSellerPerms));
   const { canMutateShop, canSyncShop } = useShopAccessFlags(account);
 
   const metrics = useShopStore(state => state.metrics);
@@ -168,6 +193,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
   const cacheMetadata = useShopStore(state => state.cacheMetadata);
   const syncProgress = useShopStore(state => state.syncProgress);
   const syncProgressShopId = useShopStore(state => state.syncProgressShopId);
+  const fetchInProgress = useShopStore((state) => state.fetchInProgress);
   const shopDataFetchQueued = useShopStore(state => state.shopDataFetchQueued);
   const queuedShopDataRequestShopId = useShopStore(state => state.queuedShopDataRequestShopId);
   const queuedShopDataRequestRange = useShopStore(state => state.queuedShopDataRequestRange);
@@ -181,6 +207,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
   const plDataKey = useShopStore(state => state.plDataKey);
   const plDataCache = useShopStore(state => state.plDataCache);
   const fetchPLData = useShopStore(state => state.fetchPLData);
+  const plLoading = useShopStore(state => state.plLoading);
 
   // Load default date preset from localStorage
   const [defaultDatePreset, setDefaultDatePreset] = useState<string>(() => {
@@ -191,8 +218,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
     }
   });
 
-  // Initialize date range based on saved preset
-  const [dateRange, setDateRange] = useState<DateRange>(getDefaultDateRange(timezone));
+  const [dateRange, setDateRange] = useState<DateRange>(() => sessionDateRange ?? readOverviewBootstrapDateRange(shopId, timezone));
 
   /** Ignore stale global `plData` while a fetch for a different range is in flight (avoids fee/statement mismatch). */
   const plData = useMemo(
@@ -201,8 +227,8 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
   );
 
   const restrictedFieldSet = useMemo(
-    () => new Set(plData?.financial_visibility?.restricted_fields || []),
-    [plData?.financial_visibility?.restricted_fields]
+    () => (bypassShopPermissionCeiling ? new Set<string>() : new Set(plData?.financial_visibility?.restricted_fields || [])),
+    [bypassShopPermissionCeiling, plData?.financial_visibility?.restricted_fields]
   );
   const isRestricted = useCallback((field: string) => restrictedFieldSet.has(field), [restrictedFieldSet]);
 
@@ -251,23 +277,6 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       return saved !== null ? saved === 'true' : true; // EXACT DEFAULT MATCH TO P&L
     } catch { return true; }
   });
-
-  // Hybrid Timezone Logic (Default: true)
-  // Toggle ON  → Applies 8-hour offset to previous period for America/Los_Angeles
-  // Toggle OFF → Standard previous period calculation
-  const [useHybridTimezone, setUseHybridTimezone] = useState<boolean>(() => {
-    try {
-      const saved = localStorage.getItem(`mamba:view_settings:hybrid_timezone:${shopId || 'default'}`);
-      return saved !== null ? saved === 'true' : true;
-    } catch { return true; }
-  });
-
-  // Persist toggles and broadcast to other views in the same tab
-  useEffect(() => {
-    try {
-      localStorage.setItem(`mamba:view_settings:hybrid_timezone:${shopId || 'default'}`, String(useHybridTimezone));
-    } catch { }
-  }, [useHybridTimezone, shopId]);
 
   // Token health state for expiration warning
   const [tokenHealth, setTokenHealth] = useState<{
@@ -318,19 +327,52 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
   }, [account.id]);
 
   // Memoize the fetch function to prevent duplicate calls
-  const handleDateRangeChange = useCallback((start: string, end: string) => {
-    if (shopId && start && end) {
-      // Use includePreviousPeriod: true so the store handles fetching the historical data needed for trends
-      // Pass initialLoadDays so the store uses the user's preferred default (matters for initial/no-date calls)
-      console.log(`[OverviewView] Fetching ${start} to ${end} (with extended history for trends, defaultLoad=${defaultLoadDays}d)`);
-      fetchShopData(account.id, shopId, { skipSyncCheck: true, includePreviousPeriod: true, initialLoadDays: defaultLoadDays, timezone }, start, end);
-      fetchAffiliateSettlements(account.id, shopId, start, end);
-      fetchAgencyFees(account.id, shopId, start, end);
-      fetchAdsSpend(account.id, start, end);
-      // Same P&L payload as ProfitLossView — powers Affiliate Commissions card (plData.fees)
-      void fetchPLData(account.id, shopId, start, end, false, timezone);
-    }
-  }, [shopId, account.id, fetchShopData, fetchAffiliateSettlements, fetchAgencyFees, fetchAdsSpend, fetchPLData, defaultLoadDays, timezone]);
+  // Presets with a multi-day span: primary range only unless user used custom apply (meta).
+  // Single-calendar-day ranges (Today / Yesterday): automatically load comparison period next (phase 2) for charts.
+  // Custom apply from the date picker: load selected range first, then previous period when meta says so.
+  const handleDateRangeChange = useCallback(
+    (start: string, end: string, opts?: { includePreviousPeriod?: boolean }) => {
+      if (shopId && start && end) {
+        const isSingleDay = start === end;
+        onSessionDateRangeChange?.({
+          startDate: start,
+          endDate: end,
+          ...(!isSingleDay && opts?.includePreviousPeriod ? { includePreviousPeriodForCharts: true } : {}),
+        });
+        const includePreviousPeriod = Boolean(opts?.includePreviousPeriod) || isSingleDay;
+        console.log(
+          `[OverviewView] Fetching ${start} to ${end}${includePreviousPeriod ? ' (then comparison period for trends)' : ''} (defaultLoad=${defaultLoadDays}d)`,
+        );
+        if (operationalShopDataAllowed) {
+          fetchShopData(
+            account.id,
+            shopId,
+            { skipSyncCheck: true, includePreviousPeriod, initialLoadDays: defaultLoadDays, timezone },
+            start,
+            end,
+          );
+        }
+        fetchAffiliateSettlements(account.id, shopId, start, end);
+        fetchAgencyFees(account.id, shopId, start, end);
+        fetchAdsSpend(account.id, start, end);
+        // Same P&L payload as ProfitLossView — powers Affiliate Commissions card (plData.fees)
+        void fetchPLData(account.id, shopId, start, end, false, timezone);
+      }
+    },
+    [
+      shopId,
+      account.id,
+      operationalShopDataAllowed,
+      fetchShopData,
+      fetchAffiliateSettlements,
+      fetchAgencyFees,
+      fetchAdsSpend,
+      fetchPLData,
+      defaultLoadDays,
+      timezone,
+      onSessionDateRangeChange,
+    ],
+  );
 
   // Keep a ref to the latest handleDateRangeChange so the mount effect always
   // calls the current version without needing it in the dependency array.
@@ -342,22 +384,23 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
   const dateRangeRef = useRef(dateRange);
   dateRangeRef.current = dateRange;
 
-  // Initial data load: fires once per shopId (on mount and when the shop changes).
-  // fetchShopData is NOT called automatically on every dateRange state change —
-  // user-triggered changes go through handleDateRangeChange directly via the
-  // DateRangePicker onChange handler and the Today button (see below).
-  // This prevents the double-fetch race condition that caused only 1000 orders
-  // to be loaded (the second concurrent call reset progressive loading state).
-  const lastFetchedShopRef = useRef<string | null>(null);
+  // Initial data load after shop change — not repeated on Overview remount while the SPA session
+  // keeps the same { account, shop, picker range, default load preference } fingerprint (tab switches).
+  // User-driven changes always go through handleDateRangeChange (picker / presets).
   useEffect(() => {
-    if (shopId && shopId !== lastFetchedShopRef.current) {
-      lastFetchedShopRef.current = shopId;
-      handleDateRangeChangeRef.current(
-        dateRangeRef.current.startDate,
-        dateRangeRef.current.endDate
-      );
-    }
-  }, [shopId]); // intentionally only shopId — see comment above
+    if (!shopId || !account.id || loadingSellerPerms) return;
+    const dr = dateRangeRef.current;
+    const isSingle = dr.startDate === dr.endDate;
+    const includePrev =
+      isSingle ? 1 : dr.includePreviousPeriodForCharts ? 1 : 0;
+    const fp = `${account.id}|${dr.startDate}|${dr.endDate}|${includePrev}|${defaultLoadDays}|${operationalShopDataAllowed ? 'op' : 'fin'}`;
+    if (shouldSkipShopTabMountBootstrap(shopId, 'overview', fp)) return;
+    handleDateRangeChangeRef.current(
+      dr.startDate,
+      dr.endDate,
+      !isSingle && dr.includePreviousPeriodForCharts ? { includePreviousPeriod: true } : undefined,
+    );
+  }, [shopId, account.id, defaultLoadDays, loadingSellerPerms, operationalShopDataAllowed]);
 
   // Force UI re-render after sync completes.
   // mergeAfterSync already updated zustand state with new data — this counter
@@ -439,7 +482,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
     if (
       !cacheMetadata.isSyncing &&
       syncProgressShopId === shopId &&
-      syncProgress.isActive &&
+      (syncProgress.isActive || fetchInProgress) &&
       syncProgress.message?.trim()
     ) {
       return syncProgress.message.trim();
@@ -453,6 +496,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
     syncProgressShopId,
     syncProgress.currentStep,
     syncProgress.isActive,
+    fetchInProgress,
     syncProgress.message,
     syncProgress.ordersFetched,
     syncProgress.ordersTotal,
@@ -469,14 +513,14 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
     if (!a || !b) {
       return 'An additional date-range load is queued and will start when the current request finishes.';
     }
-    const fmt = (iso: string) => {
-      const parts = iso.split('-').map(Number);
-      if (parts.length !== 3 || parts.some(Number.isNaN)) return iso;
-      const [y, m, d] = parts;
-      return new Date(y, m - 1, d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-    };
-    const rangeLabel = a === b ? fmt(a) : `${fmt(a)} – ${fmt(b)}`;
-    return `${rangeLabel} is queued and will load when the current request finishes.`;
+    // const fmt = (iso: string) => {
+    //   const parts = iso.split('-').map(Number);
+    //   if (parts.length !== 3 || parts.some(Number.isNaN)) return iso;
+    //   const [y, m, d] = parts;
+    //   return new Date(y, m - 1, d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    // };
+    // const rangeLabel = a === b ? fmt(a) : `${fmt(a)} – ${fmt(b)}`;
+    // return `${rangeLabel} is queued and will load when the current request finishes.`;
   }, [
     shopId,
     shopDataFetchQueued,
@@ -585,12 +629,11 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
 
     // --- Previous Period Logic (for trends) ---
 
-    // Calculate Previous Period using shop calendar days (Hybrid Timezone optional for LA)
+    // Calculate Previous Period — same-length shop-calendar block ending the day before the selection (aligned with TikTok date-range compare)
     const { prevStart, prevEndExclusive } = getPreviousPeriodRange(
       dateRange.startDate,
       dateRange.endDate,
-      timezone,
-      useHybridTimezone
+      timezone
     );
 
     // Previous period — paid_time pool (mirrors current period logic exactly)
@@ -697,21 +740,25 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
     let feesBase = 0;
     let shippingBaseForOpEx = 0;
 
-    if (plData && plData.statement_totals) {
+    const plFeesReady = Boolean(plData?.statement_totals);
+
+    if (plFeesReady) {
       feesBase =
-        plData.total_fee_tax != null
-          ? Math.abs(plData.total_fee_tax)
-          : Math.abs(plData.statement_totals.total_fees);
-      shippingBaseForOpEx = plData.shipping
-        ? shippingTotalForOperatingExpenses(plData.shipping)
-        : Math.abs(plData.statement_totals.total_shipping);
-      shopAdsFees = expenseFromNet(netByKeys(plData.fees, adSpendFeeKeys));
-      autoAffiliateCommission = expenseFromNet(netByKeys(plData.fees, affiliateCogsFeeKeys));
+        plData!.total_fee_tax != null
+          ? Math.abs(plData!.total_fee_tax)
+          : Math.abs(plData!.statement_totals!.total_fees);
+      shippingBaseForOpEx = plData!.shipping
+        ? shippingTotalForOperatingExpenses(plData!.shipping)
+        : Math.abs(plData!.statement_totals!.total_shipping);
+      shopAdsFees = expenseFromNet(netByKeys(plData!.fees, adSpendFeeKeys));
+      autoAffiliateCommission = expenseFromNet(netByKeys(plData!.fees, affiliateCogsFeeKeys));
     } else {
       const aggFees = mergeStatementFees(filteredStatements);
       const aggShip = mergeStatementShipping(filteredStatements);
       shopAdsFees = expenseFromNet(netByKeys(aggFees, adSpendFeeKeys));
-      autoAffiliateCommission = expenseFromNet(netByKeys(aggFees, affiliateCogsFeeKeys));
+      // Do not estimate affiliate from raw statements while P&L is loading — it understates
+      // commission vs the API fee breakdown and makes gross/net profit look too high until plData arrives.
+      autoAffiliateCommission = 0;
       feesBase = feesBaseFromStatements(filteredStatements);
       shippingBaseForOpEx =
         Object.keys(aggShip).length > 0
@@ -720,7 +767,20 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
     }
 
     const totalAffiliateCost = autoAffiliateCommission + manualAffiliateRetainers;
-    const grossProfit = netRevenue - totalCogs - totalProductShippingCost - totalAffiliateCost;
+
+    const plCustomBc = (plData as { custom_line_items?: { by_category?: Record<string, number> } } | null)?.custom_line_items
+      ?.by_category;
+    const customPlRevenue = Number(plCustomBc?.revenue ?? 0);
+    const customPlCogs = Number(plCustomBc?.cogs ?? 0);
+    const customPlOpEx = Number(plCustomBc?.expenses ?? 0) + Number(plCustomBc?.supplementary ?? 0);
+
+    const grossProfit =
+      netRevenue +
+      customPlRevenue -
+      totalCogs -
+      customPlCogs -
+      totalProductShippingCost -
+      totalAffiliateCost;
 
     const rangeStart = new Date(dateRange.startDate);
     rangeStart.setHours(0, 0, 0, 0);
@@ -779,7 +839,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
     }, 0);
 
     const realOperatingExpenses =
-      feesBase + shippingBaseForOpEx - shopAdsFees - autoAffiliateCommission + totalAgencyFees;
+      feesBase + shippingBaseForOpEx - shopAdsFees - autoAffiliateCommission + totalAgencyFees + customPlOpEx;
     const netProfitFinal = grossProfit - (realOperatingExpenses + adSpendTotal);
 
     // Calculate Completed Orders
@@ -831,7 +891,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
         itemsSoldChange
       },
     };
-  }, [orders, finance.statements, dateRange, products, dataVersion, syncRenderKey, useHybridTimezone, affiliateSettlementsInRange, agencyFees, adsSpendData, timezone, includeCancelledFinancials, plData]);
+  }, [orders, finance.statements, dateRange, products, dataVersion, syncRenderKey, affiliateSettlementsInRange, agencyFees, adsSpendData, timezone, includeCancelledFinancials, plData]);
 
   const shopFetchInProgress = useShopStore((state) => state.fetchInProgress);
   const plFetchInFlight = useShopStore((state) => state.plFetchInFlight);
@@ -844,8 +904,9 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
   const overviewFinanceUnsettled =
     shopFetchInProgress || plFetchInFlight || cacheMetadata.isSyncing;
 
-  /** Scoped P&L payload is authoritative for fee/shipping lines used in net profit — never overlay snapshot once it's present. */
+  /** Scoped P&L payload is authoritative for affiliate + fee lines in gross/net profit. */
   const headlinePlReady = Boolean(plData?.statement_totals);
+  const profitMetricsReady = headlinePlReady && !plFetchInFlight && !plLoading;
 
   useEffect(() => {
     settledFinanceSnapshotRef.current = null;
@@ -855,7 +916,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
     const raw = rawOverviewMetricsBundle;
     const keyFinance = `${account.id}:${shopId ?? ''}:${dateRange.startDate}:${dateRange.endDate}`;
 
-    if (!overviewFinanceUnsettled) {
+    if (!overviewFinanceUnsettled && profitMetricsReady) {
       settledFinanceSnapshotRef.current = {
         key: keyFinance,
         metrics: {
@@ -870,7 +931,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
     }
 
     const snap = settledFinanceSnapshotRef.current;
-    if (snap?.key === keyFinance && !headlinePlReady) {
+    if (snap?.key === keyFinance && !profitMetricsReady) {
       return {
         ...raw,
         calculatedMetrics: {
@@ -884,7 +945,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
   }, [
     rawOverviewMetricsBundle,
     overviewFinanceUnsettled,
-    headlinePlReady,
+    profitMetricsReady,
     account.id,
     shopId,
     dateRange.startDate,
@@ -1045,19 +1106,6 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       if (emailIncludeOrder) reportTypes.push('order');
       if (emailIncludePl) reportTypes.push('pl');
 
-      const plSummary =
-        emailIncludePl
-          ? {
-              gmv: metricsData.gmv,
-              totalOrders: metricsData.totalOrders,
-              totalRevenue: calculatedMetrics.totalRevenue,
-              netSales: calculatedMetrics.statementNetSales,
-              grossProfit: calculatedMetrics.grossProfit,
-              netProfit: calculatedMetrics.netProfit,
-              adSpend: adsSpendData?.totals?.total_spend ?? 0,
-            }
-          : undefined;
-
       const res = await apiFetch('/api/reports/email-dashboard', {
         method: 'POST',
         body: JSON.stringify({
@@ -1068,7 +1116,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
           to: recipientCheck.email,
           timezone,
           reportTypes,
-          ...(plSummary ? { plSummary } : {}),
+          includeCancelledFinancials,
         }),
       });
       const data = await res.json().catch(() => ({}));
@@ -1096,9 +1144,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
     timezone,
     emailIncludeOrder,
     emailIncludePl,
-    metricsData,
-    calculatedMetrics,
-    adsSpendData,
+    includeCancelledFinancials,
   ]);
 
   const handleCreateDigestSchedule = useCallback(async () => {
@@ -1230,17 +1276,28 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
     {
       id: 'netProfit',
       label: 'Net Profit',
-      getValue: () => (netProfitHidden ? 'Restricted' : formatCurrency(calculatedMetrics.netProfit)),
-      accentColor: calculatedMetrics.netProfit >= 0 ? 'var(--brand-profit)' : 'var(--brand-loss)',
-      subtitle: netProfitHidden ? 'Hidden by seller visibility policy' : 'Settlement - COGS',
+      getValue: () =>
+        netProfitHidden
+          ? 'Restricted'
+          : profitMetricsReady
+            ? formatCurrency(calculatedMetrics.netProfit)
+            : '—',
+      accentColor: profitMetricsReady && calculatedMetrics.netProfit >= 0 ? 'var(--brand-profit)' : 'var(--brand-loss)',
+      subtitle: netProfitHidden
+        ? 'Hidden by seller visibility policy'
+        : profitMetricsReady
+          ? 'Settlement - COGS'
+          : 'Loading affiliate & settlement fees…',
       isCurrency: true,
     },
     {
       id: 'grossProfit',
       label: 'Gross Profit',
-      getValue: () => formatCurrency(calculatedMetrics.grossProfit),
+      getValue: () => (profitMetricsReady ? formatCurrency(calculatedMetrics.grossProfit) : '—'),
       accentColor: 'var(--brand-profit)',
-      subtitle: 'Net revenue − COGS − product shipping − affiliate',
+      subtitle: profitMetricsReady
+        ? 'Net revenue − COGS − product shipping − affiliate'
+        : 'Loading affiliate commission…',
       isCurrency: true,
     },
     {
@@ -1279,7 +1336,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       accentColor: 'var(--brand-text-muted)',
       subtitle: `${dateRangeSubtitle} - Unfiltered from API`,
     },
-  ], [metricsData, calculatedMetrics, completedOrders, cancelledRefundedMetrics, sampleOrderMetrics, totalOrdersRaw, dateRangeSubtitle, netProfitHidden]);
+  ], [metricsData, calculatedMetrics, completedOrders, cancelledRefundedMetrics, sampleOrderMetrics, totalOrdersRaw, dateRangeSubtitle, netProfitHidden, profitMetricsReady]);
 
   // Same auto-affiliate total as Profit & Loss, with per-line breakdown for the card
   const autoAffiliateCommissionDetail = useMemo(() => {
@@ -1717,7 +1774,11 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
       {/* Refresh Prompt */}
       {cacheMetadata.showRefreshPrompt && canSyncShop && (
         <RefreshPrompt
-          onRefresh={() => syncData(account.id, shopId!, 'all')}
+          onRefresh={() => {
+            void syncData(account.id, shopId!, 'all').catch((err) =>
+              console.error('[Overview] Refresh sync failed:', err),
+            );
+          }}
           onDismiss={dismissRefreshPrompt}
           isStale={cacheMetadata.isStale}
         />
@@ -1742,7 +1803,11 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
             </p>
           </div>
           <button
-            onClick={() => fetchShopData(account.id, shopId, { forceRefresh: true })}
+            onClick={() =>
+              operationalShopDataAllowed && shopId
+                ? fetchShopData(account.id, shopId, { forceRefresh: true })
+                : void fetchPLData(account.id, shopId!, dateRange.startDate, dateRange.endDate, true, timezone)
+            }
             className="px-3 py-1 text-xs font-medium rounded-lg transition-colors flex items-center gap-1 brand-card brand-card-hover"
           >
             <RefreshCw className="w-3 h-3" />
@@ -1750,8 +1815,8 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
           </button>
         </div>
       )}
-      {/* Account Header — single toolbar row; scrolls horizontally on narrow viewports */}
-      <div className="brand-toolbar rounded-xl px-4 py-3 sm:px-5 sm:py-3.5">
+      {/* Account Header — single toolbar row; scrolls horizontally on narrow viewports (solid card surface, no primary tint). */}
+      <div className="brand-card rounded-xl px-4 py-3 sm:px-5 sm:py-3.5">
         <div className="flex flex-row items-center justify-between gap-3 min-w-0">
           <div className="flex items-center gap-3 min-w-0 shrink-0 pr-2">
             {account.avatar_url ? (
@@ -1789,7 +1854,7 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
               absolutely positioned dropdowns (timezone panel, date picker calendar, etc.). */}
           <div className="flex min-w-0 flex-1 items-center justify-end gap-1.5 sm:gap-2 py-0.5">
             <div className="flex min-w-0 flex-1 items-center justify-end gap-1.5 sm:gap-2 overflow-x-auto [-webkit-overflow-scrolling:touch]">
-            <div className="inline-flex h-9 shrink-0 items-stretch rounded-lg brand-toolbar p-0.5 gap-0.5">
+            <div className="inline-flex h-9 shrink-0 items-stretch rounded-lg brand-primary-card p-0.5 gap-0.5">
               <button
                 type="button"
                 onClick={handleTodayClick}
@@ -1820,9 +1885,14 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
               compact
               timezone={timezone}
               value={dateRange}
-              onChange={(range) => {
-                setDateRange(range);
-                handleDateRangeChange(range.startDate, range.endDate);
+              onChange={(range, meta) => {
+                setDateRange({
+                  ...range,
+                  includePreviousPeriodForCharts: meta?.source === 'custom',
+                });
+                handleDateRangeChange(range.startDate, range.endDate, {
+                  includePreviousPeriod: meta?.source === 'custom',
+                });
               }}
             />
 
@@ -1841,7 +1911,10 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
               <span className="hidden min-[380px]:inline">{cacheMetadata.isSyncing ? 'Syncing…' : 'Sync'}</span>
             </button>
             {syncStatusText && (
-              <span className="hidden md:inline shrink-0 text-[10px] brand-muted whitespace-nowrap">
+              <span
+                className="inline shrink-0 max-w-[min(11rem,42vw)] sm:max-w-none text-[10px] brand-muted whitespace-nowrap truncate md:whitespace-normal md:overflow-visible"
+                title={syncStatusText}
+              >
                 {syncStatusText}
               </span>
             )}
@@ -2020,7 +2093,9 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
                     />
                     <div>
                       <div className="text-sm font-medium brand-text">P&amp;L-style summary</div>
-                      <div className="text-xs brand-muted">GMV, revenue, gross/net profit, TikTok settlement reference, ad spend — matches this dashboard view</div>
+                      <div className="text-xs brand-muted">
+                        Profit and settlement lines match this view; if you also include the order summary, GMV and order count are taken from the same server totals in the email.
+                      </div>
                     </div>
                   </label>
                 </div>
@@ -2203,23 +2278,6 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
                 </select>
               </div>
 
-              {/* Toggles */}
-              <div className="flex items-center gap-3 mr-2 pr-3" style={{ borderRight: '1px solid var(--brand-card-border)' }}>
-                <label className="flex items-center gap-2 cursor-pointer group" title="Aligns previous period with Seller Center (UTC-based) for accurate trends">
-                  <div className="relative">
-                    <input
-                      type="checkbox"
-                      className="sr-only"
-                      checked={useHybridTimezone}
-                      onChange={(e) => setUseHybridTimezone(e.target.checked)}
-                    />
-                    <div className={`w-8 h-4 rounded-full transition-colors ${useHybridTimezone ? 'brand-secondary-card' : 'brand-card'}`}></div>
-                    <div className={`absolute left-0.5 top-0.5 w-3 h-3 rounded-full transition-transform ${useHybridTimezone ? 'translate-x-4' : 'translate-x-0'}`} style={{ backgroundColor: 'var(--brand-text)' }}></div>
-                  </div>
-                  <span className="text-xs brand-muted transition-colors">Hybrid Trends</span>
-                </label>
-              </div>
-
               <button
                 onClick={() => setSelectedMetricIds(DEFAULT_METRICS)}
                 className="text-xs brand-nav-idle transition-colors px-3 py-1.5 rounded-lg brand-card-hover"
@@ -2363,7 +2421,11 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
                                 ? 'brand-state-success'
                                 : 'brand-state-danger'
                                 }`}>
-                                <TrendingUp className={`w-3 h-3 ${metric.trendChange! < 0 ? 'rotate-180' : ''}`} />
+                                {metric.trendChange! >= 0 ? (
+                                  <TrendingUp className="w-3 h-3" />
+                                ) : (
+                                  <TrendingDown className="w-3 h-3" />
+                                )}
                                 {formatKeyMetricTrendPercent(metric.trendChange!)}%
                               </div>
                             )}
@@ -2404,7 +2466,6 @@ export function OverviewView({ account, shopId, timezone = 'America/Los_Angeles'
                     startDate={dateRange.startDate}
                     endDate={dateRange.endDate}
                     timezone={timezone}
-                    useHybridTimezone={useHybridTimezone}
                     includeCancelledInTotal={includeCancelledInTotal}
                     includeCancelledFinancials={includeCancelledFinancials}
                   />

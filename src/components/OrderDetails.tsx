@@ -120,7 +120,7 @@ export function OrderDetails({ order, onClose }: OrderDetailsProps) {
                         </div>
                         <div className="bg-gray-800/50 p-4 rounded-xl border border-gray-700">
                             <p className="text-xs text-gray-400 uppercase tracking-wider mb-1">Total Amount</p>
-                            <p className="text-xl font-bold text-pink-500">{formatCurrency(totalAmount)}</p>
+                            <p className="text-xl font-bold text-mamba-green">{formatCurrency(totalAmount)}</p>
                         </div>
                     </div>
 
@@ -218,7 +218,7 @@ export function OrderDetails({ order, onClose }: OrderDetailsProps) {
                         {/* Buyer Info */}
                         <div className="space-y-4">
                             <h3 className="text-lg font-semibold text-white flex items-center gap-2">
-                                <User className="text-pink-500" size={20} />
+                                <User className="text-mamba-green" size={20} />
                                 Buyer Information
                             </h3>
                             <div className="bg-gray-800 rounded-xl p-4 border border-gray-700 space-y-4">
@@ -253,7 +253,7 @@ export function OrderDetails({ order, onClose }: OrderDetailsProps) {
                         {/* Shipping Info */}
                         <div className="space-y-4">
                             <h3 className="text-lg font-semibold text-white flex items-center gap-2">
-                                <MapPin className="text-pink-500" size={20} />
+                                <MapPin className="text-mamba-green" size={20} />
                                 Shipping Address
                             </h3>
                             <div className="bg-gray-800 rounded-xl p-4 border border-gray-700">
@@ -297,7 +297,7 @@ export function OrderDetails({ order, onClose }: OrderDetailsProps) {
                     {/* Line Items */}
                     <div className="space-y-4">
                         <h3 className="text-lg font-semibold text-white flex items-center gap-2">
-                            <Package className="text-pink-500" size={20} />
+                            <Package className="text-mamba-green" size={20} />
                             Order Items ({order.line_items.length})
                         </h3>
                         <div className="bg-gray-800 rounded-xl overflow-hidden border border-gray-700">
@@ -341,7 +341,7 @@ export function OrderDetails({ order, onClose }: OrderDetailsProps) {
                                                                 </span>
                                                             )}
                                                             {item.is_gift && (
-                                                                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-pink-500/20 text-pink-400 border border-pink-500/30">
+                                                                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-mamba-green/20 text-mamba-neon border border-mamba-green/30">
                                                                     <Gift size={10} /> Gift
                                                                 </span>
                                                             )}
@@ -433,7 +433,7 @@ export function OrderDetails({ order, onClose }: OrderDetailsProps) {
                     {/* Comprehensive Payment Breakdown */}
                     <div className="space-y-4">
                         <h3 className="text-lg font-semibold text-white flex items-center gap-2">
-                            <CreditCard className="text-pink-500" size={20} />
+                            <CreditCard className="text-mamba-green" size={20} />
                             Payment Breakdown
                         </h3>
                         <div className="bg-gray-800 rounded-xl p-6 border border-gray-700">
@@ -529,10 +529,10 @@ export function OrderDetails({ order, onClose }: OrderDetailsProps) {
                                 <div className="pt-2">
                                     <div className="flex justify-between items-center">
                                         <span className="flex items-center gap-2 text-white text-lg font-bold">
-                                            <DollarSign size={20} className="text-pink-500" />
+                                            <DollarSign size={20} className="text-mamba-green" />
                                             Total Paid by Customer
                                         </span>
-                                        <span className="text-2xl font-bold text-pink-500">{formatCurrency(totalAmount)}</span>
+                                        <span className="text-2xl font-bold text-mamba-green">{formatCurrency(totalAmount)}</span>
                                     </div>
                                     {payment?.currency && payment.currency !== order.currency && (
                                         <p className="text-xs text-gray-500 text-right mt-1">
@@ -546,7 +546,7 @@ export function OrderDetails({ order, onClose }: OrderDetailsProps) {
 
                     {/* Payment Summary Mini Cards */}
                     <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-                        <div className="bg-gradient-to-br from-pink-500/20 to-purple-500/20 p-4 rounded-xl border border-pink-500/30">
+                        <div className="bg-gradient-to-br from-mamba-green/20 to-purple-500/20 p-4 rounded-xl border border-mamba-green/30">
                             <p className="text-xs text-gray-400 uppercase">Subtotal</p>
                             <p className="text-lg font-bold text-white">{formatCurrency(originalProductPrice)}</p>
                         </div>
@@ -566,9 +566,9 @@ export function OrderDetails({ order, onClose }: OrderDetailsProps) {
                             <p className="text-xs text-gray-400 uppercase">Tax</p>
                             <p className="text-lg font-bold text-white">{formatCurrency(totalTax)}</p>
                         </div>
-                        <div className="bg-gradient-to-br from-purple-500/20 to-pink-500/20 p-4 rounded-xl border border-purple-500/30">
+                        <div className="bg-gradient-to-br from-purple-500/20 to-mamba-green/20 p-4 rounded-xl border border-purple-500/30">
                             <p className="text-xs text-gray-400 uppercase">Total</p>
-                            <p className="text-lg font-bold text-pink-400">{formatCurrency(totalAmount)}</p>
+                            <p className="text-lg font-bold text-mamba-neon">{formatCurrency(totalAmount)}</p>
                         </div>
                     </div>
                 </div>

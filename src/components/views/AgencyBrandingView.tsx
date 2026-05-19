@@ -11,7 +11,6 @@ import {
     CheckCircle2,
     Clock,
     History,
-    Store,
     LayoutDashboard,
     ShoppingBag,
     Package,
@@ -23,7 +22,10 @@ import {
 } from 'lucide-react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTenantContext } from '../../contexts/TenantContext';
-import { fetchBranding, patchBranding, uploadBrandingLogo, deleteBrandingLogo } from '../../lib/brandingApi';
+import { MAMBA_SNAKE_HEAD_SRC } from '../../lib/brandAssets';
+import { supabase } from '../../lib/supabase';
+import { useAuth } from '../../contexts/AuthContext';
+import { fetchBranding, patchBranding, uploadBrandingLogo, deleteBrandingLogo, type CustomPreset } from '../../lib/brandingApi';
 import { PLATFORM_BRANDING_FORM_THEME_ONLY } from '../../lib/platformBrandingDefaults';
 import { normalizeHex6, normalizeHexAlpha } from '../../lib/colorUtils';
 import { BrandColorPopover } from '../branding/BrandColorPopover';
@@ -209,16 +211,9 @@ function BrandPreviewCard({
                     {/* Brand header */}
                     <div className="px-4 py-4 border-b flex items-center gap-3" style={{ borderColor: sidebarBorderColor }}>
                         {logoUrl ? (
-                            <div className="w-9 h-9 rounded-xl border flex items-center justify-center shrink-0" style={{ backgroundColor: sidebarBgColor, borderColor: sidebarBorderColor }}>
-                                <img src={logoUrl} alt="" className="max-w-full max-h-full object-contain p-1" />
-                            </div>
+                            <img src={logoUrl} alt="" className="h-11 w-11 shrink-0 object-contain" />
                         ) : (
-                            <div
-                                className="w-9 h-9 rounded-xl shrink-0 flex items-center justify-center shadow-lg"
-                                style={{ background: 'linear-gradient(135deg, var(--brand-primary), var(--brand-secondary))' }}
-                            >
-                                <Store className="w-4 h-4" style={{ color: 'var(--brand-btn-text)' }} />
-                            </div>
+                            <img src={MAMBA_SNAKE_HEAD_SRC} alt="" className="h-11 w-11 shrink-0 object-contain" />
                         )}
                         <div className="min-w-0">
                             <p className="text-sm font-bold truncate leading-tight" style={{ color: textColor }}>{displayName || 'Your brand'}</p>
@@ -309,7 +304,8 @@ function BrandPreviewCard({
  * Includes live preview, save success feedback, and audit change history.
  */
 export function AgencyBrandingView({ onNavigate }: AgencyBrandingViewProps) {
-    const { agencyMemberships, isAgencyAdminOn } = useTenantContext();
+    const { agencyMemberships, isAgencyAdminOn, isPlatformSuperAdmin } = useTenantContext();
+    const { user, profile } = useAuth();
     const queryClient = useQueryClient();
     const logoFileRef = useRef<HTMLInputElement>(null);
     const saveSuccessTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -337,7 +333,27 @@ export function AgencyBrandingView({ onNavigate }: AgencyBrandingViewProps) {
     // Clean up the save-success dismiss timer on unmount
     useEffect(() => () => { if (saveSuccessTimerRef.current) clearTimeout(saveSuccessTimerRef.current); }, []);
 
-    const canEdit = selectedAgencyId ? isAgencyAdminOn(selectedAgencyId) : false;
+    const { data: myAgencyPermActions = [] } = useQuery({
+        queryKey: ['agency-branding-effective-perms', selectedAgencyId, user?.id],
+        queryFn: async () => {
+            if (!selectedAgencyId || !user?.id) return [];
+            const { data, error } = await supabase.rpc('get_my_effective_permissions_on_tenant', {
+                p_tenant_id: selectedAgencyId,
+            });
+            if (error) throw error;
+            return (data || [])
+                .map((row: { action?: string }) => row.action)
+                .filter((a: string | undefined): a is string => typeof a === 'string');
+        },
+        enabled: !!selectedAgencyId && !!user?.id,
+    });
+
+    const canEdit =
+        !!selectedAgencyId &&
+        (isAgencyAdminOn(selectedAgencyId) ||
+            isPlatformSuperAdmin ||
+            profile?.role === 'admin' ||
+            myAgencyPermActions.includes('edit_brand_settings'));
 
     const {
         data: branding,
@@ -355,7 +371,7 @@ export function AgencyBrandingView({ onNavigate }: AgencyBrandingViewProps) {
         setForm({
             displayName: branding.displayName,
             primaryColor: normalizeHexAlpha(branding.primaryColor),
-            secondaryColor: normalizeHexAlpha(branding.secondaryColor, '#6366f1'),
+            secondaryColor: normalizeHexAlpha(branding.secondaryColor, '#1FA97C'),
             bgColor: normalizeHexAlpha(branding.bgColor ?? P.bgColor),
             sidebarBgColor: normalizeHexAlpha(branding.sidebarBgColor ?? P.sidebarBgColor),
             sidebarBorderColor: normalizeHexAlpha(branding.sidebarBorderColor ?? P.sidebarBorderColor),
@@ -442,7 +458,7 @@ export function AgencyBrandingView({ onNavigate }: AgencyBrandingViewProps) {
                 agencyTenantId: selectedAgencyId,
                 displayName: form.displayName.trim() || null,
                 primaryColor: normalizeHexAlpha(form.primaryColor),
-                secondaryColor: normalizeHexAlpha(form.secondaryColor, '#6366f1'),
+                secondaryColor: normalizeHexAlpha(form.secondaryColor, '#1FA97C'),
                 bgColor: normalizeHexAlpha(form.bgColor),
                 sidebarBgColor: normalizeHexAlpha(form.sidebarBgColor),
                 sidebarBorderColor: normalizeHexAlpha(form.sidebarBorderColor),
@@ -553,12 +569,19 @@ export function AgencyBrandingView({ onNavigate }: AgencyBrandingViewProps) {
 
     const THEME_PRESETS = [
         {
-            /** Accent/surface preview chips — full semantic reset uses PLATFORM_BRANDING_FORM_THEME_ONLY in applyPreset. */
-            name: 'Platform Default',
-            primaryColor: '#ec4899', secondaryColor: '#6366f1',
-            bgColor: '#111827', sidebarBgColor: '#111827', sidebarBorderColor: '#1f2937',
-            cardBgColor: '#ffffff06', cardBorderColor: '#ffffff1a',
-            textColor: '#ffffff', textMutedColor: '#6b7280', btnTextColor: '#ffffff'
+            /** Full semantic reset via PLATFORM_BRANDING_FORM_THEME_ONLY in applyPreset. */
+            presetKey: 'platform_default' as const,
+            name: 'Mamba (Official)',
+            primaryColor: '#28D99E',
+            secondaryColor: '#1FA97C',
+            bgColor: '#06141A',
+            sidebarBgColor: '#0D1B21',
+            sidebarBorderColor: '#1F3A43',
+            cardBgColor: '#13262E',
+            cardBorderColor: '#1F3A43',
+            textColor: '#E6F3F1',
+            textMutedColor: '#8CAFB3',
+            btnTextColor: '#06141A',
         },
         {
             name: 'Midnight',
@@ -583,9 +606,9 @@ export function AgencyBrandingView({ onNavigate }: AgencyBrandingViewProps) {
         }
     ];
 
-    const applyPreset = (preset: typeof THEME_PRESETS[0]) => {
+    const applyPreset = (preset: (typeof THEME_PRESETS)[number] | CustomPreset) => {
         setForm(prev => {
-            if (preset.name === 'Platform Default') {
+            if ('presetKey' in preset && preset.presetKey === 'platform_default') {
                 return { ...prev, ...PLATFORM_BRANDING_FORM_THEME_ONLY };
             }
             return {
@@ -702,7 +725,7 @@ export function AgencyBrandingView({ onNavigate }: AgencyBrandingViewProps) {
 
     // Live preview values — track form changes without waiting for a save
     const previewPrimary = normalizeHexAlpha(form.primaryColor);
-    const previewSecondary = normalizeHexAlpha(form.secondaryColor, '#6366f1');
+    const previewSecondary = normalizeHexAlpha(form.secondaryColor, '#1FA97C');
     const previewBg = normalizeHexAlpha(form.bgColor);
     const previewSidebarBg = normalizeHexAlpha(form.sidebarBgColor);
     const previewSidebarBorder = normalizeHexAlpha(form.sidebarBorderColor);
@@ -782,19 +805,19 @@ export function AgencyBrandingView({ onNavigate }: AgencyBrandingViewProps) {
 
     return (
         <div className="w-full max-w-none space-y-10 animate-in fade-in duration-500 pb-12 relative">
-            <div className="absolute inset-x-0 top-0 h-64 bg-gradient-to-b from-pink-500/10 via-violet-500/5 to-transparent -z-10 rounded-full blur-[100px] opacity-60 pointer-events-none" />
+            <div className="absolute inset-x-0 top-0 h-64 bg-gradient-to-b from-mamba-green/10 via-mamba-deep/5 to-transparent -z-10 rounded-full blur-[100px] opacity-60 pointer-events-none" />
 
             {/* Page header */}
             <div className="relative z-10 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
                 <div>
-                    <h1 className="text-4xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-white via-pink-100 to-white flex items-center gap-4">
-                        <div className="p-2.5 bg-pink-500/10 rounded-2xl border border-pink-500/20 backdrop-blur-xl">
-                            <Palette className="w-8 h-8 text-pink-400 drop-shadow-lg" />
+                    <h1 className="text-4xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-white via-mamba-neon/90 to-white flex items-center gap-4">
+                        <div className="p-2.5 bg-mamba-green/10 rounded-2xl border border-mamba-green/20 backdrop-blur-xl">
+                            <Palette className="w-8 h-8 text-mamba-green drop-shadow-lg" />
                         </div>
                         Seller branding
                     </h1>
                     <p className="brand-muted opacity-90 mt-4 text-base max-w-2xl leading-relaxed">
-                        One brand package per <strong className="brand-text opacity-90">agency</strong> (not per shop). Only Agency Admins can save. The preview on the right updates live as you make changes.
+                        One brand package per <strong className="brand-text opacity-90">agency</strong> (not per shop). Saving requires the <strong className="brand-text opacity-90">Edit brand settings</strong> permission (Agency Admins have it by default). The preview on the right updates live as you make changes.
                     </p>
                 </div>
                 {onNavigate && (
@@ -813,7 +836,7 @@ export function AgencyBrandingView({ onNavigate }: AgencyBrandingViewProps) {
 
             {/* Agency selector */}
             <section className="bg-white/[0.02] border border-white/10 rounded-3xl p-6 backdrop-blur-sm relative overflow-hidden">
-                <div className="absolute inset-0 bg-gradient-to-br from-violet-500/5 to-transparent pointer-events-none" />
+                <div className="absolute inset-0 bg-gradient-to-br from-mamba-deep/5 to-transparent pointer-events-none" />
                 <div className="relative space-y-6">
                     <div className="brand-text font-bold text-lg flex items-center gap-3">
                         <div className="p-2 bg-gray-800 rounded-xl border border-white/5">
@@ -829,17 +852,17 @@ export function AgencyBrandingView({ onNavigate }: AgencyBrandingViewProps) {
                                 onClick={() => setSelectedAgencyId(m.tenant_id)}
                                 className={`px-5 py-3 rounded-2xl text-sm font-semibold transition-all border block text-left ${
                                     selectedAgencyId === m.tenant_id
-                                        ? 'bg-violet-500/20 border-violet-500/50 text-white shadow-violet-500/10'
-                                        : 'bg-gray-900/50 border-white/10 text-gray-300 hover:border-violet-500/30 hover:bg-violet-500/5'
+                                        ? 'bg-mamba-green/20 border-mamba-green/50 text-white shadow-lg shadow-black/20'
+                                        : 'bg-gray-900/50 border-white/10 text-gray-300 hover:border-mamba-green/30 hover:bg-mamba-green/5'
                                 }`}
                             >
                                 <div className="flex items-center justify-between gap-4">
                                     <span>{m.tenants?.name || 'Agency'}</span>
-                                    {selectedAgencyId === m.tenant_id && <Check className="w-4 h-4 text-violet-400" />}
+                                    {selectedAgencyId === m.tenant_id && <Check className="w-4 h-4 text-mamba-neon" />}
                                 </div>
                                 <span
                                     className={`block text-[11px] mt-1 ${
-                                        selectedAgencyId === m.tenant_id ? 'text-violet-300' : 'text-gray-500'
+                                        selectedAgencyId === m.tenant_id ? 'text-mamba-green' : 'text-gray-500'
                                     }`}
                                 >
                                     {m.roles?.name}
@@ -854,7 +877,7 @@ export function AgencyBrandingView({ onNavigate }: AgencyBrandingViewProps) {
             <div className="grid lg:grid-cols-2 gap-8 items-start">
                 {/* Settings panel */}
                 <section className="bg-white/[0.02] border border-white/10 rounded-3xl p-6 sm:p-8 backdrop-blur-sm relative overflow-hidden">
-                    <div className="absolute inset-0 bg-gradient-to-br from-pink-500/5 to-transparent pointer-events-none" />
+                    <div className="absolute inset-0 bg-gradient-to-br from-mamba-green/5 to-transparent pointer-events-none" />
                     <div className="relative space-y-6 max-w-full">
                         <div className="flex flex-wrap items-center justify-between gap-3">
                             <h2 className="text-lg font-bold brand-text">Appearance &amp; identity</h2>
@@ -916,18 +939,18 @@ export function AgencyBrandingView({ onNavigate }: AgencyBrandingViewProps) {
                                         {/* Display name */}
                                         <label className="block space-y-1.5">
                                             <span className="text-xs font-semibold brand-muted uppercase tracking-wide">Brand display name</span>
-                                            <input value={form.displayName} onChange={(e) => setForm((f) => ({ ...f, displayName: e.target.value }))} disabled={!canEdit} maxLength={120} className="w-full px-3 py-2.5 bg-gray-950/50 border border-white/10 rounded-xl text-sm brand-text focus:border-pink-500/50 focus:outline-none disabled:opacity-50" placeholder="Shown to sellers instead of Mamba" />
+                                            <input value={form.displayName} onChange={(e) => setForm((f) => ({ ...f, displayName: e.target.value }))} disabled={!canEdit} maxLength={120} className="w-full px-3 py-2.5 bg-gray-950/50 border border-white/10 rounded-xl text-sm brand-text focus:border-mamba-green/50 focus:outline-none disabled:opacity-50" placeholder="Shown to sellers instead of Mamba" />
                                         </label>
                                         
                                         {/* Email identity */}
                                         <div className="grid sm:grid-cols-2 gap-4">
                                             <label className="block space-y-1.5">
                                                 <span className="text-xs font-semibold brand-muted uppercase tracking-wide">Email sender name</span>
-                                                <input value={form.emailSenderName} onChange={(e) => setForm((f) => ({ ...f, emailSenderName: e.target.value }))} disabled={!canEdit} className="w-full px-3 py-2.5 bg-gray-950/50 border border-white/10 rounded-xl text-sm brand-text focus:border-pink-500/50 focus:outline-none disabled:opacity-50" placeholder="Optional" />
+                                                <input value={form.emailSenderName} onChange={(e) => setForm((f) => ({ ...f, emailSenderName: e.target.value }))} disabled={!canEdit} className="w-full px-3 py-2.5 bg-gray-950/50 border border-white/10 rounded-xl text-sm brand-text focus:border-mamba-green/50 focus:outline-none disabled:opacity-50" placeholder="Optional" />
                                             </label>
                                             <label className="block space-y-1.5">
                                                 <span className="text-xs font-semibold brand-muted uppercase tracking-wide">Email sender address</span>
-                                                <input value={form.emailSenderAddress} onChange={(e) => setForm((f) => ({ ...f, emailSenderAddress: e.target.value }))} disabled={!canEdit} type="email" className="w-full px-3 py-2.5 bg-gray-950/50 border border-white/10 rounded-xl text-sm brand-text focus:border-pink-500/50 focus:outline-none disabled:opacity-50" placeholder="Verified domain in production" />
+                                                <input value={form.emailSenderAddress} onChange={(e) => setForm((f) => ({ ...f, emailSenderAddress: e.target.value }))} disabled={!canEdit} type="email" className="w-full px-3 py-2.5 bg-gray-950/50 border border-white/10 rounded-xl text-sm brand-text focus:border-mamba-green/50 focus:outline-none disabled:opacity-50" placeholder="Verified domain in production" />
                                             </label>
                                         </div>
                                     </div>
@@ -955,7 +978,7 @@ export function AgencyBrandingView({ onNavigate }: AgencyBrandingViewProps) {
                                                 );
                                             })}
                                             {canEdit && (
-                                                <button type="button" onClick={handleSaveCustomPreset} className="px-3 py-1.5 rounded-lg border border-dashed border-white/20 hover:border-pink-500/50 hover:bg-pink-500/10 text-xs text-pink-300 font-semibold transition-colors flex items-center gap-1.5 ml-1">
+                                                <button type="button" onClick={handleSaveCustomPreset} className="px-3 py-1.5 rounded-lg border border-dashed border-white/20 hover:border-mamba-green/50 hover:bg-mamba-green/10 text-xs text-mamba-neon font-semibold transition-colors flex items-center gap-1.5 ml-1">
                                                     <Plus className="w-3 h-3" /> Save current
                                                 </button>
                                             )}
@@ -974,7 +997,7 @@ export function AgencyBrandingView({ onNavigate }: AgencyBrandingViewProps) {
                                                         onClick={() => setActiveColorTab(tab)}
                                                         className={`px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider rounded-md transition-colors ${
                                                             activeColorTab === tab
-                                                                ? 'bg-pink-500/20 text-pink-300 shadow-sm'
+                                                                ? 'bg-mamba-green/20 text-mamba-neon shadow-sm'
                                                                 : 'text-gray-500 hover:text-gray-300'
                                                         }`}
                                                     >
@@ -1039,7 +1062,7 @@ export function AgencyBrandingView({ onNavigate }: AgencyBrandingViewProps) {
 
                                 {!canEdit && (
                                     <p className="text-sm brand-muted border border-white/5 rounded-xl px-4 py-3 bg-gray-950/40">
-                                        Only <strong className="text-gray-300">Agency Admins</strong> can save changes for this organization. Other roles can review values here.
+                                        You need the <strong className="text-gray-300">Edit brand settings</strong> permission on this agency to save. You can still review values here.
                                     </p>
                                 )}
 
@@ -1057,7 +1080,7 @@ export function AgencyBrandingView({ onNavigate }: AgencyBrandingViewProps) {
                                             type="button"
                                             disabled={busy}
                                             onClick={handleSave}
-                                            className="inline-flex items-center gap-2 px-6 py-3 rounded-xl text-sm font-semibold bg-pink-600 hover:bg-pink-500 text-white disabled:opacity-50 transition-colors"
+                                            className="inline-flex items-center gap-2 px-6 py-3 rounded-xl text-sm font-semibold bg-mamba-green hover:bg-mamba-deep text-mamba-dark disabled:opacity-50 transition-colors"
                                         >
                                             {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
                                             Save branding

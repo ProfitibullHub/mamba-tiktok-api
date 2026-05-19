@@ -69,7 +69,7 @@ type DrillView = 'users' | 'stores' | 'agencies' | 'sellers' | 'memberships' | '
 const membershipColor = (m: Membership) => {
     if (m.role_name === 'Super Admin') return 'bg-amber-500/20 text-amber-300 border-amber-500/30';
     if (m.tenant_type === 'agency') return 'bg-violet-500/20 text-violet-300 border-violet-500/30';
-    return 'bg-pink-500/20 text-pink-300 border-pink-500/30';
+    return 'bg-mamba-green/20 text-mamba-neon border-mamba-green/30';
 };
 
 async function authHeaders() {
@@ -247,7 +247,7 @@ export function AdminDashboard({ onNavigateToTeamRoles }: { onNavigateToTeamRole
     if (statsLoading) {
         return (
             <div className="flex items-center justify-center h-64">
-                <div className="animate-spin rounded-full h-12 w-12 border-4 border-pink-500 border-t-transparent" />
+                <div className="animate-spin rounded-full h-12 w-12 border-4 border-mamba-green border-t-transparent" />
             </div>
         );
     }
@@ -255,7 +255,7 @@ export function AdminDashboard({ onNavigateToTeamRoles }: { onNavigateToTeamRole
     const allCards: { key: DrillView; label: string; value: number; icon: typeof Users; color: string; glow: string }[] = [
         { key: 'users', label: 'Total Users', value: stats?.totalUsers ?? 0, icon: Users, color: 'text-blue-400', glow: 'from-blue-500/20' },
         { key: 'agencies', label: 'Agencies', value: stats?.agencies ?? 0, icon: Building2, color: 'text-violet-400', glow: 'from-violet-500/20' },
-        { key: 'sellers', label: 'Seller Tenants', value: stats?.sellers ?? 0, icon: Store, color: 'text-pink-400', glow: 'from-pink-500/20' },
+        { key: 'sellers', label: 'Seller Tenants', value: stats?.sellers ?? 0, icon: Store, color: 'text-mamba-neon', glow: 'from-mamba-green/20' },
         { key: 'stores', label: 'Connected Shops', value: stats?.totalStores ?? 0, icon: ShoppingBag, color: 'text-emerald-400', glow: 'from-emerald-500/20' },
         { key: 'memberships', label: 'Active Memberships', value: stats?.totalMemberships ?? 0, icon: Shield, color: 'text-cyan-400', glow: 'from-cyan-500/20' },
         { key: 'superadmins', label: 'Super Admins', value: stats?.superAdminCount ?? 0, icon: Crown, color: 'text-amber-400', glow: 'from-amber-500/20' },
@@ -266,8 +266,8 @@ export function AdminDashboard({ onNavigateToTeamRoles }: { onNavigateToTeamRole
         'Agency Admin': 'bg-violet-500/20 text-violet-300 border-violet-500/30',
         'Account Manager': 'bg-violet-500/15 text-violet-300/80 border-violet-500/20',
         'Account Coordinator': 'bg-violet-500/10 text-violet-300/70 border-violet-500/15',
-        'Seller Admin': 'bg-pink-500/20 text-pink-300 border-pink-500/30',
-        'Seller User': 'bg-pink-500/10 text-pink-300/70 border-pink-500/15',
+        'Seller Admin': 'bg-mamba-green/20 text-mamba-neon border-mamba-green/30',
+        'Seller User': 'bg-mamba-green/10 text-mamba-neon/70 border-mamba-green/15',
     };
 
     const drillLabels: Record<DrillView, string> = {
@@ -293,12 +293,12 @@ export function AdminDashboard({ onNavigateToTeamRoles }: { onNavigateToTeamRole
 
     return (
         <div className="w-full max-w-none space-y-8 animate-in fade-in duration-500 relative">
-            <div className="absolute inset-x-0 top-0 h-64 bg-gradient-to-b from-fuchsia-500/10 via-pink-500/5 to-transparent -z-10 rounded-full blur-[100px] opacity-50 pointer-events-none" />
+            <div className="absolute inset-x-0 top-0 h-64 bg-gradient-to-b from-mamba-green/10 via-mamba-green/5 to-transparent -z-10 rounded-full blur-[100px] opacity-50 pointer-events-none" />
 
             <div>
-                <h1 className="text-4xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-white via-pink-100 to-white flex items-center gap-4">
-                    <div className="p-2.5 bg-pink-500/10 rounded-2xl border border-pink-500/20 backdrop-blur-xl">
-                        <BarChart3 className="w-8 h-8 text-pink-400 drop-shadow-lg" />
+                <h1 className="text-4xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-white via-mamba-text to-white flex items-center gap-4">
+                    <div className="p-2.5 bg-mamba-green/10 rounded-2xl border border-mamba-green/20 backdrop-blur-xl">
+                        <BarChart3 className="w-8 h-8 text-mamba-neon drop-shadow-lg" />
                     </div>
                     Admin Dashboard
                 </h1>
@@ -375,7 +375,7 @@ export function AdminDashboard({ onNavigateToTeamRoles }: { onNavigateToTeamRole
                             <button
                                 onClick={() => syncProfilesMutation.mutate()}
                                 disabled={syncProfilesMutation.isPending}
-                                className="flex items-center gap-2 px-4 py-2 text-sm font-semibold rounded-xl bg-gradient-to-r from-pink-500 to-rose-500 text-white shadow-lg shadow-pink-500/20 hover:shadow-pink-500/40 transition-all disabled:opacity-50"
+                                className="flex items-center gap-2 px-4 py-2 text-sm font-semibold rounded-xl bg-gradient-to-r from-mamba-green to-mamba-deep text-mamba-dark shadow-lg shadow-mamba-green/20 hover:shadow-mamba-green/40 transition-all disabled:opacity-50"
                             >
                                 <RefreshCw className={`w-4 h-4 ${syncProfilesMutation.isPending ? 'animate-spin' : ''}`} />
                                 Sync
@@ -391,7 +391,7 @@ export function AdminDashboard({ onNavigateToTeamRoles }: { onNavigateToTeamRole
                         value={search}
                         onChange={(e) => setSearch(e.target.value)}
                         placeholder="Search…"
-                        className="w-full pl-11 pr-4 py-3 bg-gray-950/80 border border-white/10 rounded-2xl text-white text-sm placeholder-gray-600 shadow-inner focus:outline-none focus:ring-2 focus:ring-pink-500/30 focus:border-pink-500/40 transition-all"
+                        className="w-full pl-11 pr-4 py-3 bg-gray-950/80 border border-white/10 rounded-2xl text-white text-sm placeholder-gray-600 shadow-inner focus:outline-none focus:ring-2 focus:ring-mamba-green/30 focus:border-mamba-green/40 transition-all"
                     />
                 </div>
 
@@ -403,7 +403,7 @@ export function AdminDashboard({ onNavigateToTeamRoles }: { onNavigateToTeamRole
 
                 {isLoading ? (
                     <div className="flex items-center justify-center h-40">
-                        <div className="animate-spin rounded-full h-8 w-8 border-3 border-pink-500 border-t-transparent" />
+                        <div className="animate-spin rounded-full h-8 w-8 border-3 border-mamba-green border-t-transparent" />
                     </div>
                 ) : (
                     <>
@@ -621,7 +621,7 @@ function UsersTable({ users, search, tenantOptions }: { users: AdminUser[]; sear
                             <tr key={user.id} className="hover:bg-white/[0.03] transition-colors group">
                                 <td className="px-6 py-4">
                                     <div className="flex items-center gap-3">
-                                        <div className="w-10 h-10 rounded-full bg-gradient-to-br from-pink-500/30 to-violet-500/30 border border-white/10 flex items-center justify-center text-sm font-bold text-white shrink-0">
+                                        <div className="w-10 h-10 rounded-full bg-gradient-to-br from-mamba-green/30 to-violet-500/30 border border-white/10 flex items-center justify-center text-sm font-bold text-white shrink-0">
                                             {(user.full_name || user.email)?.[0]?.toUpperCase() ?? '?'}
                                         </div>
                                         <div className="min-w-0">
@@ -1094,7 +1094,7 @@ function TenantsTable({
                                         <div className={`w-10 h-10 rounded-full border border-white/10 flex items-center justify-center text-sm font-bold text-white shrink-0 ${
                                             t.type === 'agency'
                                                 ? 'bg-gradient-to-br from-violet-500/30 to-indigo-500/30'
-                                                : 'bg-gradient-to-br from-pink-500/30 to-rose-500/30'
+                                                : 'bg-gradient-to-br from-mamba-green/30 to-mamba-deep/30'
                                         }`}>
                                             {t.name?.[0]?.toUpperCase() ?? '?'}
                                         </div>
@@ -1103,7 +1103,7 @@ function TenantsTable({
                                             <span className={`inline-flex text-[10px] font-bold px-2 py-0.5 rounded-md border mt-0.5 ${
                                                 t.type === 'agency'
                                                     ? 'bg-violet-500/15 text-violet-300 border-violet-500/25'
-                                                    : 'bg-pink-500/15 text-pink-300 border-pink-500/25'
+                                                    : 'bg-mamba-green/15 text-mamba-neon border-mamba-green/25'
                                             }`}>
                                                 {t.type}
                                             </span>
@@ -1404,13 +1404,13 @@ function MembershipsTable({ memberships, search }: { memberships: MembershipRow[
     const roleColor = (name: string) => {
         if (name === 'Super Admin') return 'bg-amber-500/20 text-amber-300 border-amber-500/30';
         if (name === 'Agency Admin' || name === 'Account Manager' || name === 'Account Coordinator') return 'bg-violet-500/20 text-violet-300 border-violet-500/30';
-        return 'bg-pink-500/20 text-pink-300 border-pink-500/30';
+        return 'bg-mamba-green/20 text-mamba-neon border-mamba-green/30';
     };
 
     const tenantBadge = (type: string) => {
         if (type === 'agency') return 'bg-violet-500/10 text-violet-300 border-violet-500/20';
         if (type === 'platform') return 'bg-amber-500/10 text-amber-300 border-amber-500/20';
-        return 'bg-pink-500/10 text-pink-300 border-pink-500/20';
+        return 'bg-mamba-green/10 text-mamba-neon border-mamba-green/20';
     };
 
     return (
@@ -1484,7 +1484,7 @@ function StoresTable({
         <div className="space-y-3">
             <p className="text-xs text-gray-500 leading-relaxed px-1">
                 <span className="text-gray-400 font-semibold">Orders, revenue &amp; net</span> are{' '}
-                <span className="text-pink-300/90">today in each shop&apos;s timezone</span> (paid orders and settlements synced to your database).{' '}
+                <span className="text-mamba-neon/90">today in each shop&apos;s timezone</span> (paid orders and settlements synced to your database).{' '}
                 Two database queries for all shops — no TikTok API calls for this table.
                 {metricsWindow?.description ? ` ${metricsWindow.description}` : ''}
             </p>
@@ -1528,7 +1528,7 @@ function StoresTable({
                                     <span className={`inline-flex items-center gap-1.5 text-[11px] font-bold px-2.5 py-1 rounded-lg border ${
                                         account.tenant_type === 'agency'
                                             ? 'bg-violet-500/15 text-violet-300 border-violet-500/25'
-                                            : 'bg-pink-500/15 text-pink-300 border-pink-500/25'
+                                            : 'bg-mamba-green/15 text-mamba-neon border-mamba-green/25'
                                     }`}>
                                         <Building2 className="w-3 h-3" />
                                         {account.tenant_name}
@@ -1541,14 +1541,14 @@ function StoresTable({
                                 <div className="flex flex-col gap-1">
                                     {account.stores.slice(0, 2).map((store: any) => (
                                         <div key={store.id} className="flex items-center gap-2">
-                                            <Store className="w-3 h-3 text-pink-400" />
+                                            <Store className="w-3 h-3 text-mamba-neon" />
                                             <span className="text-xs text-gray-300 truncate max-w-[200px]">{store.shop_name}</span>
                                         </div>
                                     ))}
                                     {account.stores.length > 2 && (
                                         <button
                                             onClick={() => onShowAllStores(account)}
-                                            className="text-[10px] text-pink-400 hover:text-pink-300 font-medium flex items-center gap-0.5 mt-1"
+                                            className="text-[10px] text-mamba-neon hover:text-mamba-neon font-medium flex items-center gap-0.5 mt-1"
                                         >
                                             Show all {account.stores.length} stores
                                             <ChevronRight className="w-3 h-3" />
@@ -1612,8 +1612,8 @@ function AllStoresModal({ account, onClose, onShowPL }: { account: any; onClose:
                             <div key={store.id} className="bg-white/[0.02] border border-white/10 p-4 rounded-2xl flex flex-col gap-3">
                                 <div className="flex items-center justify-between">
                                     <div className="flex items-center gap-3">
-                                        <div className="bg-pink-500/10 p-2 rounded-xl border border-pink-500/20">
-                                            <Store className="w-4 h-4 text-pink-400" />
+                                        <div className="bg-mamba-green/10 p-2 rounded-xl border border-mamba-green/20">
+                                            <Store className="w-4 h-4 text-mamba-neon" />
                                         </div>
                                         <div>
                                             <p className="text-sm font-bold text-white">{store.shop_name}</p>
@@ -1686,7 +1686,7 @@ function PLBreakdownModal({ shop, onClose }: { shop: any; onClose: () => void })
                 <div className="p-6">
                     {isLoading ? (
                         <div className="flex items-center justify-center py-12">
-                            <div className="animate-spin rounded-full h-8 w-8 border-2 border-pink-500 border-t-transparent" />
+                            <div className="animate-spin rounded-full h-8 w-8 border-2 border-mamba-green border-t-transparent" />
                         </div>
                     ) : plData ? (
                         <div className="space-y-6">

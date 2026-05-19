@@ -6,6 +6,7 @@ import { apiFetch } from '../../lib/apiClient';
 import { queryClient } from '../../queryClient';
 import { removeStaleAccessQueries } from '../../lib/invalidateAccessQueries';
 import { useConsoleNotificationStore } from '../../store/useConsoleNotificationStore';
+import { MAMBA_FULL_LOGO_SRC } from '../../lib/brandAssets';
 
 type InvType = 'membership' | 'seller-link';
 
@@ -162,14 +163,16 @@ export function AcceptInvitationView() {
             <div className="w-full max-w-md">
                 {/* Header */}
                 <div className="text-center mb-8">
-                    <div className="text-3xl font-black bg-gradient-to-r from-violet-400 to-pink-400 bg-clip-text text-transparent tracking-tight mb-1">
-                        Mamba
-                    </div>
+                    <img
+                        src={MAMBA_FULL_LOGO_SRC}
+                        alt="Mamba"
+                        className="h-16 w-auto max-w-[280px] mx-auto object-contain mb-2"
+                    />
                     <p className="text-gray-400 text-sm">Team invitation</p>
                 </div>
 
                 <div className="bg-white/[0.03] border border-white/10 rounded-3xl p-8 backdrop-blur-sm relative overflow-hidden shadow-2xl">
-                    <div className="absolute inset-0 bg-gradient-to-br from-violet-500/5 to-pink-500/5 pointer-events-none" />
+                    <div className="absolute inset-0 bg-gradient-to-br from-violet-500/5 to-mamba-green/5 pointer-events-none" />
                     <div className="relative">
 
                         {/* LOADING */}
@@ -229,7 +232,7 @@ export function AcceptInvitationView() {
                                     <button
                                         type="button"
                                         onClick={handleAccept}
-                                        className="py-3 rounded-xl font-bold bg-gradient-to-r from-violet-600 to-pink-600 hover:from-violet-500 hover:to-pink-500 text-white text-sm transition-all hover:shadow-lg hover:shadow-violet-500/20"
+                                        className="py-3 rounded-xl font-bold bg-gradient-to-r from-violet-600 to-mamba-green hover:from-violet-500 hover:to-mamba-green text-white text-sm transition-all hover:shadow-lg hover:shadow-violet-500/20"
                                     >
                                         Accept
                                     </button>
@@ -290,7 +293,7 @@ export function AcceptInvitationView() {
                                     type="button"
                                     disabled={authBusy || !email || !password}
                                     onClick={handleLogin}
-                                    className="w-full py-3 rounded-xl font-bold bg-gradient-to-r from-violet-600 to-pink-600 hover:from-violet-500 hover:to-pink-500 text-white text-sm disabled:opacity-50 transition-all"
+                                    className="w-full py-3 rounded-xl font-bold bg-gradient-to-r from-violet-600 to-mamba-green hover:from-violet-500 hover:to-mamba-green text-white text-sm disabled:opacity-50 transition-all"
                                 >
                                     {authBusy ? <Loader2 className="w-4 h-4 animate-spin inline mr-2" /> : null}
                                     {authStep === 'login' ? 'Sign In & Continue' : 'Create Account & Continue'}
@@ -332,7 +335,7 @@ export function AcceptInvitationView() {
                                 <button
                                     type="button"
                                     onClick={() => navigate('/', { replace: true })}
-                                    className="mt-2 px-6 py-2.5 rounded-xl font-bold bg-gradient-to-r from-violet-600 to-pink-600 text-white text-sm hover:from-violet-500 hover:to-pink-500 transition-all"
+                                    className="mt-2 px-6 py-2.5 rounded-xl font-bold bg-gradient-to-r from-violet-600 to-mamba-green text-white text-sm hover:from-violet-500 hover:to-mamba-green transition-all"
                                 >
                                     Go to Dashboard now
                                 </button>

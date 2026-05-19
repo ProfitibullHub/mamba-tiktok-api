@@ -46,7 +46,7 @@ export function TikTokAdsCallback() {
             <div className="bg-gray-800/50 backdrop-blur-sm border border-gray-700 rounded-2xl p-10 max-w-md w-full text-center">
                 {status === 'loading' && (
                     <>
-                        <Loader className="w-16 h-16 text-pink-500 mx-auto mb-6 animate-spin" />
+                        <Loader className="w-16 h-16 text-mamba-green mx-auto mb-6 animate-spin" />
                         <h2 className="text-2xl font-bold text-white mb-3">
                             Connecting TikTok Ads...
                         </h2>

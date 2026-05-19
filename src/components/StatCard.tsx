@@ -37,7 +37,7 @@ export function StatCard({ title, value, subValue, change, icon: Icon, iconColor
         <button
           onClick={handleSyncClick}
           disabled={isSyncing}
-          className="absolute top-3 right-3 p-2 rounded-lg bg-gray-700/80 hover:bg-pink-500/20 text-gray-400 hover:text-pink-400 transition-all disabled:opacity-50"
+          className="absolute top-3 right-3 p-2 rounded-lg bg-gray-700/80 hover:bg-mamba-green/20 text-gray-400 hover:text-mamba-neon transition-all disabled:opacity-50"
           title="Sync this data"
         >
           <RefreshCw className={`w-4 h-4 ${isSyncing ? 'animate-spin' : ''}`} />

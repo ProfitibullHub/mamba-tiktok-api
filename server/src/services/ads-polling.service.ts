@@ -126,10 +126,6 @@ export async function pollAdvertiserMetrics(
     const daysBack = range === 'today' ? 2 : 7;
     const { startDate, endDate } = getDateRange(daysBack);
 
-    console.log(
-        `[Ads Poll] Polling advertiser ${advertiser.advertiser_id} (${advertiser.account_id}) for ${startDate} → ${endDate}`,
-    );
-
     try {
         // Fetch shops for GMV Max
         const { data: shops } = await supabase
@@ -191,7 +187,9 @@ export async function pollAdvertiserMetrics(
         ]);
 
         if (isRevoked) {
-            console.warn(`[Ads Poll] Token revoked for advertiser ${advertiser.advertiser_id}. Auto-deactivating in database.`);
+            console.error(
+                `[Ads Poll] Token revoked for advertiser ${advertiser.advertiser_id}. Auto-deactivating in database.`,
+            );
             logSystemEvent({
                 level: 'error',
                 scope: 'ads',
@@ -330,10 +328,6 @@ export async function pollAdvertiserMetrics(
             .update({ last_synced_at: new Date().toISOString() })
             .eq('id', advertiser.id);
 
-        console.log(
-            `[Ads Poll] ✅ Upserted ${spendRecords.length} rows for advertiser ${advertiser.advertiser_id}`,
-        );
-
         return {
             success: true,
             advertiser_id: advertiser.advertiser_id,
@@ -371,11 +365,8 @@ export async function pollAllAdvertisers(range: PollRange = 'today'): Promise<{
         .eq('is_active', true);
 
     if (error || !advertisers || advertisers.length === 0) {
-        console.log('[Ads Poll] No active advertisers found to poll.');
         return { total: 0, succeeded: 0, failed: 0, results: [] };
     }
-
-    console.log(`[Ads Poll] Polling ${advertisers.length} active advertiser(s), range=${range}`);
 
     // Run with max 5 concurrent requests to avoid overloading the TikTok API
     const CONCURRENCY = 5;
@@ -393,8 +384,6 @@ export async function pollAllAdvertisers(range: PollRange = 'today'): Promise<{
     const failed = results.filter((r) => !r.success).length;
 
     await Promise.all(results.map((r) => recordAdsPollActivity(range, r)));
-
-    console.log(`[Ads Poll] Done. ${succeeded} succeeded, ${failed} failed.`);
 
     return {
         total: results.length,

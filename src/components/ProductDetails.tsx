@@ -301,7 +301,7 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate, rea
                         <button
                             type="button"
                             onClick={() => setShowEditModal(true)}
-                            className="flex items-center gap-2 px-4 py-2 bg-pink-600 hover:bg-pink-700 text-white rounded-lg transition-colors"
+                            className="flex items-center gap-2 px-4 py-2 bg-mamba-green hover:bg-mamba-deep text-mamba-dark rounded-lg transition-colors"
                         >
                             <Settings size={18} />
                             Edit Product
@@ -346,7 +346,7 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate, rea
                             </div>
                             <h1 className="text-2xl font-bold text-white mb-4">{product.name}</h1>
                             <div className="flex items-baseline gap-2">
-                                <span className="text-3xl font-bold text-pink-500">{product.currency} {product.price}</span>
+                                <span className="text-3xl font-bold text-mamba-green">{product.currency} {product.price}</span>
                             </div>
                         </div>
 
@@ -380,7 +380,7 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate, rea
                         {/* Performance Metrics */}
                         <div className="space-y-4">
                             <h3 className="text-lg font-semibold text-white flex items-center gap-2">
-                                <BarChart2 className="text-pink-500" size={20} />
+                                <BarChart2 className="text-mamba-green" size={20} />
                                 Performance (Last 30 Days)
                             </h3>
                             <div className="grid grid-cols-3 gap-4">
@@ -585,16 +585,16 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate, rea
                                             onClick={() => handleFulfillmentChange('fbt')}
                                             disabled={readOnly || isSavingFulfillment}
                                             className={`p-3 rounded-lg border-2 transition-all flex flex-col items-center gap-1 ${fulfillmentType === 'fbt'
-                                                ? 'border-pink-500 bg-pink-500/10'
+                                                ? 'border-mamba-green bg-mamba-green/10'
                                                 : 'border-gray-600 hover:border-gray-500 bg-gray-900'
                                                 } ${readOnly ? 'opacity-80 cursor-default' : ''}`}
                                         >
-                                            <span className={`text-sm font-medium ${fulfillmentType === 'fbt' ? 'text-pink-400' : 'text-white'}`}>
+                                            <span className={`text-sm font-medium ${fulfillmentType === 'fbt' ? 'text-mamba-neon' : 'text-white'}`}>
                                                 FBT
                                             </span>
                                             <span className="text-xs text-gray-400">Fulfilled by TikTok</span>
                                             {fulfillmentType === 'fbt' && (
-                                                <Check size={14} className="text-pink-400 mt-1" />
+                                                <Check size={14} className="text-mamba-neon mt-1" />
                                             )}
                                         </button>
                                         <button
@@ -625,8 +625,8 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate, rea
 
                                 {/* FBT Info or Self-Fulfilled Cost Entry */}
                                 {fulfillmentType === 'fbt' ? (
-                                    <div className="bg-pink-500/10 border border-pink-500/30 rounded-lg p-3">
-                                        <p className="text-pink-300 text-sm">
+                                    <div className="bg-mamba-green/10 border border-mamba-green/30 rounded-lg p-3">
+                                        <p className="text-mamba-neon text-sm">
                                             Shipping handled by TikTok. Fulfillment fees are automatically deducted from settlements.
                                         </p>
                                     </div>
@@ -771,7 +771,7 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate, rea
                                     {needsReadMore && (
                                         <button
                                             onClick={() => setShowFullDescription(!showFullDescription)}
-                                            className="mt-3 text-pink-500 hover:text-pink-400 text-sm font-medium transition-colors"
+                                            className="mt-3 text-mamba-green hover:text-mamba-neon text-sm font-medium transition-colors"
                                         >
                                             {showFullDescription ? 'Show Less' : 'Read More'}
                                         </button>
@@ -818,7 +818,7 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate, rea
                                                         <div className="flex flex-wrap gap-4 text-sm">
                                                             <div>
                                                                 <span className="text-gray-400">Price: </span>
-                                                                <span className="text-pink-500 font-semibold">
+                                                                <span className="text-mamba-green font-semibold">
                                                                     {sku.price?.currency || product.currency} {skuPrice.toFixed(2)}
                                                                 </span>
                                                             </div>
@@ -970,7 +970,7 @@ export function ProductDetails({ product, accountId, onClose, onCostsUpdate, rea
 
                         <div className="space-y-4">
                             <h3 className="text-lg font-semibold text-white flex items-center gap-2">
-                                <Layers className="text-pink-500" size={20} />
+                                <Layers className="text-mamba-green" size={20} />
                                 Specifications
                             </h3>
                             <div className="bg-gray-800 rounded-xl p-4 border border-gray-700 space-y-3">

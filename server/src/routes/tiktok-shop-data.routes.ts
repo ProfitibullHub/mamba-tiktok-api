@@ -24,8 +24,40 @@ import {
 import { requireTikTokShopEntitlementParam } from '../middleware/tiktok-entitlement-param.middleware.js';
 import { requireIngestionJobReadAccess } from '../middleware/ingestion-job-access.middleware.js';
 import { auditLog } from '../services/audit-logger.js';
+import { classifyMonitoringAuditPrdCategory, monitoringAuditRowIncluded } from '../lib/monitoring-audit-categories.js';
+import { sanitizeShopSyncResultForAudit, tenantIdForAccount } from '../lib/ingestion-audit-helpers.js';
 
 const router = Router();
+
+/** Keyset cursor for descending (paid_time, order_id): always RFC3339 Zulu + order_id — avoids "+" timestamps in filters. */
+function formatShopOrdersKeysetCursor(paidTimeRaw: string | Date | null | undefined, orderId: string): string | null {
+    if (paidTimeRaw == null || !orderId) return null;
+    const iso =
+        typeof paidTimeRaw === 'string'
+            ? new Date(paidTimeRaw).toISOString()
+            : paidTimeRaw instanceof Date && !Number.isNaN(paidTimeRaw.getTime())
+              ? paidTimeRaw.toISOString()
+              : new Date(String(paidTimeRaw)).toISOString();
+    return `${iso}|${orderId}`;
+}
+
+/** Parse legacy (raw ISO)|id or millis|id cursors. */
+function parseShopOrdersKeysetCursor(cursor: string): { paidIsoUtc: string; orderId: string } {
+    const pipe = cursor.indexOf('|');
+    if (pipe < 1 || pipe === cursor.length - 1) {
+        throw new Error('Invalid orders cursor');
+    }
+    const left = cursor.slice(0, pipe);
+    const orderId = cursor.slice(pipe + 1);
+    let ms: number;
+    if (/^\d{12,}$/.test(left)) {
+        ms = Number(left);
+    } else {
+        ms = new Date(left).getTime();
+    }
+    if (!Number.isFinite(ms)) throw new Error('Invalid cursor paid_time');
+    return { paidIsoUtc: new Date(ms).toISOString(), orderId };
+}
 
 router.use(enforceRequestAccountAccess);
 router.param('accountId', verifyAccountIdParam);
@@ -753,7 +785,12 @@ router.get('/shop-data/:accountId', async (req: Request, res: Response) => {
     try {
         const { accountId } = req.params;
         const { shopId, startDate, endDate } = req.query;
-        const INITIAL_ORDER_BATCH = 1000; // First batch size (Supabase single-query max)
+
+        const ORDER_ROWS_SELECT =
+            'order_id, order_status, total_amount, currency, create_time, update_time, paid_time, is_fbt, fulfillment_type, line_items, buyer_info, payment_info, fbt_fulfillment_fee, warehouse_id, payment_method_name, delivery_option_name, shipping_type, shipping_info, is_sample_order, cancel_reason, cancellation_initiator, seller_note, delivery_type, collection_time, shipping_due_time, is_cod, is_exchange_order, is_on_hold_order, is_replacement_order, tracking_number, shipping_provider, shipping_provider_id';
+
+        const SETTLEMENT_ROWS_SELECT =
+            'settlement_id, shop_id, order_id, settlement_time, settlement_data, transaction_summary';
 
         // 1. Single shop lookup (reused for everything)
         let shopQuery = supabase
@@ -800,59 +837,102 @@ router.get('/shop-data/:accountId', async (req: Request, res: Response) => {
             // Convert to ISO timestamp strings for PostgreSQL
             startTs = new Date(startUnix * 1000).toISOString();
             endTs = new Date(endUnix * 1000).toISOString();
-            console.log(`[Shop Data] Date range: ${startDate} to ${endDate} (${shopTimezone})`);
         } else {
             // Default to last 30 days
             const now = new Date();
             const thirtyDaysAgo = new Date(now.getTime() - (30 * 86400 * 1000));
             startTs = thirtyDaysAgo.toISOString();
             endTs = now.toISOString();
-            console.log(`[Shop Data] Using default 30-day range`);
         }
 
-        // 2. Run ALL queries in parallel with date filtering
-        const [ordersResult, orderCountResult, productsResult, settlementsResult] = await Promise.all([
-            // First batch of orders (1000, newest first) - FILTERED BY DATE RANGE
-            // FILTER BY PAID_TIME: Only include orders that have been paid (paid_time IS NOT NULL)
+        // Wide calendar ranges (e.g. current + previous period for trends) make `COUNT(*)` scan the
+        // entire window and often hit Postgres statement_timeout alongside the other parallel queries.
+        // Skip exact count — the client already supports progressive pagination with `totalOrders: null`.
+        const ORDER_COUNT_SKIP_THRESHOLD_DAYS = Number(process.env.SHOP_DATA_SKIP_ORDER_COUNT_AFTER_DAYS || '35');
+        const inclusiveDaySpan = (a: string, b: string): number => {
+            const s = Date.parse(`${a}T00:00:00.000Z`);
+            const e = Date.parse(`${b}T00:00:00.000Z`);
+            if (!Number.isFinite(s) || !Number.isFinite(e)) return ORDER_COUNT_SKIP_THRESHOLD_DAYS + 1;
+            return Math.floor((e - s) / 86400000) + 1;
+        };
+        const skipExactOrderCount =
+            Boolean(startDate && endDate) &&
+            inclusiveDaySpan(startDate as string, endDate as string) > ORDER_COUNT_SKIP_THRESHOLD_DAYS;
+
+        if (skipExactOrderCount) {
+            console.log(
+                `[Shop Data] Skipping exact order count (range > ${ORDER_COUNT_SKIP_THRESHOLD_DAYS} days) — using progressive load without total.`,
+            );
+        }
+
+        /** Wide ranges run queries sequentially and use a smaller first page to avoid stacking heavy statements behind one statement_timeout. */
+        const initialOrderBatch = skipExactOrderCount
+            ? Math.min(Math.max(Number.parseInt(process.env.SHOP_DATA_WIDE_RANGE_INITIAL_ORDERS || '500', 10) || 500, 1), 1000)
+            : 1000;
+
+        const fetchOrdersChunk = () =>
             supabase
                 .from('shop_orders')
-                .select('order_id, order_status, total_amount, currency, create_time, update_time, paid_time, is_fbt, fulfillment_type, line_items, buyer_info, payment_info, fbt_fulfillment_fee, warehouse_id, payment_method_name, delivery_option_name, shipping_type, shipping_info, is_sample_order, cancel_reason, cancellation_initiator, seller_note, delivery_type, collection_time, shipping_due_time, is_cod, is_exchange_order, is_on_hold_order, is_replacement_order, tracking_number, shipping_provider, shipping_provider_id')
+                .select(ORDER_ROWS_SELECT)
                 .in('shop_id', internalShopIds)
-                .not('paid_time', 'is', null) // Exclude UNPAID orders
-                .gte('paid_time', startTs) // Date range filter by PAID TIME
+                .not('paid_time', 'is', null)
+                .gte('paid_time', startTs)
                 .lt('paid_time', endTs)
-                .order('paid_time', { ascending: false }) // Sort by payment time
-                .order('order_id', { ascending: false }) // Secondary sort
-                .limit(INITIAL_ORDER_BATCH),
+                .order('paid_time', { ascending: false })
+                .order('order_id', { ascending: false })
+                .limit(initialOrderBatch);
 
-            // Exact total count (lightweight HEAD request) - only PAID orders in date range
-            supabase
-                .from('shop_orders')
-                .select('order_id', { count: 'exact', head: true })
-                .in('shop_id', internalShopIds)
-                .not('paid_time', 'is', null) // Exclude UNPAID orders from count
-                .gte('paid_time', startTs) // Date range filter by PAID TIME
-                .lt('paid_time', endTs),
-
-            // All products
+        const fetchProducts = () =>
             supabase
                 .from('shop_products')
                 .select('product_id, product_name, status, price, stock, sales_count, main_image_url, images, gmv, orders_count, click_through_rate, cogs, shipping_cost, is_fbt, fbt_source, details')
-                .in('shop_id', internalShopIds),
+                .in('shop_id', internalShopIds);
 
-            // All settlements in date range
+        const fetchSettlements = () =>
             supabase
                 .from('shop_settlements')
-                .select('*')
+                .select(SETTLEMENT_ROWS_SELECT)
                 .in('shop_id', internalShopIds)
-                .gte('settlement_time', startTs) // Date range filter
+                .gte('settlement_time', startTs)
                 .lt('settlement_time', endTs)
-                .order('settlement_time', { ascending: false })
-        ]);
+                .order('settlement_time', { ascending: false });
 
-        if (ordersResult.error) throw ordersResult.error;
-        if (productsResult.error) throw productsResult.error;
-        if (settlementsResult.error) throw settlementsResult.error;
+        const orderCountPromise = skipExactOrderCount
+            ? Promise.resolve({ count: null as number | null, error: null })
+            : supabase
+                  .from('shop_orders')
+                  .select('order_id', { count: 'exact', head: true })
+                  .in('shop_id', internalShopIds)
+                  .not('paid_time', 'is', null)
+                  .gte('paid_time', startTs)
+                  .lt('paid_time', endTs);
+
+        let ordersResult;
+        let orderCountResult;
+        let productsResult;
+        let settlementsResult;
+
+        if (skipExactOrderCount) {
+            orderCountResult = { count: null as number | null, error: null };
+            ordersResult = await fetchOrdersChunk();
+            if (ordersResult.error) throw ordersResult.error;
+
+            productsResult = await fetchProducts();
+            if (productsResult.error) throw productsResult.error;
+
+            settlementsResult = await fetchSettlements();
+            if (settlementsResult.error) throw settlementsResult.error;
+        } else {
+            [ordersResult, orderCountResult, productsResult, settlementsResult] = await Promise.all([
+                fetchOrdersChunk(),
+                orderCountPromise,
+                fetchProducts(),
+                fetchSettlements(),
+            ]);
+            if (ordersResult.error) throw ordersResult.error;
+            if (productsResult.error) throw productsResult.error;
+            if (settlementsResult.error) throw settlementsResult.error;
+        }
 
         const orders = ordersResult.data || [];
         const products = productsResult.data || [];
@@ -862,8 +942,7 @@ router.get('/shop-data/:accountId', async (req: Request, res: Response) => {
         // error or timeout), retry sequentially before giving up. Never use a sentinel value like
         // 9999999 — that causes the UI to show "Loading data: X/9999999..." which is incorrect.
         let totalOrderCount: number | null = orderCountResult.count ?? null;
-        if (totalOrderCount === null) {
-            console.warn(`[Shop Data] Parallel count query returned null (error: ${orderCountResult.error?.message}), retrying sequentially...`);
+        if (totalOrderCount === null && !skipExactOrderCount) {
             const { count: retryCount, error: retryError } = await supabase
                 .from('shop_orders')
                 .select('order_id', { count: 'exact', head: true })
@@ -873,9 +952,10 @@ router.get('/shop-data/:accountId', async (req: Request, res: Response) => {
                 .lt('paid_time', endTs);
             if (!retryError && retryCount !== null) {
                 totalOrderCount = retryCount;
-                console.log(`[Shop Data] Sequential count succeeded: ${totalOrderCount}`);
             } else {
-                console.warn(`[Shop Data] Sequential count also failed (${retryError?.message}). Progressive loading will use batch pagination.`);
+                console.error(
+                    `[Shop Data] Order count unavailable (parallel: ${orderCountResult.error?.message}; sequential: ${retryError?.message}). Progressive loading will use batch pagination.`,
+                );
             }
         }
 
@@ -883,7 +963,7 @@ router.get('/shop-data/:accountId', async (req: Request, res: Response) => {
         // if count is still unknown, assume more exist when the initial batch was full.
         const hasMoreOrders = totalOrderCount !== null
             ? totalOrderCount > orders.length
-            : orders.length === INITIAL_ORDER_BATCH;
+            : orders.length === initialOrderBatch;
 
         // 3. Compute metrics server-side (PAID ORDERS ONLY)
         // GMV = Sum of payment.total_amount for all PAID orders
@@ -917,7 +997,6 @@ router.get('/shop-data/:accountId', async (req: Request, res: Response) => {
         };
 
         const timing = Date.now() - startTime;
-        console.log(`[Shop Data] Loaded in ${timing}ms — ${orders.length}/${totalOrderCount} orders, ${products.length} products, ${settlements.length} settlements${hasMoreOrders ? ' (more orders pending)' : ''}`);
 
         // Helper to map order rows
         const mapOrder = (o: any) => ({
@@ -1012,7 +1091,10 @@ router.get('/shop-data/:accountId', async (req: Request, res: Response) => {
                 cache_status: cacheStatus,
                 // Progressive loading info
                 hasMoreOrders,
-                nextCursor: orders.length > 0 ? `${orders[orders.length - 1].paid_time}|${orders[orders.length - 1].order_id}` : null,
+                nextCursor:
+                    orders.length > 0
+                        ? formatShopOrdersKeysetCursor(orders[orders.length - 1].paid_time, orders[orders.length - 1].order_id)
+                        : null,
                 totalOrders: totalOrderCount,
                 ordersLoaded: orders.length
             },
@@ -1033,7 +1115,9 @@ router.get('/orders/synced/:accountId/batch', async (req: Request, res: Response
     try {
         const { accountId } = req.params;
         const { shopId, limit = '1000', startDate, endDate, cursor } = req.query;
-        const batchLimit = Math.min(parseInt(limit as string) || 1000, 1000);
+        const HARD_CAP = Math.min(Math.max(parseInt(process.env.TIKTOK_ORDERS_BATCH_MAX || '1000', 10) || 1000, 40), 1000);
+        const requested = parseInt(limit as string);
+        const batchLimit = Math.min(Number.isFinite(requested) ? requested || HARD_CAP : HARD_CAP, HARD_CAP);
 
         let shopsQuery = supabase
             .from('tiktok_shops')
@@ -1071,7 +1155,6 @@ router.get('/orders/synced/:accountId/batch', async (req: Request, res: Response
             const thirtyDaysAgo = new Date(now.getTime() - (30 * 86400 * 1000));
             startTs = thirtyDaysAgo.toISOString();
             endTs = now.toISOString();
-            console.log(`[Batch Orders] No date range provided, defaulting to 30 days`);
         }
 
         ordersQuery = ordersQuery
@@ -1082,13 +1165,22 @@ router.get('/orders/synced/:accountId/batch', async (req: Request, res: Response
         // This is O(1) regardless of how deep we paginate, unlike OFFSET which
         // degrades at high values (e.g. offset=21000 causes timeouts).
         if (cursor) {
-            const cursorStr = cursor as string;
-            if (cursorStr.includes('|')) {
-                const [cursorTime, cursorId] = cursorStr.split('|');
-                // (paid_time < cursorTime) OR (paid_time = cursorTime AND order_id < cursorId)
-                ordersQuery = ordersQuery.or(`paid_time.lt.${cursorTime},and(paid_time.eq.${cursorTime},order_id.lt.${cursorId})`);
-            } else {
-                ordersQuery = ordersQuery.lt('paid_time', cursorStr);
+            try {
+                const cursorStr = cursor as string;
+                if (cursorStr.includes('|')) {
+                    const { paidIsoUtc, orderId } = parseShopOrdersKeysetCursor(cursorStr);
+                    const q = (v: string) =>
+                        `"${String(v)
+                            .replace(/\\/g, '\\\\')
+                            .replace(/"/g, '\\"')}"`;
+                    const qt = q(paidIsoUtc);
+                    const qi = q(orderId);
+                    ordersQuery = ordersQuery.or(`paid_time.lt.${qt},and(paid_time.eq.${qt},order_id.lt.${qi})`);
+                } else {
+                    ordersQuery = ordersQuery.lt('paid_time', cursorStr);
+                }
+            } catch (e: any) {
+                return res.status(400).json({ success: false, error: e?.message || 'Invalid cursor' });
             }
         }
 
@@ -1102,10 +1194,10 @@ router.get('/orders/synced/:accountId/batch', async (req: Request, res: Response
         const orders = batch || [];
         const hasMore = orders.length === batchLimit;
 
-        // Return the cursor for the next batch (paid_time|order_id of the last order in this batch)
-        const nextCursor = orders.length > 0 ? `${orders[orders.length - 1].paid_time}|${orders[orders.length - 1].order_id}` : null;
-
-        console.log(`[Batch Orders] cursor=${cursor || 'none'}, limit=${batchLimit}, returned=${orders.length}, hasMore=${hasMore}, nextCursor=${nextCursor}`);
+        const nextCursor =
+            orders.length > 0
+                ? formatShopOrdersKeysetCursor(orders[orders.length - 1].paid_time, orders[orders.length - 1].order_id)
+                : null;
 
         res.json({
             success: true,
@@ -3042,12 +3134,22 @@ router.post('/sync/:accountId([0-9a-fA-F-]{36})', async (req: Request, res: Resp
             status: job.status,
             deduped,
         });
+        const enqueueTenantId = await tenantIdForAccount(accountId);
         await auditLog(req, {
             action: 'tiktok.shop.sync_enqueued',
             resourceType: 'ingestion_job',
             resourceId: job.id,
             accountId,
-            metadata: { stream: 'shop', syncType, deduped, shopId: shopId ?? null, source: payload.source },
+            tenantId: enqueueTenantId ?? undefined,
+            metadata: {
+                stream: 'shop',
+                syncType,
+                deduped,
+                shopId: shopId ?? null,
+                source: payload.source,
+                forceFullSync: !!forceFullSync,
+                bootstrap: shouldBootstrap,
+            },
         });
         if (backfillJob) {
             await auditLog(req, {
@@ -3055,6 +3157,7 @@ router.post('/sync/:accountId([0-9a-fA-F-]{36})', async (req: Request, res: Resp
                 resourceType: 'ingestion_job',
                 resourceId: backfillJob.id,
                 accountId,
+                tenantId: enqueueTenantId ?? undefined,
                 metadata: {
                     stream: 'shop',
                     syncType: 'orders',
@@ -3108,22 +3211,48 @@ router.get('/sync/job/:jobId', requireIngestionJobReadAccess(), async (req: Requ
     }
 });
 
-router.post('/sync/run-worker', async (req: Request, res: Response) => {
+/** Vercel Cron invokes paths with HTTP GET; browsers use POST after enqueueing a job. */
+const handleShopSyncRunWorker = async (req: Request, res: Response) => {
     const authHeader = req.headers.authorization;
     const cronAuthorized = !!process.env.CRON_SECRET && authHeader === `Bearer ${process.env.CRON_SECRET}`;
     const superAdminAuthorized = await isPlatformSuperAdminRequest(req);
+
+    const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    let claimOpts: { accountId?: string; preferredJobId?: string } | undefined;
+
     if (!cronAuthorized && !superAdminAuthorized) {
-        return res.status(401).json({ success: false, error: 'Unauthorized (cron secret or platform super admin required)' });
+        const raw = req.query.accountId;
+        const interactiveAccountId = typeof raw === 'string' ? raw.trim() : '';
+        if (!uuidRe.test(interactiveAccountId)) {
+            return res.status(401).json({
+                success: false,
+                error:
+                    'Unauthorized: interactive worker requires a valid session JWT plus ?accountId=<your-account-uuid>. Cron uses Bearer CRON_SECRET without account scope.',
+            });
+        }
+        const rawJobId = req.query.jobId;
+        const interactiveJobId = typeof rawJobId === 'string' ? rawJobId.trim() : '';
+        claimOpts = {
+            accountId: interactiveAccountId,
+            ...(uuidRe.test(interactiveJobId) ? { preferredJobId: interactiveJobId } : {}),
+        };
     }
 
     const workerId = `shop-worker-${Date.now()}`;
+    const workerTrigger: 'cron' | 'super_admin' | 'account_scoped' = cronAuthorized
+        ? 'cron'
+        : superAdminAuthorized
+          ? 'super_admin'
+          : 'account_scoped';
     const limit = Math.max(1, Math.min(10, Number(req.query.limit) || 3));
     const results: Array<{ jobId: string; status: string; error?: string }> = [];
     try {
-        const claimedJobs = await claimIngestionJobs(workerId, 'shop', limit);
+        const claimedJobs = await claimIngestionJobs(workerId, 'shop', limit, claimOpts);
         const jobResults = await Promise.all(
             claimedJobs.map(async (job) => {
                 try {
+                    const jobTenantId = await tenantIdForAccount(job.account_id);
+                    const jobPayload = job.payload as IngestionJobPayload;
                     ingestionLogger.info({
                         event: 'job_started',
                         stream: 'shop',
@@ -3138,7 +3267,16 @@ router.post('/sync/run-worker', async (req: Request, res: Response) => {
                         resourceType: 'ingestion_job',
                         resourceId: job.id,
                         accountId: job.account_id,
-                        metadata: { stream: 'shop', workerId, attempt: job.attempt_count },
+                        tenantId: jobTenantId ?? undefined,
+                        metadata: {
+                            stream: 'shop',
+                            workerId,
+                            worker_trigger: workerTrigger,
+                            attempt: job.attempt_count,
+                            sync_type: job.sync_type,
+                            source: typeof jobPayload.source === 'string' ? jobPayload.source : null,
+                            force_full_sync: !!jobPayload.forceFullSync,
+                        },
                     });
                     let lastProgressWriteAt = 0;
                     const result = await runShopSyncJob(
@@ -3165,12 +3303,26 @@ router.post('/sync/run-worker', async (req: Request, res: Response) => {
                         resourceType: 'ingestion_job',
                         resourceId: job.id,
                         accountId: job.account_id,
-                        metadata: { stream: 'shop' },
+                        tenantId: jobTenantId ?? undefined,
+                        metadata: {
+                            stream: 'shop',
+                            worker_trigger: workerTrigger,
+                            sync_type: job.sync_type,
+                            source: typeof jobPayload.source === 'string' ? jobPayload.source : null,
+                            force_full_sync: !!jobPayload.forceFullSync,
+                            is_first_sync:
+                                typeof (result as { isFirstSync?: boolean }).isFirstSync === 'boolean'
+                                    ? (result as { isFirstSync: boolean }).isFirstSync
+                                    : null,
+                        },
+                        afterState: sanitizeShopSyncResultForAudit(result),
                     });
                     return { jobId: job.id, status: 'succeeded' as const };
                 } catch (error: any) {
                     const willDeadLetter = (job as IngestionJobRow).attempt_count >= (job as IngestionJobRow).max_attempts;
                     await markIngestionJobFailed(job as IngestionJobRow, error);
+                    const failTenantId = await tenantIdForAccount(job.account_id);
+                    const failPayload = job.payload as IngestionJobPayload;
                     ingestionLogger.error({
                         event: 'job_failed',
                         stream: 'shop',
@@ -3186,7 +3338,15 @@ router.post('/sync/run-worker', async (req: Request, res: Response) => {
                         resourceType: 'ingestion_job',
                         resourceId: job.id,
                         accountId: job.account_id,
-                        metadata: { stream: 'shop', error: error.message, willRetry: !willDeadLetter },
+                        tenantId: failTenantId ?? undefined,
+                        metadata: {
+                            stream: 'shop',
+                            worker_trigger: workerTrigger,
+                            sync_type: job.sync_type,
+                            source: typeof failPayload.source === 'string' ? failPayload.source : null,
+                            error: error.message,
+                            willRetry: !willDeadLetter,
+                        },
                     });
                     return { jobId: job.id, status: 'failed' as const, error: error.message };
                 }
@@ -3223,7 +3383,10 @@ router.post('/sync/run-worker', async (req: Request, res: Response) => {
     } catch (error: any) {
         return res.status(500).json({ success: false, error: error.message, workerId, results });
     }
-});
+};
+
+router.get('/sync/run-worker', handleShopSyncRunWorker);
+router.post('/sync/run-worker', handleShopSyncRunWorker);
 
 // Cron job endpoint for Vercel
 router.get('/sync/cron', async (req: Request, res: Response) => {
@@ -3909,9 +4072,11 @@ router.get('/sync/monitoring/status', async (req: Request, res: Response) => {
                 .limit(500),
             supabase
                 .from('audit_logs')
-                .select('id,created_at,action,resource_type,resource_id,actor_user_id,actor_email,tenant_id,account_id,metadata,ip_address')
+                .select(
+                    'id,created_at,action,resource_type,resource_id,actor_user_id,actor_email,tenant_id,account_id,metadata,ip_address,before_state,after_state',
+                )
                 .order('created_at', { ascending: false })
-                .limit(200),
+                .limit(400),
             supabase
                 .from('system_logs')
                 .select('created_at,data,message,level')
@@ -4019,18 +4184,12 @@ router.get('/sync/monitoring/status', async (req: Request, res: Response) => {
             recent: perfRows.slice(0, 100),
         };
 
-        const billingOrPermissionAudit = (auditResult.data || []).filter((a: any) => {
-            const action = String(a?.action || '').toLowerCase();
-            const resource = String(a?.resource_type || '').toLowerCase();
-            return action.startsWith('plan.')
-                || action.startsWith('billing.')
-                || action.includes('permission')
-                || action.startsWith('role.')
-                || action.startsWith('member.')
-                || resource.includes('entitlement')
-                || resource.includes('authorization')
-                || resource.includes('tenant_membership');
-        });
+        const billingOrPermissionAudit = (auditResult.data || [])
+            .filter((a: any) => monitoringAuditRowIncluded(a))
+            .map((a: any) => ({
+                ...a,
+                prd_category: classifyMonitoringAuditPrdCategory(a),
+            }));
 
         const ingestionAudit = recentActivity.map((a: any) => {
             const resultObj = a?.result || null;

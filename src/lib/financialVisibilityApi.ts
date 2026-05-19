@@ -27,6 +27,8 @@ export type SellerFinancialRestrictionRule = {
     restrict_custom_line_items: boolean;
     restricted_principals: string[];
     restricted_fields: FinancialRestrictionFieldId[];
+    /** Custom P&L line item ids hidden for targeted principals (when custom lines are otherwise visible). */
+    restricted_custom_pl_line_item_ids?: string[];
     updated_at?: string;
     updated_by?: string | null;
 };
@@ -44,9 +46,13 @@ export async function saveSellerFinancialRestrictions(
     accountId: string,
     payload: Pick<
         SellerFinancialRestrictionRule,
-        'restrict_cogs' | 'restrict_margin' | 'restrict_custom_line_items' | 'restricted_fields'
+        | 'restrict_cogs'
+        | 'restrict_margin'
+        | 'restrict_custom_line_items'
+        | 'restricted_fields'
         | 'restricted_principals'
-    >
+        | 'restricted_custom_pl_line_item_ids'
+    >,
 ): Promise<SellerFinancialRestrictionRule> {
     const res = await apiFetch(`/api/tiktok-shop/finance/restrictions/${accountId}`, {
         method: 'PUT',

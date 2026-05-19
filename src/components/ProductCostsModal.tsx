@@ -1,5 +1,6 @@
 import { useState, useCallback } from 'react';
 import { X, DollarSign, Loader2, Check, Truck, Layers, ChevronDown } from 'lucide-react';
+import { useShallow } from 'zustand/react/shallow';
 import { Product, useShopStore } from '../store/useShopStore';
 
 interface ProductCostsModalProps {
@@ -11,7 +12,12 @@ interface ProductCostsModalProps {
 type ApplyFromOption = 'today' | 'specific_date';
 
 export function ProductCostsModal({ product, accountId, onClose }: ProductCostsModalProps) {
-    const { updateProductCosts, updateProductSkuCosts } = useShopStore();
+    const { updateProductCosts, updateProductSkuCosts } = useShopStore(
+        useShallow((s) => ({
+            updateProductCosts: s.updateProductCosts,
+            updateProductSkuCosts: s.updateProductSkuCosts,
+        })),
+    );
 
     // COGS state
     const [cogsValue, setCogsValue] = useState<string>(product.cogs?.toString() || '');
@@ -297,16 +303,16 @@ export function ProductCostsModal({ product, accountId, onClose }: ProductCostsM
                                         onClick={() => handleFulfillmentChange('fbt')}
                                         disabled={isSavingFulfillment}
                                         className={`p-3 rounded-lg border-2 transition-all flex flex-col items-center gap-1 ${fulfillmentType === 'fbt'
-                                            ? 'border-pink-500 bg-pink-500/10'
+                                            ? 'border-mamba-green bg-mamba-green/10'
                                             : 'border-gray-600 hover:border-gray-500 bg-gray-900'
                                             }`}
                                     >
-                                        <span className={`text-sm font-medium ${fulfillmentType === 'fbt' ? 'text-pink-400' : 'text-white'}`}>
+                                        <span className={`text-sm font-medium ${fulfillmentType === 'fbt' ? 'text-mamba-neon' : 'text-white'}`}>
                                             FBT
                                         </span>
                                         <span className="text-xs text-gray-400">Fulfilled by TikTok</span>
                                         {fulfillmentType === 'fbt' && (
-                                            <Check size={14} className="text-pink-400 mt-1" />
+                                            <Check size={14} className="text-mamba-neon mt-1" />
                                         )}
                                     </button>
                                     <button

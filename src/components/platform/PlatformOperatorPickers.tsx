@@ -229,7 +229,7 @@ export function OperatorTenantPicker({ kind, value, onChange, disabled, label, h
                     <div className="flex items-start gap-2 min-w-0">
                         <div
                             className={`mt-0.5 p-1.5 rounded-lg ${
-                                kind === 'agency' ? 'bg-violet-500/15 text-violet-300' : 'bg-pink-500/15 text-pink-300'
+                                kind === 'agency' ? 'bg-violet-500/15 text-violet-300' : 'bg-mamba-green/15 text-mamba-neon'
                             }`}
                         >
                             <Icon className="w-4 h-4" />

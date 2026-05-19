@@ -37,8 +37,8 @@ export function CampaignRow({ campaign, defaultExpanded = false }: CampaignRowPr
                     <button className="p-1 hover:bg-gray-700 rounded transition-colors">
                         {expanded ? <ChevronDown size={16} className="text-gray-400" /> : <ChevronRight size={16} className="text-gray-400" />}
                     </button>
-                    <div className="p-2 bg-pink-500/10 rounded-lg">
-                        <Layers size={18} className="text-pink-400" />
+                    <div className="p-2 bg-mamba-green/10 rounded-lg">
+                        <Layers size={18} className="text-mamba-neon" />
                     </div>
                     <div>
                         <div className="flex items-center gap-2">
@@ -111,7 +111,7 @@ function AdGroupRow({ adGroup }: { adGroup: AdGroupAsset }) {
     };
 
     return (
-        <div className="border-l-4 border-l-pink-500/20 ml-4 pb-1">
+        <div className="border-l-4 border-l-mamba-green/20 ml-4 pb-1">
             <div
                 className="flex items-center justify-between p-3 pl-4 hover:bg-gray-800/50 cursor-pointer transition-colors"
                 onClick={() => setExpanded(!expanded)}

@@ -57,7 +57,7 @@ export function AdsView({ account }: AdsViewProps) {
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="animate-spin rounded-full h-12 w-12 border-4 border-pink-500 border-t-transparent"></div>
+        <div className="animate-spin rounded-full h-12 w-12 border-4 border-mamba-green border-t-transparent"></div>
       </div>
     );
   }
@@ -109,14 +109,14 @@ export function AdsView({ account }: AdsViewProps) {
           value={formatNumber(metrics?.clicks || 0)}
           change={8.7}
           icon={MousePointer}
-          iconColor="bg-gradient-to-r from-orange-500 to-red-500"
+          iconColor="bg-gradient-to-r from-mamba-neon to-mamba-deep"
         />
         <StatCard
           title="Total Spend"
           value={formatCurrency(metrics?.spend || 0)}
           change={5.2}
           icon={DollarSign}
-          iconColor="bg-gradient-to-r from-red-500 to-pink-500"
+          iconColor="bg-gradient-to-r from-mamba-deep to-mamba-neon"
         />
         <StatCard
           title="Revenue"
@@ -135,7 +135,7 @@ export function AdsView({ account }: AdsViewProps) {
             value={`${ctr}%`}
             change={3.2}
             icon={Target}
-            iconColor="bg-gradient-to-r from-purple-500 to-pink-500"
+            iconColor="bg-gradient-to-r from-purple-500 to-mamba-green"
           />
           <StatCard
             title="Return on Ad Spend"
@@ -156,7 +156,7 @@ export function AdsView({ account }: AdsViewProps) {
             value={formatNumber(metrics?.conversions || 0)}
             change={7.8}
             icon={Target}
-            iconColor="bg-gradient-to-r from-pink-500 to-red-500"
+            iconColor="bg-gradient-to-r from-mamba-green to-mamba-deep"
           />
           <StatCard
             title="Cost Per Conversion"
@@ -179,7 +179,7 @@ export function AdsView({ account }: AdsViewProps) {
         <h3 className="text-lg font-semibold text-white mb-4">Individual Campaigns</h3>
         {campaignsLoading ? (
           <div className="flex items-center justify-center h-32">
-            <div className="animate-spin rounded-full h-8 w-8 border-4 border-pink-500 border-t-transparent"></div>
+            <div className="animate-spin rounded-full h-8 w-8 border-4 border-mamba-green border-t-transparent"></div>
           </div>
         ) : campaigns.length === 0 ? (
           <div className="bg-gray-800 rounded-xl p-8 text-center border border-gray-700">

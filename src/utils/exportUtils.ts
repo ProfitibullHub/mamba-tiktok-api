@@ -3,6 +3,35 @@ import autoTable from 'jspdf-autotable';
 import * as XLSX from 'xlsx';
 import { saveAs } from 'file-saver';
 
+/**
+ * jsPDF standard fonts omit most Unicode (e.g. box-drawing ═). Those glyphs render as
+ * garbage (often "%P" sequences) and wide headers clip. Map to ASCII for all exports.
+ */
+const BOX_DRAWING_RE = /[\u2500-\u257F]/g;
+
+export function sanitizeExportCellValue(value: string | number): string | number {
+    if (typeof value !== 'string') return value;
+    return value
+        .replace(/\u2550/g, '=') // ═ double horizontal (section bars)
+        .replace(/\u2500/g, '-') // ─ light horizontal
+        .replace(/\u2501/g, '-') // heavy horizontal
+        .replace(/\u2551/g, '|')
+        .replace(/\u2502/g, '|')
+        .replace(/\u2503/g, '|')
+        .replace(BOX_DRAWING_RE, '');
+}
+
+function mapExportRow(row: (string | number)[]): (string | number)[] {
+    return row.map((cell) => sanitizeExportCellValue(cell));
+}
+
+function sanitizeExportData(data: ExportData): ExportData {
+    return {
+        headers: data.headers.map((h) => String(sanitizeExportCellValue(h))),
+        rows: data.rows.map(mapExportRow),
+    };
+}
+
 export interface ExportData {
     headers: string[];
     rows: (string | number)[][];
@@ -54,7 +83,7 @@ async function getImageDimensions(dataUrl: string): Promise<{ width: number; hei
  * Export data to CSV format
  */
 export function exportToCSV(data: ExportData, filename: string = 'export.csv'): void {
-    const { headers, rows } = data;
+    const { headers, rows } = sanitizeExportData(data);
 
     // Create CSV content
     const csvRows = [headers, ...rows];
@@ -78,7 +107,7 @@ export function exportToCSV(data: ExportData, filename: string = 'export.csv'): 
  * Export data to Excel format (.xlsx)
  */
 export function exportToExcel(data: ExportData, filename: string = 'export.xlsx'): void {
-    const { headers, rows } = data;
+    const { headers, rows } = sanitizeExportData(data);
 
     // Create worksheet data
     const wsData = [headers, ...rows];
@@ -114,7 +143,7 @@ export function exportToPDF(
     subtitle?: string,
     options?: PdfBrandingOptions
 ): void {
-    const { headers, rows } = data;
+    const { headers, rows } = sanitizeExportData(data);
     const brandName = options?.brandName?.trim() || 'Mamba';
     const primaryColor = hexToRgb(options?.primaryColor || '') ?? [41, 128, 185];
     const logoUrl = options?.logoUrl || null;
@@ -140,13 +169,21 @@ export function exportToPDF(
             doc.text(subtitle, 14, title ? titleStartY + 7 : titleStartY);
         }
 
+        const pageW = doc.internal.pageSize.getWidth();
+        const sideMargin = 12;
+        const tableWidth = pageW - sideMargin * 2;
+
         autoTable(doc, {
             head: [headers],
             body: rows,
             startY: title && subtitle ? titleStartY + 13 : title ? titleStartY + 7 : titleStartY,
+            margin: { left: sideMargin, right: sideMargin },
+            tableWidth,
             styles: {
                 fontSize: 8,
                 cellPadding: 2,
+                overflow: 'linebreak',
+                cellWidth: 'wrap',
             },
             headStyles: {
                 fillColor: primaryColor,

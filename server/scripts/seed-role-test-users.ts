@@ -108,13 +108,21 @@ async function ensureAuthUser(supabase: SupabaseClient, email: string, fullName:
     return data.user.id;
 }
 
-async function ensureProfile(supabase: SupabaseClient, userId: string, email: string, fullName: string) {
+async function ensureProfile(
+    supabase: SupabaseClient,
+    userId: string,
+    email: string,
+    fullName: string,
+    /** Home tenant for `get_request_tenant_context` (agency JWT vs seller JWT). */
+    tenantId: string
+) {
     const { error } = await supabase.from('profiles').upsert(
         {
             id: userId,
             email,
             full_name: fullName,
             role: 'client',
+            tenant_id: tenantId,
             updated_at: new Date().toISOString(),
         },
         { onConflict: 'id' }
@@ -232,7 +240,8 @@ async function main() {
 
     for (const spec of USER_SPECS) {
         const userId = await ensureAuthUser(supabase, spec.email, spec.fullName);
-        await ensureProfile(supabase, userId, spec.email, spec.fullName);
+        const profileTenantId = spec.membershipTenant === 'agency' ? agencyTenantId : sellerTenantId;
+        await ensureProfile(supabase, userId, spec.email, spec.fullName, profileTenantId);
         const roleId = await getSystemRoleId(supabase, spec.roleName);
 
         const tenantId = spec.membershipTenant === 'agency' ? agencyTenantId : sellerTenantId;

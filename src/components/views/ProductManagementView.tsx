@@ -5,6 +5,7 @@ import {
     BarChart3, AlertTriangle, CheckCircle, Box, Settings, Layers, Edit2, ChevronRight, Calendar
 } from 'lucide-react';
 import { ProductCostsModal } from '../ProductCostsModal';
+import { useShallow } from 'zustand/react/shallow';
 import { useShopStore, Product, Order } from '../../store/useShopStore';
 import { Account } from '../../lib/supabase';
 import { calculateOrderGMV } from '../../utils/gmvCalculations';
@@ -29,7 +30,20 @@ interface EditingProduct {
 }
 
 export function ProductManagementView({ account, shopId, onBack, readOnly = false }: ProductManagementViewProps) {
-    const { products, orders, isLoading, syncData, cacheMetadata, updateProductCosts, activateProducts, deactivateProducts, deleteProducts, dataVersion } = useShopStore();
+    const { products, orders, isLoading, syncData, cacheMetadata, updateProductCosts, activateProducts, deactivateProducts, deleteProducts, dataVersion } = useShopStore(
+        useShallow((s) => ({
+            products: s.products,
+            orders: s.orders,
+            isLoading: s.isLoading,
+            syncData: s.syncData,
+            cacheMetadata: s.cacheMetadata,
+            updateProductCosts: s.updateProductCosts,
+            activateProducts: s.activateProducts,
+            deactivateProducts: s.deactivateProducts,
+            deleteProducts: s.deleteProducts,
+            dataVersion: s.dataVersion,
+        })),
+    );
 
     useEffect(() => {
         if (!readOnly) return;
@@ -357,7 +371,7 @@ export function ProductManagementView({ account, shopId, onBack, readOnly = fals
                     )}
                     <div>
                         <h2 className="text-2xl font-bold text-white flex items-center gap-2">
-                            <Settings className="text-pink-500" />
+                            <Settings className="text-mamba-green" />
                             Product Management
                         </h2>
                         <p className="text-gray-400">Manage inventory, costs, and performance</p>
@@ -376,7 +390,7 @@ export function ProductManagementView({ account, shopId, onBack, readOnly = fals
                         onClick={handleSync}
                         disabled={readOnly || cacheMetadata.isSyncing || isLoading}
                         title={readOnly ? 'Read-only for your role' : undefined}
-                        className="flex items-center gap-2 px-4 py-2 bg-pink-600 hover:bg-pink-700 text-white rounded-lg transition-colors disabled:opacity-50"
+                        className="flex items-center gap-2 px-4 py-2 bg-mamba-green hover:bg-mamba-deep text-mamba-dark rounded-lg transition-colors disabled:opacity-50"
                     >
                         <RefreshCw size={18} className={cacheMetadata.isSyncing ? "animate-spin" : ""} />
                         Sync Products
@@ -436,8 +450,8 @@ export function ProductManagementView({ account, shopId, onBack, readOnly = fals
                     className="w-full flex items-center justify-between p-4 hover:bg-gray-800/50 transition-colors"
                 >
                     <div className="flex items-center gap-3">
-                        <div className="p-2 bg-pink-500/20 rounded-lg">
-                            <BarChart3 className="w-5 h-5 text-pink-400" />
+                        <div className="p-2 bg-mamba-green/20 rounded-lg">
+                            <BarChart3 className="w-5 h-5 text-mamba-neon" />
                         </div>
                         <div className="text-left">
                             <h3 className="text-white font-semibold">Product Performance Analytics</h3>
@@ -534,7 +548,7 @@ export function ProductManagementView({ account, shopId, onBack, readOnly = fals
                 </div>
                 <div className="bg-gray-800/50 p-4 rounded-xl border border-gray-700">
                     <div className="flex items-center gap-2 text-gray-400 text-sm mb-1">
-                        <BarChart3 size={14} className="text-pink-400" />
+                        <BarChart3 size={14} className="text-mamba-neon" />
                         GMV ({getHistoricalWindowLabel()})
                         <CalculationTooltip
                             source="Synced Orders"
@@ -542,7 +556,7 @@ export function ProductManagementView({ account, shopId, onBack, readOnly = fals
                             api="GET /orders"
                         />
                     </div>
-                    <p className="text-2xl font-bold text-pink-400">${formatCompactNumber(stats.totalGMV)}</p>
+                    <p className="text-2xl font-bold text-mamba-neon">${formatCompactNumber(stats.totalGMV)}</p>
                     <p className="text-xs text-gray-500 mt-1">Gross merchandise value ({getHistoricalWindowDescription()})</p>
                 </div>
             </div>
@@ -558,7 +572,7 @@ export function ProductManagementView({ account, shopId, onBack, readOnly = fals
                             placeholder="Search products or SKU..."
                             value={searchTerm}
                             onChange={(e) => setSearchTerm(e.target.value)}
-                            className="w-full bg-gray-900 border border-gray-700 text-white pl-10 pr-4 py-2 rounded-lg focus:outline-none focus:border-pink-500"
+                            className="w-full bg-gray-900 border border-gray-700 text-white pl-10 pr-4 py-2 rounded-lg focus:outline-none focus:border-mamba-green"
                         />
                     </div>
 
@@ -566,7 +580,7 @@ export function ProductManagementView({ account, shopId, onBack, readOnly = fals
                     <select
                         value={statusFilter}
                         onChange={(e) => setStatusFilter(e.target.value)}
-                        className="bg-gray-900 border border-gray-700 text-white px-4 py-2 rounded-lg focus:outline-none focus:border-pink-500"
+                        className="bg-gray-900 border border-gray-700 text-white px-4 py-2 rounded-lg focus:outline-none focus:border-mamba-green"
                     >
                         <option value="all">All Status</option>
                         <option value="ACTIVATE">Active</option>
@@ -582,7 +596,7 @@ export function ProductManagementView({ account, shopId, onBack, readOnly = fals
                         disabled={readOnly}
                         title={readOnly ? 'Read-only for your role' : undefined}
                         className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors ${bulkEditMode
-                            ? 'bg-pink-600 text-white'
+                            ? 'bg-mamba-green text-mamba-dark'
                             : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
                             } disabled:opacity-40 disabled:pointer-events-none`}
                     >
@@ -602,7 +616,7 @@ export function ProductManagementView({ account, shopId, onBack, readOnly = fals
                                     value={bulkCogs}
                                     onChange={(e) => setBulkCogs(e.target.value)}
                                     placeholder="Set COGS"
-                                    className="bg-gray-900 border border-gray-700 text-white px-3 py-2 rounded-lg w-32 focus:outline-none focus:border-pink-500"
+                                    className="bg-gray-900 border border-gray-700 text-white px-3 py-2 rounded-lg w-32 focus:outline-none focus:border-mamba-green"
                                     step="0.01"
                                 />
                             </div>
@@ -613,7 +627,7 @@ export function ProductManagementView({ account, shopId, onBack, readOnly = fals
                                     value={bulkShipping}
                                     onChange={(e) => setBulkShipping(e.target.value)}
                                     placeholder="Set Shipping"
-                                    className="bg-gray-900 border border-gray-700 text-white px-3 py-2 rounded-lg w-32 focus:outline-none focus:border-pink-500"
+                                    className="bg-gray-900 border border-gray-700 text-white px-3 py-2 rounded-lg w-32 focus:outline-none focus:border-mamba-green"
                                     step="0.01"
                                 />
                             </div>
@@ -719,7 +733,7 @@ export function ProductManagementView({ account, shopId, onBack, readOnly = fals
                                             type="checkbox"
                                             checked={selectedProducts.size === paginatedProducts.length && paginatedProducts.length > 0}
                                             onChange={toggleSelectAll}
-                                            className="w-4 h-4 rounded border-gray-600 bg-gray-800 text-pink-500 focus:ring-pink-500"
+                                            className="w-4 h-4 rounded border-gray-600 bg-gray-800 text-mamba-green focus:ring-mamba-green"
                                         />
                                     </th>
                                 )}
@@ -746,7 +760,7 @@ export function ProductManagementView({ account, shopId, onBack, readOnly = fals
                                 return (
                                     <tr
                                         key={product.product_id}
-                                        className={`hover:bg-gray-700/30 ${selectedProducts.has(product.product_id) ? 'bg-pink-500/10' : ''
+                                        className={`hover:bg-gray-700/30 ${selectedProducts.has(product.product_id) ? 'bg-mamba-green/10' : ''
                                             }`}
                                     >
                                         {bulkEditMode && (
@@ -755,7 +769,7 @@ export function ProductManagementView({ account, shopId, onBack, readOnly = fals
                                                     type="checkbox"
                                                     checked={selectedProducts.has(product.product_id)}
                                                     onChange={() => toggleProductSelection(product.product_id)}
-                                                    className="w-4 h-4 rounded border-gray-600 bg-gray-800 text-pink-500 focus:ring-pink-500"
+                                                    className="w-4 h-4 rounded border-gray-600 bg-gray-800 text-mamba-green focus:ring-mamba-green"
                                                 />
                                             </td>
                                         )}
@@ -770,7 +784,7 @@ export function ProductManagementView({ account, shopId, onBack, readOnly = fals
                                                     {hasVideo && (
                                                         <button
                                                             onClick={() => setPlayingVideo(playingVideo === product.product_id ? null : product.product_id)}
-                                                            className="absolute -bottom-1 -right-1 w-5 h-5 bg-pink-500 rounded-full flex items-center justify-center"
+                                                            className="absolute -bottom-1 -right-1 w-5 h-5 bg-mamba-green rounded-full flex items-center justify-center"
                                                         >
                                                             <Video size={10} className="text-white" />
                                                         </button>
@@ -802,7 +816,7 @@ export function ProductManagementView({ account, shopId, onBack, readOnly = fals
                                                                 cogs: val
                                                             }));
                                                         }}
-                                                        className="w-20 bg-gray-900 border border-pink-500 text-white px-2 py-1 rounded text-sm"
+                                                        className="w-20 bg-gray-900 border border-mamba-green text-white px-2 py-1 rounded text-sm"
                                                         step="0.01"
                                                         placeholder="0.00"
                                                     />
@@ -824,7 +838,7 @@ export function ProductManagementView({ account, shopId, onBack, readOnly = fals
                                             <div className="flex flex-col gap-1">
                                                 {/* Fulfillment Type Badge */}
                                                 {product.is_fbt ? (
-                                                    <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-pink-500/20 text-pink-400 border border-pink-500/30 w-fit">
+                                                    <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-mamba-green/20 text-mamba-neon border border-mamba-green/30 w-fit">
                                                         FBT
                                                     </span>
                                                 ) : (
@@ -845,7 +859,7 @@ export function ProductManagementView({ account, shopId, onBack, readOnly = fals
                                                                     shipping_cost: val
                                                                 }));
                                                             }}
-                                                            className="w-20 bg-gray-900 border border-pink-500 text-white px-2 py-1 rounded text-sm"
+                                                            className="w-20 bg-gray-900 border border-mamba-green text-white px-2 py-1 rounded text-sm"
                                                             step="0.01"
                                                             placeholder="0.00"
                                                             title="Cost to ship to customer"
@@ -939,7 +953,7 @@ export function ProductManagementView({ account, shopId, onBack, readOnly = fals
                                                                 }}
                                                                 className="w-full text-left px-4 py-2 hover:bg-gray-800 text-sm text-gray-300 hover:text-white flex items-center gap-2"
                                                             >
-                                                                <Edit2 size={14} className="text-pink-500" />
+                                                                <Edit2 size={14} className="text-mamba-green" />
                                                                 Edit Product
                                                             </button>
                                                             <button
@@ -1059,7 +1073,7 @@ export function ProductManagementView({ account, shopId, onBack, readOnly = fals
                     <div className="bg-gray-900 rounded-2xl max-w-3xl w-full border border-gray-800">
                         <div className="flex justify-between items-center p-4 border-b border-gray-800">
                             <h3 className="text-lg font-semibold text-white flex items-center gap-2">
-                                <Video className="text-pink-500" />
+                                <Video className="text-mamba-green" />
                                 Product Video
                             </h3>
                             <button

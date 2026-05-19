@@ -16,6 +16,7 @@ import {
     WifiOff,
     ListFilter,
     PanelRightOpen,
+    X,
 } from 'lucide-react';
 import { apiFetch, getAccessTokenForApi, getApiOrigin } from '../../lib/apiClient';
 
@@ -130,11 +131,17 @@ type MonitoringResponse = {
                 created_at: string;
                 action: string;
                 resource_type: string;
+                resource_id?: string | null;
+                actor_user_id?: string | null;
                 actor_email: string | null;
                 tenant_id: string | null;
                 account_id: string | null;
                 ip_address: string | null;
                 metadata?: Record<string, unknown>;
+                before_state?: Record<string, unknown> | null;
+                after_state?: Record<string, unknown> | null;
+                /** Server-computed PRD bucket for dashboard grouping */
+                prd_category?: string | null;
             }>;
         };
     };
@@ -153,6 +160,49 @@ type LogEntry = {
     data: Record<string, unknown>;
     created_at: string;
 };
+
+/** Mirrors server `MonitoringAuditPrdCategory` for ingestion audit grouping */
+type MonitoringAuditPrdCategory =
+    | 'tiktok_ingestion'
+    | 'rbac_permissions_plans'
+    | 'financial_visibility'
+    | 'exports'
+    | 'tenancy'
+    | 'branding'
+    | 'pl'
+    | 'tasks'
+    | 'other';
+
+type MonitoringAuditTabId = 'all' | MonitoringAuditPrdCategory;
+
+const MONITORING_AUDIT_TABS: { id: MonitoringAuditTabId; label: string; shortHint: string }[] = [
+    { id: 'all', label: 'All', shortHint: 'Included audit rows' },
+    {
+        id: 'tiktok_ingestion',
+        label: 'TikTok ingestion',
+        shortHint: 'Shop & ads sync: enqueue, worker start/success/fail, counts in after_state',
+    },
+    {
+        id: 'rbac_permissions_plans',
+        label: 'RBAC & subscriptions',
+        shortHint: 'Roles, assignments, denials, plans, billing, finance API auth',
+    },
+    {
+        id: 'financial_visibility',
+        label: 'Financial visibility',
+        shortHint: 'Restriction rules, seller visibility policy, DB restriction changes',
+    },
+    { id: 'exports', label: 'Exports', shortHint: 'Dashboard / data exports' },
+    {
+        id: 'tenancy',
+        label: 'Multi-tenant',
+        shortHint: 'Tenant lifecycle, agency–seller links, user–seller assignments',
+    },
+    { id: 'branding', label: 'White-label', shortHint: 'Branding create/update' },
+    { id: 'pl', label: 'P&L custom', shortHint: 'Custom line items & scoped values' },
+    { id: 'tasks', label: 'Agency tasks', shortHint: 'Kanban task audit trail' },
+    { id: 'other', label: 'Other', shortHint: 'Unclassified included rows' },
+];
 
 // ─────────────────────────────────────────────────────────────────────────────
 // API helpers
@@ -210,6 +260,232 @@ function formatLogTime(ts: string): string {
         minute: '2-digit',
         second: '2-digit',
     });
+}
+
+/** One-line summary from ingestion_job_attempts.result for monitoring table */
+function formatIngestionAttemptSummary(
+    status: string,
+    result: Record<string, unknown> | null | undefined,
+): string {
+    if (!result || typeof result !== 'object') {
+        return status === 'running' ? '…running' : '—';
+    }
+    if (status === 'running' && 'progress' in result && result.progress && typeof result.progress === 'object') {
+        const p = result.progress as Record<string, unknown>;
+        const phase = typeof p.phase === 'string' ? p.phase : 'run';
+        const processed = typeof p.processed === 'number' ? p.processed : null;
+        const total = typeof p.total === 'number' ? p.total : null;
+        if (processed != null && total != null) return `${phase} ${processed}/${total}`;
+        return phase;
+    }
+    const stats = result.stats;
+    if (stats && typeof stats === 'object') {
+        const parts: string[] = [];
+        if (result.isFirstSync === true) parts.push('first');
+        else if (result.isFirstSync === false) parts.push('incr');
+        for (const [k, v] of Object.entries(stats as Record<string, unknown>)) {
+            if (!v || typeof v !== 'object') continue;
+            const o = v as Record<string, unknown>;
+            const bits: string[] = [];
+            if (typeof o.upserted === 'number') bits.push(`↑${o.upserted}`);
+            if (typeof o.fetched === 'number' && o.fetched !== o.upserted) bits.push(`f${o.fetched}`);
+            if (o.isIncremental === true) bits.push('Δ');
+            if (o.isIncremental === false) bits.push('full');
+            if (bits.length) parts.push(`${k}:${bits.join('/')}`);
+        }
+        return parts.length ? parts.join(' · ') : 'ok';
+    }
+    if (result.success === true && result.summary && typeof result.summary === 'object') {
+        const s = result.summary as Record<string, unknown>;
+        const c = typeof s.campaigns === 'number' ? s.campaigns : 0;
+        const ag = typeof s.adGroups === 'number' ? s.adGroups : 0;
+        const ads = typeof s.ads === 'number' ? s.ads : 0;
+        const m = typeof s.metricsRecords === 'number' ? s.metricsRecords : 0;
+        return `ads c${c}/ag${ag}/a${ads}/m${m}`;
+    }
+    if (typeof result.message === 'string') {
+        return result.message.length > 72 ? `${result.message.slice(0, 69)}…` : result.message;
+    }
+    return '—';
+}
+
+function formatAuditJson(value: unknown): string {
+    if (value === null || value === undefined) return 'null';
+    try {
+        return JSON.stringify(value, null, 2);
+    } catch {
+        return String(value);
+    }
+}
+
+/** One-line hint for list view (full JSON opens in drawer). */
+function auditSnapshotHint(r: {
+    before_state?: Record<string, unknown> | null;
+    after_state?: Record<string, unknown> | null;
+    metadata?: Record<string, unknown>;
+}): string {
+    const hb = r.before_state != null;
+    const ha = r.after_state != null;
+    if (hb && ha) return 'Before + after';
+    if (ha) return 'After only';
+    if (hb) return 'Before only';
+    const meta = r.metadata;
+    if (meta && typeof meta === 'object' && Object.keys(meta).length > 0) {
+        return `Metadata (${Object.keys(meta).length})`;
+    }
+    return '—';
+}
+
+type MonitoringAuditLogRow = NonNullable<
+    NonNullable<MonitoringResponse['observability']>['audit']['billingAndPermissionRows']
+>[number];
+
+function AuditLogDetailDrawer({
+    row,
+    onClose,
+}: {
+    row: MonitoringAuditLogRow | null;
+    onClose: () => void;
+}) {
+    if (!row) return null;
+    const meta = row.metadata && typeof row.metadata === 'object' ? (row.metadata as Record<string, unknown>) : null;
+    const block = (title: string, body: string) => (
+        <div className="mb-5">
+            <h4 className="text-[10px] font-bold uppercase tracking-wider text-gray-500 mb-2">{title}</h4>
+            <pre className="max-h-[38vh] overflow-auto rounded-lg border border-white/10 bg-black/60 p-3 text-[11px] leading-relaxed text-gray-200 font-mono whitespace-pre-wrap break-words">
+                {body}
+            </pre>
+        </div>
+    );
+
+    return (
+        <div className="fixed inset-0 z-[60] flex justify-end" role="presentation">
+            <button
+                type="button"
+                className="absolute inset-0 bg-black/55 backdrop-blur-[2px]"
+                aria-label="Close audit detail"
+                onClick={onClose}
+            />
+            <div
+                className="relative z-10 flex h-full w-full max-w-xl flex-col border-l border-white/10 bg-[#0c0d12] shadow-2xl"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="audit-drawer-title"
+            >
+                <div className="flex items-start justify-between gap-3 border-b border-white/10 px-4 py-3 shrink-0">
+                    <div className="min-w-0">
+                        <p id="audit-drawer-title" className="text-sm font-bold text-white truncate">
+                            Audit entry
+                        </p>
+                        <p className="text-xs text-cyan-300 mt-0.5 font-mono truncate">{row.action}</p>
+                        <p className="text-[11px] text-gray-500 mt-1">{formatTs(row.created_at)}</p>
+                    </div>
+                    <button
+                        type="button"
+                        onClick={onClose}
+                        className="shrink-0 rounded-lg border border-white/15 p-2 text-gray-400 hover:bg-white/10 hover:text-white transition-colors"
+                        aria-label="Close"
+                    >
+                        <X className="w-4 h-4" />
+                    </button>
+                </div>
+                <div className="flex-1 overflow-y-auto px-4 py-4">
+                    <div className="space-y-2 text-xs mb-6">
+                        <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-2 items-start">
+                            <span className="text-gray-500">Resource</span>
+                            <span className="font-mono text-gray-200 break-all">
+                                {row.resource_type}
+                                {row.resource_id ? ` · ${row.resource_id}` : ''}
+                            </span>
+                        </div>
+                        <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-2 items-start">
+                            <span className="text-gray-500">Actor</span>
+                            <span className="text-gray-200 break-all">{row.actor_email || row.actor_user_id || '—'}</span>
+                        </div>
+                        <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-2 items-start">
+                            <span className="text-gray-500">Tenant</span>
+                            <span className="font-mono text-gray-200 break-all">{row.tenant_id || '—'}</span>
+                        </div>
+                        <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-2 items-start">
+                            <span className="text-gray-500">Account</span>
+                            <span className="font-mono text-gray-200 break-all">{row.account_id || '—'}</span>
+                        </div>
+                        <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-2 items-start">
+                            <span className="text-gray-500">IP</span>
+                            <span className="font-mono text-gray-200 break-all">{row.ip_address || '—'}</span>
+                        </div>
+                    </div>
+                    {meta && Object.keys(meta).length > 0 ? block('Metadata', formatAuditJson(meta)) : null}
+                    {row.before_state != null || row.after_state != null ? (
+                        <>
+                            {block('Before state', formatAuditJson(row.before_state ?? null))}
+                            {block('After state', formatAuditJson(row.after_state ?? null))}
+                        </>
+                    ) : null}
+                </div>
+            </div>
+        </div>
+    );
+}
+
+/** One row for the ingestion monitoring audit table (PRD-aligned columns). */
+function buildMonitoringAuditTableRow(r: {
+    id: string;
+    created_at: string;
+    action: string;
+    resource_type: string;
+    resource_id?: string | null;
+    actor_user_id?: string | null;
+    actor_email: string | null;
+    tenant_id: string | null;
+    account_id: string | null;
+    ip_address: string | null;
+    metadata?: Record<string, unknown>;
+    before_state?: Record<string, unknown> | null;
+    after_state?: Record<string, unknown> | null;
+}): ReactNode[] {
+    const meta = r.metadata && typeof r.metadata === 'object' ? (r.metadata as Record<string, unknown>) : {};
+    const sellerSnake = typeof meta.seller_tenant_id === 'string' ? meta.seller_tenant_id : null;
+    const sellerCamel = typeof meta.sellerTenantId === 'string' ? meta.sellerTenantId : null;
+    const agencyCamel = typeof meta.agencyTenantId === 'string' ? meta.agencyTenantId : null;
+    const userCamel = typeof meta.userId === 'string' ? meta.userId : null;
+    const staffUser = typeof meta.staffUserId === 'string' ? meta.staffUserId : null;
+    const acceptedBy = typeof meta.acceptedBy === 'string' ? meta.acceptedBy : null;
+    const unassignedBy = typeof meta.unassignedBy === 'string' ? meta.unassignedBy : null;
+    const seller = sellerSnake || sellerCamel;
+    const agency = agencyCamel;
+    const userPart = userCamel || staffUser || acceptedBy || unassignedBy;
+    const tenantOrAccount =
+        [r.tenant_id, agency, r.account_id, seller, userPart && `user:${userPart}`].filter(Boolean).join(' · ') || '—';
+
+    const actorLabel =
+        r.actor_email ||
+        (typeof r.actor_user_id === 'string' && r.actor_user_id.length > 0
+            ? `${r.actor_user_id.slice(0, 8)}…`
+            : null) ||
+        '—';
+    const actorTitle =
+        [r.actor_email, r.actor_user_id].filter((x): x is string => typeof x === 'string' && x.length > 0).join(' · ') ||
+        undefined;
+
+    return [
+        <span key={`at-${r.id}`} className="text-xs text-gray-400 whitespace-nowrap">{formatTs(r.created_at)}</span>,
+        <span key={`aa-${r.id}`} className="text-xs text-cyan-300">{r.action}</span>,
+        <span key={`ar-${r.id}`} className="text-xs text-gray-300">{r.resource_type}</span>,
+        <span key={`ari-${r.id}`} className="text-xs text-gray-400 font-mono truncate max-w-[120px]" title={r.resource_id || ''}>
+            {r.resource_id || '—'}
+        </span>,
+        <span key={`ae-${r.id}`} className="text-xs text-gray-300" title={actorTitle}>
+            {actorLabel}
+        </span>,
+        <span key={`ax-${r.id}`} className="text-xs text-gray-400 break-all" title={tenantOrAccount}>
+            {tenantOrAccount}
+        </span>,
+        <span key={`as-${r.id}`} className="text-xs text-gray-500">
+            {auditSnapshotHint(r)}
+        </span>,
+        <span key={`ai-${r.id}`} className="text-xs text-gray-500">{r.ip_address || '—'}</span>,
+    ];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -450,6 +726,8 @@ export function IngestionMonitoringView() {
     const [logQuery, setLogQuery] = useState('');
     const [selectedLogId, setSelectedLogId] = useState<string | null>(null);
     const [logsClearedAt, setLogsClearedAt] = useState<string | null>(null);
+    const [auditCategoryTab, setAuditCategoryTab] = useState<MonitoringAuditTabId>('all');
+    const [selectedAuditLogId, setSelectedAuditLogId] = useState<string | null>(null);
 
     const snapshotLogs = data?.observability?.systemLogs24h.rows || [];
     const rawExplorerLogs = logs.length > 0 ? logs : snapshotLogs;
@@ -486,6 +764,52 @@ export function IngestionMonitoringView() {
         [data?.jobs.rows],
     );
 
+    const auditRowsAll = data?.observability?.audit.billingAndPermissionRows ?? [];
+    const auditTabCounts = useMemo(() => {
+        const counts: Partial<Record<MonitoringAuditTabId, number>> = { all: auditRowsAll.length };
+        for (const tab of MONITORING_AUDIT_TABS) {
+            if (tab.id !== 'all') counts[tab.id] = 0;
+        }
+        for (const r of auditRowsAll) {
+            const cat = (r.prd_category as MonitoringAuditPrdCategory | undefined) || 'other';
+            counts[cat] = (counts[cat] || 0) + 1;
+        }
+        return counts as Record<MonitoringAuditTabId, number>;
+    }, [auditRowsAll]);
+
+    const filteredAuditRows = useMemo(() => {
+        if (auditCategoryTab === 'all') return auditRowsAll;
+        return auditRowsAll.filter(
+            (r) => ((r.prd_category as MonitoringAuditPrdCategory | undefined) || 'other') === auditCategoryTab,
+        );
+    }, [auditRowsAll, auditCategoryTab]);
+
+    const auditTableRows = useMemo(() => filteredAuditRows.slice(0, 80), [filteredAuditRows]);
+
+    const selectedAuditRow = useMemo((): MonitoringAuditLogRow | null => {
+        if (!selectedAuditLogId) return null;
+        return auditRowsAll.find((r) => r.id === selectedAuditLogId) ?? null;
+    }, [auditRowsAll, selectedAuditLogId]);
+
+    useEffect(() => {
+        if (selectedAuditLogId && !selectedAuditRow) {
+            setSelectedAuditLogId(null);
+        }
+    }, [selectedAuditLogId, selectedAuditRow]);
+
+    useEffect(() => {
+        setSelectedAuditLogId(null);
+    }, [auditCategoryTab]);
+
+    useEffect(() => {
+        if (!selectedAuditLogId) return;
+        const onKey = (e: KeyboardEvent) => {
+            if (e.key === 'Escape') setSelectedAuditLogId(null);
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+    }, [selectedAuditLogId]);
+
     const systemHealthy =
         !error &&
         !isLoading &&
@@ -512,8 +836,8 @@ export function IngestionMonitoringView() {
                 <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
                     <div>
                         <h1 className="text-3xl font-extrabold text-white flex items-center gap-3">
-                            <div className="p-2 rounded-xl border border-pink-500/30 bg-pink-500/10">
-                                <Activity className="w-6 h-6 text-pink-400" />
+                            <div className="p-2 rounded-xl border border-mamba-green/30 bg-mamba-green/10">
+                                <Activity className="w-6 h-6 text-mamba-neon" />
                             </div>
                             Ingestion Monitoring
                         </h1>
@@ -556,7 +880,7 @@ export function IngestionMonitoringView() {
                     <button
                         type="button"
                         onClick={() => setMonitorView('overview')}
-                        className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors ${monitorView === 'overview' ? 'bg-pink-500/20 text-pink-200 border border-pink-500/30' : 'text-gray-400 hover:text-gray-200'}`}
+                        className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors ${monitorView === 'overview' ? 'bg-mamba-green/20 text-mamba-text border border-mamba-green/30' : 'text-gray-400 hover:text-gray-200'}`}
                     >
                         Overview
                     </button>
@@ -691,10 +1015,13 @@ export function IngestionMonitoringView() {
                 </Panel>
 
                 {/* ── Recent activity ── */}
-                <Panel title="Recent Activity" subtitle="Latest ingestion attempts (newest first)">
+                <Panel title="Recent Activity" subtitle="Latest ingestion attempts (newest first); summary shows counts / incremental flags from attempt result">
                     <SimpleTable
-                        headers={['Job', 'Shop / Advertiser', 'Stream', 'Type', 'Source', 'Status', 'Started', 'Age', 'Error']}
-                        rows={(data?.recentActivity || []).map((r) => [
+                        headers={['Job', 'Shop / Advertiser', 'Stream', 'Type', 'Source', 'Status', 'Summary', 'Started', 'Age', 'Error']}
+                        rows={(data?.recentActivity || []).map((r) => {
+                            const res = r.result && typeof r.result === 'object' ? (r.result as Record<string, unknown>) : null;
+                            const summary = formatIngestionAttemptSummary(r.status, res);
+                            return [
                             <span key="job" className="font-mono text-xs text-gray-400">{r.job_id.slice(0, 8)}…</span>,
                             <div key="shop" className="text-xs">
                                 <p className="text-white font-medium leading-tight">
@@ -705,15 +1032,28 @@ export function IngestionMonitoringView() {
                                 <p className="text-gray-500 leading-tight">
                                     {r.stream === 'ads' ? (r.advertiser_id || '') : (r.shop_id || '')}
                                 </p>
+                                {r.account_id ? (
+                                    <p className="text-[10px] text-gray-600 font-mono leading-tight mt-0.5" title={r.account_id}>
+                                        acct {r.account_id.slice(0, 8)}…
+                                    </p>
+                                ) : null}
                             </div>,
                             <StreamBadge key="stream" stream={r.stream} />,
                             <span key="type" className="text-xs text-gray-300">{r.sync_type}</span>,
                             <span key="source" className="text-xs text-cyan-300">{r.source || 'unknown'}</span>,
                             <StatusBadge key="status" status={r.status} />,
+                            <span
+                                key="sum"
+                                className="text-xs text-gray-400 max-w-[220px] truncate"
+                                title={summary}
+                            >
+                                {summary}
+                            </span>,
                             <span key="started" className="text-xs text-gray-400 whitespace-nowrap">{formatTs(r.started_at)}</span>,
                             <span key="age" className="text-xs text-gray-500 whitespace-nowrap">{formatAge(r.finished_at || r.started_at)}</span>,
                             <ErrorCell key="error" error={r.error} />,
-                        ])}
+                            ];
+                        })}
                         emptyText="No ingestion attempts yet."
                         loading={isLoading}
                     />
@@ -820,18 +1160,48 @@ export function IngestionMonitoringView() {
                     </Panel>
                 </div>
 
-                <Panel title="Audit: Billing & Permission-Sensitive Actions" subtitle="Immutable audit records for entitlement, role, and permission changes">
+                <Panel
+                    title="Immutable audit trail"
+                    subtitle="Click a row for full metadata and before/after JSON. Grouped by product area (TikTok ingestion, RBAC, financial visibility, tenancy, branding, P&L, tasks, exports)."
+                >
+                    <div className="flex flex-wrap gap-2 mb-3">
+                        {MONITORING_AUDIT_TABS.map((tab) => {
+                            const count = auditTabCounts[tab.id] ?? 0;
+                            const active = auditCategoryTab === tab.id;
+                            return (
+                                <button
+                                    key={tab.id}
+                                    type="button"
+                                    onClick={() => setAuditCategoryTab(tab.id)}
+                                    title={tab.shortHint}
+                                    className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-semibold transition-colors ${
+                                        active
+                                            ? 'border-cyan-400/50 bg-cyan-500/15 text-cyan-100'
+                                            : 'border-white/10 bg-white/[0.03] text-gray-400 hover:border-white/20 hover:text-gray-200'
+                                    }`}
+                                >
+                                    <span>{tab.label}</span>
+                                    <span className={`tabular-nums ${active ? 'text-cyan-200/90' : 'text-gray-500'}`}>
+                                        {count}
+                                    </span>
+                                </button>
+                            );
+                        })}
+                    </div>
+                    <p className="text-xs text-gray-500 mb-4 leading-relaxed">
+                        {MONITORING_AUDIT_TABS.find((t) => t.id === auditCategoryTab)?.shortHint}
+                    </p>
                     <SimpleTable
-                        headers={['Time', 'Action', 'Resource', 'Actor', 'Tenant/Account', 'IP']}
-                        rows={(data?.observability?.audit.billingAndPermissionRows || []).slice(0, 80).map((r) => [
-                            <span key={`at-${r.id}`} className="text-xs text-gray-400 whitespace-nowrap">{formatTs(r.created_at)}</span>,
-                            <span key={`aa-${r.id}`} className="text-xs text-cyan-300">{r.action}</span>,
-                            <span key={`ar-${r.id}`} className="text-xs text-gray-300">{r.resource_type}</span>,
-                            <span key={`ae-${r.id}`} className="text-xs text-gray-300">{r.actor_email || 'system'}</span>,
-                            <span key={`ax-${r.id}`} className="text-xs text-gray-400">{r.tenant_id || r.account_id || '—'}</span>,
-                            <span key={`ai-${r.id}`} className="text-xs text-gray-500">{r.ip_address || '—'}</span>,
-                        ])}
-                        emptyText="No billing/permission audit records yet."
+                        headers={['Time', 'Action', 'Resource', 'Resource ID', 'Actor', 'Tenant / targets', 'Snapshot', 'IP']}
+                        rows={auditTableRows.map((r) => buildMonitoringAuditTableRow(r))}
+                        rowIds={auditTableRows.map((r) => r.id)}
+                        selectedRowId={selectedAuditLogId}
+                        onRowClick={(id) => setSelectedAuditLogId((prev) => (prev === id ? null : id))}
+                        emptyText={
+                            auditCategoryTab === 'all'
+                                ? 'No matching audit records yet.'
+                                : `No rows in “${MONITORING_AUDIT_TABS.find((t) => t.id === auditCategoryTab)?.label ?? auditCategoryTab}” for this window.`
+                        }
                         loading={isLoading}
                     />
                 </Panel>
@@ -955,6 +1325,7 @@ export function IngestionMonitoringView() {
                     Snapshot as of: {data ? formatTs(data.asOf) : '—'}
                 </p>
             </div>
+            <AuditLogDetailDrawer row={selectedAuditRow} onClose={() => setSelectedAuditLogId(null)} />
         </>
     );
 }
@@ -1033,7 +1404,7 @@ function EmptyState({ icon, title, subtitle }: { icon: ReactNode; title: string;
 function StreamBadge({ stream }: { stream: Stream }) {
     const cls =
         stream === 'shop'
-            ? 'bg-pink-500/15 text-pink-300 border-pink-500/20'
+            ? 'bg-mamba-green/15 text-mamba-neon border-mamba-green/20'
             : 'bg-cyan-500/15 text-cyan-300 border-cyan-500/20';
     return (
         <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold uppercase border ${cls}`}>
@@ -1102,12 +1473,21 @@ function SimpleTable({
     rows,
     emptyText,
     loading,
+    rowIds,
+    selectedRowId,
+    onRowClick,
 }: {
     headers: string[];
     rows: ReactNode[][];
     emptyText: string;
     loading?: boolean;
+    /** When set (same length as `rows`), each row is clickable for drill-down UIs */
+    rowIds?: string[];
+    selectedRowId?: string | null;
+    onRowClick?: (rowId: string) => void;
 }) {
+    const rowClickable = typeof onRowClick === 'function' && Array.isArray(rowIds) && rowIds.length === rows.length;
+
     return (
         <div className="overflow-x-auto">
             <table className="w-full text-left">
@@ -1137,15 +1517,42 @@ function SimpleTable({
                             </td>
                         </tr>
                     ) : (
-                        rows.map((row, i) => (
-                            <tr key={i} className="hover:bg-white/[0.03] transition-colors">
-                                {row.map((cell, c) => (
-                                    <td key={c} className="px-3 py-2 align-middle">
-                                        {cell}
-                                    </td>
-                                ))}
-                            </tr>
-                        ))
+                        rows.map((row, i) => {
+                            const rid = rowIds?.[i];
+                            return (
+                                <tr
+                                    key={rid ?? i}
+                                    className={`transition-colors ${
+                                        rowClickable
+                                            ? `cursor-pointer select-none ${
+                                                  rid && selectedRowId && rid === selectedRowId
+                                                      ? 'bg-cyan-500/15'
+                                                      : 'hover:bg-white/[0.06]'
+                                              }`
+                                            : 'hover:bg-white/[0.03]'
+                                    }`}
+                                    onClick={rowClickable && rid ? () => onRowClick!(rid) : undefined}
+                                    onKeyDown={
+                                        rowClickable && rid
+                                            ? (e) => {
+                                                if (e.key === 'Enter' || e.key === ' ') {
+                                                    e.preventDefault();
+                                                    onRowClick!(rid);
+                                                }
+                                            }
+                                            : undefined
+                                    }
+                                    tabIndex={rowClickable && rid ? 0 : undefined}
+                                    role={rowClickable && rid ? 'button' : undefined}
+                                >
+                                    {row.map((cell, c) => (
+                                        <td key={c} className="px-3 py-2 align-middle">
+                                            {cell}
+                                        </td>
+                                    ))}
+                                </tr>
+                            );
+                        })
                     )}
                 </tbody>
             </table>

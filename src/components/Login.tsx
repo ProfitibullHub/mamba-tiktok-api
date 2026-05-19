@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useAuth } from '../contexts/AuthContext';
-import { Video, Eye, EyeOff } from 'lucide-react';
+import { Eye, EyeOff } from 'lucide-react';
+import { MAMBA_SNAKE_HEAD_SRC } from '../lib/brandAssets';
 import { supabase } from '../lib/supabase';
 
 export function Login() {
@@ -60,19 +61,22 @@ export function Login() {
   };
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900 flex items-center justify-center p-4">
+    <div className="min-h-screen bg-gradient-to-br from-mamba-dark via-mamba-panel to-mamba-dark flex items-center justify-center p-4">
       <div className="w-full max-w-md">
-        <div className="bg-gray-800 rounded-2xl shadow-2xl p-8 border border-gray-700">
-          <div className="flex justify-center mb-8">
-            <div className="bg-gradient-to-r from-pink-500 to-red-500 p-4 rounded-2xl">
-              <Video className="w-10 h-10 text-white" />
-            </div>
+        <div className="bg-mamba-card rounded-2xl shadow-2xl p-8 border border-mamba-border">
+          <div className="flex flex-col items-center">
+            <img
+              src={MAMBA_SNAKE_HEAD_SRC}
+              alt=""
+              className="mt-10 h-24 w-24 object-contain "
+            />
+            <h1 className="mb-2 text-4xl font-bold tracking-tight text-center bg-gradient-to-r from-mamba-green via-mamba-neon to-mamba-deep bg-clip-text text-transparent">
+              Mamba
+            </h1>
           </div>
 
-          <h1 className="text-3xl font-bold text-center text-white mb-2">
-            Mamba TikTok Reporting App
-          </h1>
-          <p className="text-gray-400 text-center mb-8">
+          <h2 className="mt-2 text-2xl font-bold text-center text-mamba-text mb-2">TikTok Shop Analytics</h2>
+          <p className="text-mamba-muted text-center mb-8">
             {isForgotPassword
               ? 'Enter your email to reset your password'
               : isSignUp ? 'Create your account' : 'Sign in to view your analytics'}
@@ -90,7 +94,7 @@ export function Login() {
                   value={fullName}
                   onChange={(e) => setFullName(e.target.value)}
                   required
-                  className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-pink-500 focus:border-transparent transition-all"
+                  className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-mamba-green focus:border-transparent transition-all"
                   placeholder="John Doe"
                 />
               </div>
@@ -106,7 +110,7 @@ export function Login() {
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 required
-                className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-pink-500 focus:border-transparent transition-all"
+                className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-mamba-green focus:border-transparent transition-all"
                 placeholder="your@email.com"
               />
             </div>
@@ -126,7 +130,7 @@ export function Login() {
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
                     required
-                    className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-pink-500 focus:border-transparent transition-all pr-12"
+                    className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-mamba-green focus:border-transparent transition-all pr-12"
                     placeholder="••••••••"
                   />
                   <button
@@ -146,7 +150,7 @@ export function Login() {
                         setError('');
                         setSuccess('');
                       }}
-                      className="text-xs text-pink-400 hover:text-pink-300 transition-colors"
+                      className="text-xs text-mamba-neon hover:text-mamba-neon transition-colors"
                     >
                       Forgot password?
                     </button>
@@ -170,7 +174,7 @@ export function Login() {
             <button
               type="submit"
               disabled={loading}
-              className="w-full bg-gradient-to-r from-pink-500 to-red-500 text-white py-3 rounded-lg font-semibold hover:from-pink-600 hover:to-red-600 focus:outline-none focus:ring-2 focus:ring-pink-500 focus:ring-offset-2 focus:ring-offset-gray-800 disabled:opacity-50 disabled:cursor-not-allowed transition-all transform hover:scale-[1.02]"
+              className="w-full bg-gradient-to-r from-mamba-green to-mamba-deep text-mamba-dark py-3 rounded-lg font-semibold hover:from-mamba-neon hover:to-mamba-deep focus:outline-none focus:ring-2 focus:ring-mamba-green focus:ring-offset-2 focus:ring-offset-gray-800 disabled:opacity-50 disabled:cursor-not-allowed transition-all transform hover:scale-[1.02]"
             >
               {loading
                 ? (isForgotPassword ? 'Sending...' : isSignUp ? 'Creating account...' : 'Signing in...')
@@ -189,7 +193,7 @@ export function Login() {
                 setError('');
                 setSuccess('');
               }}
-              className="text-sm text-pink-400 hover:text-pink-300 transition-colors block w-full"
+              className="text-sm text-mamba-neon hover:text-mamba-neon transition-colors block w-full"
             >
               {isForgotPassword
                 ? 'Back to Sign In'

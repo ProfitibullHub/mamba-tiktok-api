@@ -58,7 +58,7 @@ export function SalesView({ account }: SalesViewProps) {
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="animate-spin rounded-full h-12 w-12 border-4 border-pink-500 border-t-transparent"></div>
+        <div className="animate-spin rounded-full h-12 w-12 border-4 border-mamba-green border-t-transparent"></div>
       </div>
     );
   }
@@ -124,7 +124,7 @@ export function SalesView({ account }: SalesViewProps) {
           value={`$${avgOrderValue}`}
           change={5.3}
           icon={CreditCard}
-          iconColor="bg-gradient-to-r from-purple-500 to-pink-500"
+          iconColor="bg-gradient-to-r from-purple-500 to-mamba-green"
           tooltip={<CalculationTooltip
             source="Calculated"
             calculation="Revenue / Conversions"
@@ -153,7 +153,7 @@ export function SalesView({ account }: SalesViewProps) {
             value={formatCurrency(metrics?.spend || 0)}
             change={8.9}
             icon={DollarSign}
-            iconColor="bg-gradient-to-r from-red-500 to-pink-500"
+            iconColor="bg-gradient-to-r from-mamba-deep to-mamba-neon"
             subtitle="Marketing costs"
             tooltip={<CalculationTooltip
               source="TikTok Ads"
@@ -208,7 +208,7 @@ export function SalesView({ account }: SalesViewProps) {
             value={`${metrics?.clicks ? ((metrics.conversions / metrics.clicks) * 100).toFixed(2) : '0.00'}%`}
             change={7.1}
             icon={ShoppingBag}
-            iconColor="bg-gradient-to-r from-pink-500 to-red-500"
+            iconColor="bg-gradient-to-r from-mamba-green to-mamba-deep"
             tooltip={<CalculationTooltip
               source="Calculated"
               calculation="Conversions / Clicks"
@@ -235,7 +235,7 @@ export function SalesView({ account }: SalesViewProps) {
         <h3 className="text-lg font-semibold text-white mb-4">Individual Campaigns</h3>
         {campaignsLoading ? (
           <div className="flex items-center justify-center h-32">
-            <div className="animate-spin rounded-full h-8 w-8 border-4 border-pink-500 border-t-transparent"></div>
+            <div className="animate-spin rounded-full h-8 w-8 border-4 border-mamba-green border-t-transparent"></div>
           </div>
         ) : campaigns.length === 0 ? (
           <div className="bg-gray-800 rounded-xl p-8 text-center border border-gray-700">

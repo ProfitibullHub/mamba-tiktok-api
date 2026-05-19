@@ -125,11 +125,11 @@ export function MyAccessView() {
     return (
         <div className="w-full max-w-none space-y-8 pb-10 animate-in fade-in duration-500">
             <div className="relative overflow-hidden rounded-3xl border border-white/10 bg-white/[0.02] p-6 sm:p-8 backdrop-blur-sm">
-                <div className="absolute inset-0 bg-gradient-to-br from-pink-500/10 via-transparent to-violet-500/5 pointer-events-none" />
+                <div className="absolute inset-0 bg-gradient-to-br from-mamba-green/10 via-transparent to-violet-500/5 pointer-events-none" />
                 <div className="relative flex flex-col gap-6 lg:flex-row lg:items-start lg:justify-between">
                     <div className="flex min-w-0 flex-1 gap-4">
-                        <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl border border-pink-500/25 bg-pink-500/10">
-                            <Shield className="h-7 w-7 text-pink-400" />
+                        <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl border border-mamba-green/25 bg-mamba-green/10">
+                            <Shield className="h-7 w-7 text-mamba-neon" />
                         </div>
                         <div className="min-w-0 flex-1">
                             <h1 className="text-2xl font-bold tracking-tight text-white sm:text-3xl">My access & roles</h1>
@@ -175,7 +175,7 @@ export function MyAccessView() {
                                 <select
                                     value={selectedTenantId ?? ''}
                                     onChange={(e) => setSelectedTenantId(e.target.value || null)}
-                                    className="w-full appearance-none rounded-xl border border-white/10 bg-black/40 py-3.5 pl-4 pr-11 text-sm font-semibold text-white shadow-inner focus:border-pink-500/40 focus:outline-none"
+                                    className="w-full appearance-none rounded-xl border border-white/10 bg-black/40 py-3.5 pl-4 pr-11 text-sm font-semibold text-white shadow-inner focus:border-mamba-green/40 focus:outline-none"
                                 >
                                     {memberships.map((m) => (
                                         <option key={m.id} value={m.tenant_id} className="bg-gray-900">
@@ -193,7 +193,7 @@ export function MyAccessView() {
                                         ) : selected.tenants?.type === 'platform' ? (
                                             <Globe className="h-4 w-4 shrink-0 text-amber-400" />
                                         ) : (
-                                            <Store className="h-4 w-4 shrink-0 text-pink-400" />
+                                            <Store className="h-4 w-4 shrink-0 text-mamba-neon" />
                                         )}
                                         <div className="min-w-0">
                                             <div className="truncate text-sm font-bold text-white">
@@ -203,7 +203,7 @@ export function MyAccessView() {
                                         </div>
                                     </div>
                                     <div className="flex items-center gap-2">
-                                        <span className="rounded-lg border border-pink-500/25 bg-pink-500/10 px-3 py-1 text-xs font-bold text-pink-200">
+                                        <span className="rounded-lg border border-mamba-green/25 bg-mamba-green/10 px-3 py-1 text-xs font-bold text-mamba-text">
                                             {selected.roles?.name ?? '—'}
                                         </span>
                                         <button
@@ -301,7 +301,7 @@ export function MyAccessView() {
                             <div className="space-y-10">
                                 {permGroups.map(([group, perms]) => (
                                     <div key={group}>
-                                        <h3 className="mb-4 text-xs font-extrabold uppercase tracking-widest text-pink-400">
+                                        <h3 className="mb-4 text-xs font-extrabold uppercase tracking-widest text-mamba-neon">
                                             {group}
                                         </h3>
                                         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-2 2xl:grid-cols-3">

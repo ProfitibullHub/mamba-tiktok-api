@@ -52,7 +52,7 @@ export function ConnectTikTokAds({ accountId, compact = false }: ConnectTikTokAd
             <button
                 onClick={handleConnect}
                 disabled={isLoading}
-                className="flex items-center gap-2 px-3 py-1.5 bg-gradient-to-r from-pink-600 to-red-600 hover:from-pink-700 hover:to-red-700 text-white text-sm font-medium rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                className="flex items-center gap-2 px-3 py-1.5 bg-gradient-to-r from-mamba-green to-mamba-deep hover:from-mamba-neon hover:to-mamba-deep text-mamba-dark text-sm font-medium rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed"
             >
                 {isLoading ? (
                     <>
@@ -70,10 +70,10 @@ export function ConnectTikTokAds({ accountId, compact = false }: ConnectTikTokAd
     }
 
     return (
-        <div className="bg-gradient-to-r from-pink-500/10 to-red-500/10 border border-pink-500/30 rounded-xl p-6">
+        <div className="bg-gradient-to-r from-mamba-green/10 to-mamba-deep/10 border border-mamba-green/30 rounded-xl p-6">
             <div className="flex items-start gap-4">
-                <div className="bg-gradient-to-r from-pink-600 to-red-600 p-3 rounded-xl">
-                    <TrendingUp className="w-6 h-6 text-white" />
+                <div className="bg-gradient-to-r from-mamba-neon to-mamba-deep p-3 rounded-xl">
+                    <TrendingUp className="w-6 h-6 text-mamba-dark" />
                 </div>
                 <div className="flex-1">
                     <h3 className="text-lg font-semibold text-white mb-2">
@@ -85,7 +85,7 @@ export function ConnectTikTokAds({ accountId, compact = false }: ConnectTikTokAd
                     <button
                         onClick={handleConnect}
                         disabled={isLoading}
-                        className="flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-pink-600 to-red-600 hover:from-pink-700 hover:to-red-700 text-white font-medium rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                        className="flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-mamba-green to-mamba-deep hover:from-mamba-neon hover:to-mamba-deep text-mamba-dark font-medium rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                         {isLoading ? (
                             <>

@@ -57,7 +57,7 @@ export function PostsView({ account }: PostsViewProps) {
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="animate-spin rounded-full h-12 w-12 border-4 border-pink-500 border-t-transparent"></div>
+        <div className="animate-spin rounded-full h-12 w-12 border-4 border-mamba-green border-t-transparent"></div>
       </div>
     );
   }
@@ -95,7 +95,7 @@ export function PostsView({ account }: PostsViewProps) {
           value={data.length}
           change={20.5}
           icon={Video}
-          iconColor="bg-gradient-to-r from-pink-500 to-purple-500"
+          iconColor="bg-gradient-to-r from-mamba-green to-purple-500"
           subtitle="Published content"
         />
         <StatCard
@@ -117,7 +117,7 @@ export function PostsView({ account }: PostsViewProps) {
           value={`${engagementRate}%`}
           change={12.1}
           icon={Heart}
-          iconColor="bg-gradient-to-r from-pink-500 to-red-500"
+          iconColor="bg-gradient-to-r from-mamba-green to-mamba-deep"
         />
       </div>
 
@@ -129,7 +129,7 @@ export function PostsView({ account }: PostsViewProps) {
             value={formatNumber(metrics?.likes || 0)}
             change={14.2}
             icon={Heart}
-            iconColor="bg-gradient-to-r from-pink-500 to-red-500"
+            iconColor="bg-gradient-to-r from-mamba-green to-mamba-deep"
           />
           <StatCard
             title="Total Comments"
@@ -152,7 +152,7 @@ export function PostsView({ account }: PostsViewProps) {
         <h3 className="text-lg font-semibold text-white mb-4">Individual Posts</h3>
         {postsLoading ? (
           <div className="flex items-center justify-center h-32">
-            <div className="animate-spin rounded-full h-8 w-8 border-4 border-pink-500 border-t-transparent"></div>
+            <div className="animate-spin rounded-full h-8 w-8 border-4 border-mamba-green border-t-transparent"></div>
           </div>
         ) : posts.length === 0 ? (
           <div className="bg-gray-800 rounded-xl p-8 text-center border border-gray-700">
@@ -189,7 +189,7 @@ export function PostsView({ account }: PostsViewProps) {
                         </td>
                         <td className="px-6 py-4 text-right text-white">{formatNumber(post.views)}</td>
                         <td className="px-6 py-4 text-right">
-                          <span className="flex items-center justify-end gap-1 text-pink-400">
+                          <span className="flex items-center justify-end gap-1 text-mamba-neon">
                             <Heart className="w-4 h-4" />
                             {formatNumber(post.likes)}
                           </span>

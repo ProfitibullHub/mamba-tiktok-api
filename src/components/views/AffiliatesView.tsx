@@ -54,7 +54,7 @@ export function AffiliatesView({ account }: AffiliatesViewProps) {
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="animate-spin rounded-full h-12 w-12 border-4 border-pink-500 border-t-transparent"></div>
+        <div className="animate-spin rounded-full h-12 w-12 border-4 border-mamba-green border-t-transparent"></div>
       </div>
     );
   }
@@ -109,14 +109,14 @@ export function AffiliatesView({ account }: AffiliatesViewProps) {
           value={formatNumber(metrics?.conversions || 0)}
           change={15.7}
           icon={TrendingUp}
-          iconColor="bg-gradient-to-r from-purple-500 to-pink-500"
+          iconColor="bg-gradient-to-r from-purple-500 to-mamba-green"
         />
         <StatCard
           title="Conversion Rate"
           value={`${conversionRate}%`}
           change={8.2}
           icon={Percent}
-          iconColor="bg-gradient-to-r from-orange-500 to-red-500"
+          iconColor="bg-gradient-to-r from-mamba-neon to-mamba-deep"
         />
       </div>
 
@@ -136,7 +136,7 @@ export function AffiliatesView({ account }: AffiliatesViewProps) {
             value={formatCurrency(metrics?.revenue || 0)}
             change={20.1}
             icon={TrendingUp}
-            iconColor="bg-gradient-to-r from-pink-500 to-red-500"
+            iconColor="bg-gradient-to-r from-mamba-green to-mamba-deep"
           />
           <StatCard
             title="Active Programs"
@@ -152,7 +152,7 @@ export function AffiliatesView({ account }: AffiliatesViewProps) {
         <h3 className="text-lg font-semibold text-white mb-4">Individual Programs</h3>
         {programsLoading ? (
           <div className="flex items-center justify-center h-32">
-            <div className="animate-spin rounded-full h-8 w-8 border-4 border-pink-500 border-t-transparent"></div>
+            <div className="animate-spin rounded-full h-8 w-8 border-4 border-mamba-green border-t-transparent"></div>
           </div>
         ) : programs.length === 0 ? (
           <div className="bg-gray-800 rounded-xl p-8 text-center border border-gray-700">

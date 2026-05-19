@@ -1,5 +1,6 @@
 import { useState, useMemo, useEffect } from 'react';
 import { Search, Filter, RefreshCw, Box, Truck, BarChart3, ChevronDown, ChevronUp, XCircle, BadgeCheck, Users } from 'lucide-react';
+import { useShallow } from 'zustand/react/shallow';
 import { useShopStore, Order } from '../../store/useShopStore';
 import { Account } from '../../lib/supabase';
 import { OrderCard } from '../OrderCard';
@@ -13,6 +14,8 @@ import { DateRangePicker, DateRange } from '../DateRangePicker';
 import { toLocalDateString, getShopDayStartTimestamp, getDateRangeFromPreset } from '../../utils/dateUtils';
 import { useShopAccessFlags } from '../../hooks/useShopMutationAccess';
 import { isCancelledOrRefunded } from '../../utils/orderFinancials';
+import { readDefaultLoadDaysFromStorage } from '../../config/dataRetention';
+import { shouldSkipShopTabMountBootstrap } from '../../utils/shopTabBootstrap';
 
 // Use paid_time for filtering (matches backend which loads by paid_time)
 const getOrderTs = (o: Order): number => Number(o.paid_time || o.created_time);
@@ -27,18 +30,46 @@ const getEffectiveOrderTs = (o: Order): number => {
     return Number(o.paid_time || o.created_time);
 };
 
+function readOrdersBootstrapDateRange(shopId: string | undefined, timezone: string): DateRange {
+    try {
+        const preset = localStorage.getItem(`mamba:default_date_preset:${shopId || 'default'}`) || 'today';
+        return getDateRangeFromPreset(preset, timezone);
+    } catch {
+        return getDateRangeFromPreset('today', timezone);
+    }
+}
+
 interface OrdersViewProps {
     account: Account;
     shopId?: string;
     timezone?: string; // Shop timezone for date calculations
     preSelectedOrderId?: string; // Deep-link to a specific order
     onClearSelection?: () => void;
+    sessionDateRange?: DateRange;
+    onSessionDateRangeChange?: (range: DateRange) => void;
 }
 
 
-export function OrdersView({ account, shopId, timezone = 'America/Los_Angeles', preSelectedOrderId, onClearSelection }: OrdersViewProps) {
+export function OrdersView({
+    account,
+    shopId,
+    timezone = 'America/Los_Angeles',
+    preSelectedOrderId,
+    onClearSelection,
+    sessionDateRange,
+    onSessionDateRangeChange,
+}: OrdersViewProps) {
     const { canSyncShop } = useShopAccessFlags(account);
-    const { orders, isLoading, syncData, cacheMetadata, dataVersion, fetchShopData } = useShopStore();
+    const { orders, isLoading, syncData, cacheMetadata, dataVersion, fetchShopData } = useShopStore(
+        useShallow((s) => ({
+            orders: s.orders,
+            isLoading: s.isLoading,
+            syncData: s.syncData,
+            cacheMetadata: s.cacheMetadata,
+            dataVersion: s.dataVersion,
+            fetchShopData: s.fetchShopData,
+        })),
+    );
     const [searchTerm, setSearchTerm] = useState('');
     const [statusFilter, setStatusFilter] = useState('all');
     const [fulfillmentFilter, setFulfillmentFilter] = useState('all');
@@ -46,14 +77,14 @@ export function OrdersView({ account, shopId, timezone = 'America/Los_Angeles', 
     const [selectedOrder, setSelectedOrder] = useState<Order | null>(null);
     const [viewMode, setViewMode] = useState<ViewMode>('cards');
     const [showCharts, setShowCharts] = useState(true);
-    const [dateRange, setDateRange] = useState<DateRange>(() => {
-        try {
-            const preset = localStorage.getItem(`mamba:default_date_preset:${shopId || 'default'}`) || 'today';
-            return getDateRangeFromPreset(preset, timezone);
-        } catch {
-            return getDateRangeFromPreset('today', timezone);
-        }
-    });
+    const [dateRange, setDateRange] = useState<DateRange>(
+        () => sessionDateRange ?? readOrdersBootstrapDateRange(shopId, timezone),
+    );
+
+    const handleOrdersDateRangeChange = (r: DateRange) => {
+        setDateRange(r);
+        onSessionDateRangeChange?.(r);
+    };
 
     const [currentPage, setCurrentPage] = useState(1);
     const itemsPerPage = viewMode === 'list' ? 25 : 50;
@@ -70,12 +101,18 @@ export function OrdersView({ account, shopId, timezone = 'America/Los_Angeles', 
     }, [preSelectedOrderId, orders, selectedOrder, dateRange, timezone]);
 
 
-    // Load any missing data when the date range changes, including the previous period
-    // so the comparison chart has data for both the current and preceding window.
-    // fetchShopData's smart cache only fetches what isn't already in the store.
+    // Same-range remount skips duplicate fetch (tab switching); store cache still applies on real range changes.
     useEffect(() => {
         if (!shopId) return;
-        fetchShopData(account.id, shopId, { skipSyncCheck: true, includePreviousPeriod: true, timezone }, dateRange.startDate, dateRange.endDate);
+        const ld = readDefaultLoadDaysFromStorage(shopId);
+        const fp = `${account.id}|${dateRange.startDate}|${dateRange.endDate}|${ld}|ip1`;
+        if (shouldSkipShopTabMountBootstrap(shopId, 'orders', fp)) return;
+        fetchShopData(account.id, shopId, {
+            skipSyncCheck: true,
+            includePreviousPeriod: true,
+            initialLoadDays: ld,
+            timezone,
+        }, dateRange.startDate, dateRange.endDate);
     }, [account.id, shopId, dateRange.startDate, dateRange.endDate, timezone, fetchShopData]);
 
     // Shared toggles — synced with OverviewView via localStorage + custom events
@@ -314,7 +351,7 @@ export function OrdersView({ account, shopId, timezone = 'America/Los_Angeles', 
                     <p className="brand-muted">Manage and track your shop orders</p>
                 </div>
                 <div className="flex items-center gap-3">
-                    <DateRangePicker value={dateRange} onChange={setDateRange} />
+                    <DateRangePicker value={dateRange} onChange={handleOrdersDateRangeChange} />
                     <ViewToggle
                         currentView={effectiveViewMode}
                         onViewChange={setViewMode}

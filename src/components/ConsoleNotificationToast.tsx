@@ -36,14 +36,14 @@ function ToastItem({ toast, onClose }: { toast: UserNotification; onClose: () =>
         if (type.includes('invite')) return <Users className="w-5 h-5 text-indigo-400" />;
         if (type.includes('suspend') || type.includes('remove')) return <AlertCircle className="w-5 h-5 text-red-400" />;
         if (type.includes('reactivate')) return <CheckCircle className="w-5 h-5 text-emerald-400" />;
-        return <Bell className="w-5 h-5 text-pink-400" />;
+        return <Bell className="w-5 h-5 text-mamba-neon" />;
     };
 
     const getBackgroundClass = (type: string) => {
         if (type.includes('invite')) return 'from-indigo-500/10 to-transparent border-indigo-500/20';
         if (type.includes('suspend') || type.includes('remove')) return 'from-red-500/10 to-transparent border-red-500/20';
         if (type.includes('reactivate')) return 'from-emerald-500/10 to-transparent border-emerald-500/20';
-        return 'from-pink-500/10 to-transparent border-pink-500/20';
+        return 'from-mamba-green/10 to-transparent border-mamba-green/20';
     };
 
     return (

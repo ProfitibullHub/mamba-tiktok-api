@@ -61,7 +61,7 @@ export function OrderListRow({ order, onClick }: OrderListRowProps) {
             {/* Order ID & Date */}
             <td className="px-4 py-3">
                 <div className="flex items-center gap-3">
-                    <div className="p-1.5 bg-gray-700 rounded group-hover:bg-pink-500/10 transition-colors">
+                    <div className="p-1.5 bg-gray-700 rounded group-hover:bg-mamba-green/10 transition-colors">
                         {getStatusIcon(order.order_status)}
                     </div>
                     <div>
@@ -115,7 +115,7 @@ export function OrderListRow({ order, onClick }: OrderListRowProps) {
                             {mainItem?.product_name || 'Unknown'}
                         </p>
                         {itemsCount > 1 && (
-                            <p className="text-xs text-pink-400">+{itemsCount - 1} more</p>
+                            <p className="text-xs text-mamba-neon">+{itemsCount - 1} more</p>
                         )}
                     </div>
                 </div>

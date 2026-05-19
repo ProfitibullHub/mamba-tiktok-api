@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
-import { ChevronDown, Store, CheckCircle2 } from 'lucide-react';
+import { ChevronDown, CheckCircle2 } from 'lucide-react';
+import { MAMBA_SNAKE_HEAD_SRC } from '../lib/brandAssets';
 import { Account, supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import { useTenantContext } from '../contexts/TenantContext';
@@ -55,13 +56,11 @@ export function AccountSelector({ selectedAccount, onSelectAccount }: AccountSel
     return (
       <div className="bg-gray-800 rounded-xl p-4 border border-gray-700">
         <div className="flex items-center gap-3">
-          <div className="bg-gradient-to-r from-pink-500 to-red-500 p-2 rounded-lg">
-            <Store className="w-5 h-5 text-white" />
-          </div>
+          <img src={MAMBA_SNAKE_HEAD_SRC} alt="" className="h-10 w-10 shrink-0 object-contain" />
           <div>
             <p className="text-sm text-gray-400">Current Account</p>
             <p className="text-lg font-bold text-white">{accounts[0].name}</p>
-            <p className="text-sm text-pink-400">{accounts[0].tiktok_handle}</p>
+            <p className="text-sm text-mamba-neon">{accounts[0].tiktok_handle}</p>
           </div>
         </div>
       </div>
@@ -72,20 +71,18 @@ export function AccountSelector({ selectedAccount, onSelectAccount }: AccountSel
     <div className="relative">
       <button
         onClick={() => setIsOpen(!isOpen)}
-        className="w-full bg-gray-800 rounded-xl p-4 border border-gray-700 hover:border-pink-500/50 transition-all"
+        className="w-full bg-gray-800 rounded-xl p-4 border border-gray-700 hover:border-mamba-green/50 transition-all"
       >
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="bg-gradient-to-r from-pink-500 to-red-500 p-2 rounded-lg">
-              <Store className="w-5 h-5 text-white" />
-            </div>
+            <img src={MAMBA_SNAKE_HEAD_SRC} alt="" className="h-10 w-10 shrink-0 object-contain" />
             <div className="text-left">
               <p className="text-sm text-gray-400">
                 {isPlatformSuperAdmin ? 'Viewing Account' : 'Current Account'}
               </p>
               <p className="text-lg font-bold text-white">{selectedAccount?.name || 'Select Account'}</p>
               {selectedAccount && (
-                <p className="text-sm text-pink-400">{selectedAccount.tiktok_handle}</p>
+                <p className="text-sm text-mamba-neon">{selectedAccount.tiktok_handle}</p>
               )}
             </div>
           </div>
@@ -107,19 +104,18 @@ export function AccountSelector({ selectedAccount, onSelectAccount }: AccountSel
                 className="w-full p-4 flex items-center justify-between hover:bg-gray-700 transition-colors first:rounded-t-xl last:rounded-b-xl border-b border-gray-700 last:border-b-0"
               >
                 <div className="flex items-center gap-3">
-                  <div className={`p-2 rounded-lg ${selectedAccount?.id === account.id
-                      ? 'bg-gradient-to-r from-pink-500 to-red-500'
-                      : 'bg-gray-700'
-                    }`}>
-                    <Store className="w-4 h-4 text-white" />
-                  </div>
+                  <img
+                    src={MAMBA_SNAKE_HEAD_SRC}
+                    alt=""
+                    className="h-10 w-10 shrink-0 object-contain"
+                  />
                   <div className="text-left">
                     <p className="font-semibold text-white">{account.name}</p>
                     <p className="text-sm text-gray-400">{account.tiktok_handle}</p>
                   </div>
                 </div>
                 {selectedAccount?.id === account.id && (
-                  <CheckCircle2 className="w-5 h-5 text-pink-400" />
+                  <CheckCircle2 className="w-5 h-5 text-mamba-neon" />
                 )}
               </button>
             ))}

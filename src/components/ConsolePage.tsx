@@ -1,9 +1,11 @@
-import { useState, useEffect, useLayoutEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { Sidebar } from './Sidebar';
 import { HomeConsoleView } from './views/HomeConsoleView';
 import { AgencyConsoleView } from './views/AgencyConsoleView';
 import { AgencyBrandingView } from './views/AgencyBrandingView';
 import { RoleManagementView } from './views/RoleManagementView';
+import { AgencyTasksView } from './views/AgencyTasksView';
 import { MyAccessView } from './views/MyAccessView';
 import { PlatformTenantsView } from './views/PlatformTenantsView';
 import { AdminDashboard } from './views/AdminDashboard';
@@ -18,8 +20,14 @@ import { supabase, type Account } from '../lib/supabase';
 import { apiFetch, getApiOrigin } from '../lib/apiClient';
 import { useAuth } from '../contexts/AuthContext';
 import { useTenantContext } from '../contexts/TenantContext';
+import {
+    useMyEffectivePermissions,
+    effectiveAllowsTasksBoard,
+    fetchMyEffectivePermissionsOnTenant,
+} from '../hooks/useMyEffectivePermissions';
 import { SellerBrandingProvider } from '../contexts/SellerBrandingContext';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { CONSOLE_TASK_TAB, isAgencyTaskId } from '../lib/taskDeepLinks';
 
 const API_BASE_URL = getApiOrigin();
 
@@ -29,6 +37,7 @@ const CONSOLE_ACTIVE_TAB_KEY = 'console.activeTab';
 const PLATFORM_ONLY_CONSOLE_TABS = new Set(['admin-dashboard', 'platform-tenants', 'ingestion-monitoring']);
 
 export function ConsolePage() {
+    const [searchParams, setSearchParams] = useSearchParams();
     const { user } = useAuth();
     const {
         isPlatformSuperAdmin,
@@ -37,18 +46,71 @@ export function ConsolePage() {
         hasAgencyAccess,
         manageableAdminTenants,
         profileTenantId,
+        profileTenantType,
+        agencyMemberships,
         sellerFacingBrandingEligible,
         isTenantAccessLocked,
         tenantAccessLockReason,
     } = useTenantContext();
     const queryClient = useQueryClient();
 
+    const agencyTenantForTasksNav = useMemo(
+        () =>
+            profileTenantType === 'agency' && profileTenantId
+                ? profileTenantId
+                : agencyMemberships.filter((m) => m.status === 'active')[0]?.tenant_id ?? null,
+        [agencyMemberships, profileTenantId, profileTenantType],
+    );
+
+    const { data: taskNavPerms } = useMyEffectivePermissions(agencyTenantForTasksNav, {
+        enabled: Boolean(hasAgencyAccess && agencyTenantForTasksNav),
+    });
+
+    const showTeamTasksBoard =
+        Boolean(hasAgencyAccess && taskNavPerms && effectiveAllowsTasksBoard(taskNavPerms));
+
     const [activeTab, setActiveTab] = useState(() => {
+        try {
+            const sp = new URLSearchParams(window.location.search);
+            if (sp.get('tab') === CONSOLE_TASK_TAB) return 'tasks';
+        } catch {
+            /* ignore */
+        }
         const saved = sessionStorage.getItem(CONSOLE_ACTIVE_TAB_KEY);
         return saved && saved.trim().length > 0 ? saved : 'home';
     });
     const adminTabInitialized = useRef(false);
     const [hasSkippedWelcome, setHasSkippedWelcome] = useState(false);
+    const [connectShopBusy, setConnectShopBusy] = useState(false);
+    const [connectShopError, setConnectShopError] = useState<string | null>(null);
+
+    const sellerMembershipTenantIds = useMemo(
+        () =>
+            memberships
+                .filter((m) => m.status === 'active' && m.tenants?.type === 'seller')
+                .map((m) => m.tenant_id),
+        [memberships],
+    );
+
+    const connectPermissionTenantIds = useMemo(() => {
+        const ids = new Set<string>(sellerMembershipTenantIds);
+        if (profileTenantId && profileTenantType === 'seller') ids.add(profileTenantId);
+        return [...ids];
+    }, [sellerMembershipTenantIds, profileTenantId, profileTenantType]);
+
+    const { data: canConnectShop = false } = useQuery({
+        queryKey: ['can-connect-tiktok-shop', user?.id, connectPermissionTenantIds],
+        queryFn: async () => {
+            if (isPlatformSuperAdmin) return true;
+            for (const tenantId of connectPermissionTenantIds) {
+                const perms = await fetchMyEffectivePermissionsOnTenant(tenantId);
+                if (perms.has('tiktok.auth')) return true;
+            }
+            return false;
+        },
+        enabled: Boolean(user?.id) && (isPlatformSuperAdmin || connectPermissionTenantIds.length > 0),
+        staleTime: 60_000,
+    });
 
     useEffect(() => {
         if (isPlatformSuperAdmin && !adminTabInitialized.current) {
@@ -65,15 +127,59 @@ export function ConsolePage() {
         if (!isPlatformSuperAdmin && PLATFORM_ONLY_CONSOLE_TABS.has(activeTab)) {
             setActiveTab('home');
         }
-    }, [user?.id, tenantLoading, isPlatformSuperAdmin, activeTab]);
+        if (activeTab === 'tasks' && !showTeamTasksBoard) {
+            setActiveTab('home');
+        }
+    }, [user?.id, tenantLoading, isPlatformSuperAdmin, activeTab, showTeamTasksBoard]);
+
+    /** Deep links e.g. `/?tab=tasks&taskId=<uuid>` from messaging or bookmarks. */
+    useEffect(() => {
+        if (!showTeamTasksBoard) return;
+        if (searchParams.get('tab') === CONSOLE_TASK_TAB) {
+            setActiveTab('tasks');
+        }
+    }, [searchParams, showTeamTasksBoard]);
 
     useEffect(() => {
         sessionStorage.setItem(CONSOLE_ACTIVE_TAB_KEY, activeTab);
     }, [activeTab]);
 
-    const handleConsoleTabChange = (tab: string) => {
-        setActiveTab(tab);
-    };
+    const handleConsoleTabChange = useCallback(
+        (tab: string) => {
+            setActiveTab(tab);
+            if (tab !== 'tasks') {
+                setSearchParams(
+                    (prev) => {
+                        const next = new URLSearchParams(prev);
+                        next.delete('tab');
+                        next.delete('taskId');
+                        return next;
+                    },
+                    { replace: true },
+                );
+            }
+        },
+        [setSearchParams],
+    );
+
+    const onConsumeTaskDeepLink = useCallback(() => {
+        setSearchParams(
+            (prev) => {
+                const next = new URLSearchParams(prev);
+                next.delete('taskId');
+                return next;
+            },
+            { replace: true },
+        );
+    }, [setSearchParams]);
+
+    const deepLinkTaskId =
+        activeTab === 'tasks' && showTeamTasksBoard ?
+            (() => {
+                const raw = searchParams.get('taskId');
+                return isAgencyTaskId(raw) ? raw : null;
+            })()
+        :   null;
 
     const fetchNotifications = useConsoleNotificationStore((state) => state.fetchNotifications);
     const subscribeToNotifications = useConsoleNotificationStore((state) => state.subscribeToNotifications);
@@ -135,13 +241,40 @@ export function ConsolePage() {
         }
     }, [isPlatformSuperAdmin, queryClient]);
 
+    const resolveAccountForTikTokConnect = async (pool: Account[]): Promise<Account | null> => {
+        const tenantIds: string[] = [];
+        if (profileTenantId && profileTenantType === 'seller') tenantIds.push(profileTenantId);
+        for (const id of sellerMembershipTenantIds) {
+            if (!tenantIds.includes(id)) tenantIds.push(id);
+        }
+        for (const tid of tenantIds) {
+            const { data: accountId, error } = await supabase.rpc('get_seller_account_id', {
+                p_seller_tenant_id: tid,
+            });
+            if (error) {
+                console.warn('[Console] get_seller_account_id', error.message);
+                continue;
+            }
+            if (typeof accountId === 'string') {
+                const hit = pool.find((a) => a.id === accountId);
+                if (hit) return hit;
+            }
+        }
+        const nonAgency = pool.find((a) => !a.is_agency_view);
+        if (nonAgency) return nonAgency;
+        return pool[0] ?? null;
+    };
+
     const ensureAccountExists = async (): Promise<Account> => {
         try {
             if (!user?.id) throw new Error('User not authenticated');
 
-            const cached = queryClient.getQueryData<Account[]>(['accounts', user.id]);
+            const cached =
+                queryClient.getQueryData<Account[]>(['accounts', user.id]) ??
+                (accounts.length > 0 ? accounts : undefined);
             if (cached?.length) {
-                return cached[0];
+                const resolved = await resolveAccountForTikTokConnect(cached);
+                if (resolved) return resolved;
             }
 
             const metaName =
@@ -167,18 +300,33 @@ export function ConsolePage() {
     };
 
     const handleConnectShop = async () => {
+        setConnectShopError(null);
+        setConnectShopBusy(true);
         try {
             const account = await ensureAccountExists();
             const response = await apiFetch('/api/tiktok-shop/auth/start', {
                 method: 'POST',
                 body: JSON.stringify({ accountId: account.id, accountName: account.name }),
             });
-            const data = await response.json();
-            if (data.authUrl || data.url) {
-                window.location.href = data.authUrl || data.url;
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(
+                    typeof data.error === 'string'
+                        ? data.error
+                        : `Could not start TikTok connection (${response.status})`,
+                );
             }
-        } catch (error: any) {
+            const authUrl = data.authUrl || data.url;
+            if (!authUrl) {
+                throw new Error('No authorization URL returned from server');
+            }
+            window.location.href = authUrl;
+        } catch (error: unknown) {
+            const msg = error instanceof Error ? error.message : 'Could not connect TikTok Shop';
             console.error('Error starting auth:', error);
+            setConnectShopError(msg);
+        } finally {
+            setConnectShopBusy(false);
         }
     };
 
@@ -223,7 +371,7 @@ export function ConsolePage() {
     if (!user?.id || tenantLoading) {
         return (
             <div className="flex items-center justify-center h-screen bg-gray-900">
-                <div className="animate-spin rounded-full h-12 w-12 border-4 border-pink-500 border-t-transparent" />
+                <div className="animate-spin rounded-full h-12 w-12 border-4 border-mamba-green border-t-transparent" />
             </div>
         );
     }
@@ -231,7 +379,7 @@ export function ConsolePage() {
     if (isLoadingAccounts && !accounts.length) {
         return (
             <div className="flex items-center justify-center h-screen bg-gray-900">
-                <div className="animate-spin rounded-full h-12 w-12 border-4 border-pink-500 border-t-transparent" />
+                <div className="animate-spin rounded-full h-12 w-12 border-4 border-mamba-green border-t-transparent" />
             </div>
         );
     }
@@ -261,6 +409,7 @@ export function ConsolePage() {
                     mode="console"
                     activeTab={activeTab}
                     onTabChange={handleConsoleTabChange}
+                    showTeamTasksBoard={showTeamTasksBoard}
                 />
                 <ConsoleNotificationToast />
                 <TeamInvitationStickyToast activeTab={activeTab} onOpenNotifications={() => handleConsoleTabChange('notifications')} />
@@ -289,10 +438,20 @@ export function ConsolePage() {
                                         onNavigate={handleConsoleTabChange}
                                         memberships={memberships}
                                         onAddShop={handleConnectShop}
+                                        canConnectShop={canConnectShop}
+                                        connectShopError={connectShopError}
+                                        connectShopBusy={connectShopBusy}
                                     />
                                 );
                             case 'agency-console':
                                 return <AgencyConsoleView />;
+                            case 'tasks':
+                                return (
+                                    <AgencyTasksView
+                                        deepLinkTaskId={deepLinkTaskId}
+                                        onConsumeTaskDeepLink={onConsumeTaskDeepLink}
+                                    />
+                                );
                             case 'agency-branding':
                                 return <AgencyBrandingView onNavigate={handleConsoleTabChange} />;
                             case 'my-access':
@@ -325,6 +484,9 @@ export function ConsolePage() {
                                         onNavigate={handleConsoleTabChange}
                                         memberships={memberships}
                                         onAddShop={handleConnectShop}
+                                        canConnectShop={canConnectShop}
+                                        connectShopError={connectShopError}
+                                        connectShopBusy={connectShopBusy}
                                     />
                                 );
                             }
